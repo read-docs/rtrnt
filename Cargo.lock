@@ -790,7 +790,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -906,6 +906,7 @@ dependencies = [
  "bytes",
  "clap",
  "indicatif",
+ "rand",
  "reqwest",
  "serde",
  "serde_bencode",

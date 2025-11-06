@@ -4,20 +4,30 @@ use sha1::Digest;
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct TorrentFile {
-    announce: String,
-    info: Info,
+    pub announce: String,
+    pub info: Info,
+}
+
+impl TorrentFile {
+    pub fn length(&self) -> u64 {
+        self.info.length.unwrap_or_else(|| {
+            self.info.files.as_ref()
+                .map(|files| files.iter().map(|f| f.length).sum())
+                .unwrap_or(0)
+        })
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug)]
-struct Info {
-    name: String,
+pub struct Info {
+    pub name: String,
     #[serde(rename = "piece length")]
-    piece_length: u64,
-    pieces: ByteBuf,
+    pub piece_length: u64,
+    pub pieces: ByteBuf,
     #[serde(default)]
-    length: Option<u64>,
+    pub length: Option<u64>,
     #[serde(default)]
-    files: Option<Vec<FileInfo>>,
+    pub files: Option<Vec<FileInfo>>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
