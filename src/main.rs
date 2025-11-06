@@ -1,5 +1,7 @@
+mod peer;
 mod torrent;
 mod tracker;
+mod peer;
 #[tokio::main]
 async fn main() {
     let (torrent, info_hash) = torrent::load_file("torrents/cwel.torrent").await.unwrap();
