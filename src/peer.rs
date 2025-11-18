@@ -67,6 +67,41 @@ impl PeerConnection {
             bitfield: Vec::new(),
         }
     }
+
+    pub async fn handshake(&mut self) -> Result<()> {
+        let mut handshake = Vec::new();
+        handshake.push(19u8); // Length
+        handshake.extend_from_slice(b"BitTorrent protocol");
+        handshake.extend_from_slice(&[0u8; 8]); // Reserved
+        handshake.extend_from_slice(&self.info_hash); // Info hash
+        handshake.extend_from_slice(b"-RT0001-123456789012"); // Your peer ID
+
+        self.socket.write_all(&handshake).await?;
+        let mut response_buf = vec![0u8; 68];
+        self.socket.read_exact(&mut response_buf).await?;
+
+        if response_buf[0] != 19 {
+            return Err(anyhow!("Invalid protocol length: {}", response_buf[0]));
+        }
+
+        if &response_buf[1..20] != b"BitTorrent protocol" {
+            return Err(anyhow!("Invalid protocol name"));
+        }
+
+        let received_info_hash: [u8; 20] = response_buf[28..48].try_into()?;
+        if received_info_hash != self.info_hash {
+            return Err(anyhow!("Info hash mismatch"));
+        }
+
+        let peer_id: [u8; 20] = response_buf[48..68].try_into()?;
+        self.peer_id = peer_id;
+        Ok(())
+    }
+
+    pub async fn sedn_message(&mut self) -> Result<()> {
+
+        Ok(())
+    }
 }
 
 pub async fn connect(
@@ -84,38 +119,4 @@ pub async fn connect(
     };
 
     Ok(PeerConnection::new(socket, peer_ip, peer_port, info_hash))
-}
-
-pub async fn handshake(mut peer: PeerConnection) -> Result<PeerConnection> {
-    let mut handshake = Vec::new();
-    handshake.push(19u8); // Length
-    handshake.extend_from_slice(b"BitTorrent protocol");
-    handshake.extend_from_slice(&[0u8; 8]); // Reserved
-    handshake.extend_from_slice(&peer.info_hash); // Info hash
-    handshake.extend_from_slice(b"-RT0001-123456789012"); // Your peer ID
-
-    peer.socket.write_all(&handshake).await?;
-    let mut response_buf = vec![0u8; 68];
-    peer.socket.read_exact(&mut response_buf).await?;
-
-    // Validate protocol name length
-    if response_buf[0] != 19 {
-        return Err(anyhow!("Invalid protocol length: {}", response_buf[0]));
-    }
-
-    // Validate protocol name
-    if &response_buf[1..20] != b"BitTorrent protocol" {
-        return Err(anyhow!("Invalid protocol name"));
-    }
-
-    // Extract and verify info_hash
-    let received_info_hash: [u8; 20] = response_buf[28..48].try_into()?;
-    if received_info_hash != peer.info_hash {
-        return Err(anyhow!("Info hash mismatch"));
-    }
-    // Extract peer_id
-    let peer_id: [u8; 20] = response_buf[48..68].try_into()?;
-    peer.peer_id = peer_id;
-
-    Ok(peer)
 }
