@@ -1,4 +1,7 @@
+use std::io::Read;
+
 use anyhow::{Ok, Result, anyhow};
+use serde::de::value::UsizeDeserializer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
@@ -33,7 +36,7 @@ enum PeerMessage {
 }
 
 impl PeerMessage {
-    fn id(self) -> u8 {
+    fn id(&self) -> u8 {
         let id: u8 = match self {
             PeerMessage::Choke => 0,
             PeerMessage::Unchoke => 1,
@@ -155,7 +158,7 @@ fn get_message_bytes(peer_message: PeerMessage) -> Result<()> {
             message_bytes.extend_from_slice(&[0, 0, 0, 1]);
             message_bytes.push(0);
         }
-        PeerMessage::Choke => {
+        PeerMessage::Unchoke => {
             message_bytes.extend_from_slice(&[0, 0, 0, 1]);
             message_bytes.push(1);
         }
@@ -169,21 +172,37 @@ fn get_message_bytes(peer_message: PeerMessage) -> Result<()> {
         }
         PeerMessage::Have { piece_index } => {
             let mut buffe: Vec<u8> = vec![0; 4];
-            let lenght: Vec<u8> = piece_index.to_be_bytes().len().to_be_bytes().into();
-            buffe = lenght;
+            let lenght: usize = piece_index.to_be_bytes().len() + 1;
+            buffe = lenght.to_be_bytes().into();
             buffe.extend_from_slice(&piece_index.to_be_bytes());
+            message_bytes.push(4);
             message_bytes.extend_from_slice(&buffe);
         }
         PeerMessage::Bitfield { bitfield } => {
             let mut buffe: Vec<u8> = vec![0; 4];
-            let lenght: Vec<u8> = piece_index.to_be_bytes().len().to_be_bytes().into();
-            buffe = lenght;
-            buffe.extend_from_slice(&piece_index.to_be_bytes());
+            let lenght: usize = bitfield.len() + 1;
+            buffe = lenght.to_be_bytes().into();
+            buffe.extend_from_slice(&bitfield);
+            message_bytes.push(5);
             message_bytes.extend_from_slice(&buffe);
         }
-        PeerMessage::Request => 6,
+        PeerMessage::Request {
+            index,
+            begin,
+            length,
+        } => {
+            let mut buffe: Vec<u8> = vec![0; 4];
+            let mut length_all: u32 = index + begin + length + 1;
+            buffe = length_all.to_be_bytes().into();
+            buffe.extend_from_slice(&length_all.to_be_bytes());
+            message_bytes.push(6 as u8);
+            message_bytes.extend_from_slice(&buffe);
+        }
         PeerMessage::Piece => 7,
         PeerMessage::Cancel => 9,
+        PeerMessage::KeepAlive => {
+            message_bytes.extend_from_slice(&[0, 0, 0, 0]);
+        }
     };
     Ok(())
 }
