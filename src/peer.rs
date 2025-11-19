@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Ok, Result, anyhow};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
@@ -29,9 +29,37 @@ enum PeerMessage {
         begin: u32,
         length: u32,
     },
-    Port {
-        port: u16,
-    },
+    KeepAlive,
+}
+
+impl PeerMessage {
+    fn id(self) -> u8 {
+        let id: u8 = match self {
+            PeerMessage::Choke => 0,
+            PeerMessage::Unchoke => 1,
+            PeerMessage::Interested => 2,
+            PeerMessage::NotInterested => 3,
+            PeerMessage::Have { piece_index } => 4,
+            PeerMessage::Bitfield { bitfield } => 5,
+            PeerMessage::Request {
+                index,
+                begin,
+                length,
+            } => 6,
+            PeerMessage::Piece {
+                index,
+                begin,
+                block,
+            } => 7,
+            PeerMessage::Cancel {
+                index,
+                begin,
+                length,
+            } => 8,
+            PeerMessage::KeepAlive => 9,
+        };
+        id
+    }
 }
 
 pub struct PeerConnection {
@@ -98,8 +126,7 @@ impl PeerConnection {
         Ok(())
     }
 
-    pub async fn sedn_message(&mut self) -> Result<()> {
-
+    pub async fn send_message(&mut self, peer_message: PeerMessage) -> Result<()> {
         Ok(())
     }
 }
@@ -119,4 +146,44 @@ pub async fn connect(
     };
 
     Ok(PeerConnection::new(socket, peer_ip, peer_port, info_hash))
+}
+
+fn get_message_bytes(peer_message: PeerMessage) -> Result<()> {
+    let mut message_bytes = vec![];
+    match peer_message {
+        PeerMessage::Choke => {
+            message_bytes.extend_from_slice(&[0, 0, 0, 1]);
+            message_bytes.push(0);
+        }
+        PeerMessage::Choke => {
+            message_bytes.extend_from_slice(&[0, 0, 0, 1]);
+            message_bytes.push(1);
+        }
+        PeerMessage::Interested => {
+            message_bytes.extend_from_slice(&[0, 0, 0, 1]);
+            message_bytes.push(2);
+        }
+        PeerMessage::NotInterested => {
+            message_bytes.extend_from_slice(&[0, 0, 0, 1]);
+            message_bytes.push(3);
+        }
+        PeerMessage::Have { piece_index } => {
+            let mut buffe: Vec<u8> = vec![0; 4];
+            let lenght: Vec<u8> = piece_index.to_be_bytes().len().to_be_bytes().into();
+            buffe = lenght;
+            buffe.extend_from_slice(&piece_index.to_be_bytes());
+            message_bytes.extend_from_slice(&buffe);
+        }
+        PeerMessage::Bitfield { bitfield } => {
+            let mut buffe: Vec<u8> = vec![0; 4];
+            let lenght: Vec<u8> = piece_index.to_be_bytes().len().to_be_bytes().into();
+            buffe = lenght;
+            buffe.extend_from_slice(&piece_index.to_be_bytes());
+            message_bytes.extend_from_slice(&buffe);
+        }
+        PeerMessage::Request => 6,
+        PeerMessage::Piece => 7,
+        PeerMessage::Cancel => 9,
+    };
+    Ok(())
 }
