@@ -1,6 +1,7 @@
 use std::io::Read;
 
-use anyhow::{Ok, Result, anyhow};
+use anyhow::{Context, Ok, Result, anyhow};
+use bytes::buf;
 use serde::de::value::UsizeDeserializer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -130,6 +131,7 @@ impl PeerConnection {
     }
 
     pub async fn send_message(&mut self, peer_message: PeerMessage) -> Result<()> {
+        todo!();
         Ok(())
     }
 }
@@ -142,11 +144,10 @@ pub async fn connect(
     let addr = format!("{}:{}", peer_ip, peer_port);
     let connection_timeout = Duration::from_secs(5);
 
-    let socket = match timeout(connection_timeout, TcpStream::connect(&addr)).await {
-        Ok(Ok(socket)) => socket,
-        Ok(Err(e)) => return Err(anyhow!("Failed to connect to {}: {}", addr, e)),
-        Err(_) => return Err(anyhow!("Connection timeout to {}", addr)),
-    };
+    let socket = timeout(connection_timeout, TcpStream::connect(&addr))
+        .await
+        .context("Connection timeout")? // turns timeout into your error
+        .with_context(|| format!("Failed to connect to {}", addr))?; // adds context to IO error
 
     Ok(PeerConnection::new(socket, peer_ip, peer_port, info_hash))
 }
@@ -171,19 +172,19 @@ fn get_message_bytes(peer_message: PeerMessage) -> Result<()> {
             message_bytes.push(3);
         }
         PeerMessage::Have { piece_index } => {
-            let mut buffe: Vec<u8> = vec![0; 4];
+            let mut buffe: Vec<u8> = vec![];
             let lenght: usize = piece_index.to_be_bytes().len() + 1;
             buffe = lenght.to_be_bytes().into();
+            buffe.push(4);
             buffe.extend_from_slice(&piece_index.to_be_bytes());
-            message_bytes.push(4);
             message_bytes.extend_from_slice(&buffe);
         }
         PeerMessage::Bitfield { bitfield } => {
-            let mut buffe: Vec<u8> = vec![0; 4];
+            let mut buffe: Vec<u8> = vec![];
             let lenght: usize = bitfield.len() + 1;
             buffe = lenght.to_be_bytes().into();
+            buffe.push(5);
             buffe.extend_from_slice(&bitfield);
-            message_bytes.push(5);
             message_bytes.extend_from_slice(&buffe);
         }
         PeerMessage::Request {
@@ -191,15 +192,41 @@ fn get_message_bytes(peer_message: PeerMessage) -> Result<()> {
             begin,
             length,
         } => {
-            let mut buffe: Vec<u8> = vec![0; 4];
-            let mut length_all: u32 = index + begin + length + 1;
+            let mut buffe: Vec<u8> = vec![];
+            let length_all: u32 = index + begin + length + 1;
             buffe = length_all.to_be_bytes().into();
             buffe.extend_from_slice(&length_all.to_be_bytes());
-            message_bytes.push(6 as u8);
+            buffe.push(6 as u8);
+            message_bytes.extend_from_slice(&buffe);
+            message_bytes.extend_from_slice(&index.to_be_bytes());
+        }
+        PeerMessage::Piece {
+            index,
+            begin,
+            block,
+        } => {
+            let mut buffe: Vec<u8> = vec![];
+            let length_all: u32 = index + begin + block.len() as u32 + 1;
+            buffe.extend_from_slice(&length_all.to_be_bytes());
+            buffe.push(7 as u8);
+            buffe.extend_from_slice(&index.to_be_bytes());
+            buffe.extend_from_slice(&begin.to_be_bytes());
+            buffe.extend_from_slice(&block);
             message_bytes.extend_from_slice(&buffe);
         }
-        PeerMessage::Piece => 7,
-        PeerMessage::Cancel => 9,
+        PeerMessage::Cancel {
+            index,
+            begin,
+            length,
+        } => {
+            let mut buffe: Vec<u8> = vec![];
+            let length_all: u32 = index + begin + length + 1;
+            buffe = length_all.to_be_bytes().into();
+            buffe.extend_from_slice(&length_all.to_be_bytes());
+            buffe.push(6 as u8);
+            message_bytes.extend_from_slice(&buffe);
+            message_bytes.extend_from_slice(&index.to_be_bytes());
+        }
         PeerMessage::KeepAlive => {
             message_bytes.extend_from_slice(&[0, 0, 0, 0]);
         }
