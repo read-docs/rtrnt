@@ -152,84 +152,76 @@ pub async fn connect(
     Ok(PeerConnection::new(socket, peer_ip, peer_port, info_hash))
 }
 
-fn get_message_bytes(peer_message: PeerMessage) -> Result<()> {
+fn get_message_bytes(peer_message: PeerMessage) -> Result<Vec<u8>> {
     let mut message_bytes = vec![];
     match peer_message {
         PeerMessage::Choke => {
-            message_bytes.extend_from_slice(&[0, 0, 0, 1]);
+            message_bytes.extend_from_slice(&1u32.to_be_bytes());
             message_bytes.push(0);
         }
         PeerMessage::Unchoke => {
-            message_bytes.extend_from_slice(&[0, 0, 0, 1]);
+            message_bytes.extend_from_slice(&1u32.to_be_bytes());
             message_bytes.push(1);
         }
         PeerMessage::Interested => {
-            message_bytes.extend_from_slice(&[0, 0, 0, 1]);
+            message_bytes.extend_from_slice(&1u32.to_be_bytes());
             message_bytes.push(2);
         }
         PeerMessage::NotInterested => {
-            message_bytes.extend_from_slice(&[0, 0, 0, 1]);
+            message_bytes.extend_from_slice(&1u32.to_be_bytes());
             message_bytes.push(3);
         }
         PeerMessage::Have { piece_index } => {
-            let mut buffe: Vec<u8> = vec![];
-            let lenght: usize = piece_index.to_be_bytes().len() + 1;
-            buffe = lenght.to_be_bytes().into();
-            buffe.push(4);
-            buffe.extend_from_slice(&piece_index.to_be_bytes());
-            message_bytes.extend_from_slice(&buffe);
+            let length: u32 = 5; // 1 byte ID + 4 bytes piece_index
+            message_bytes.extend_from_slice(&length.to_be_bytes());
+            message_bytes.push(4);
+            message_bytes.extend_from_slice(&piece_index.to_be_bytes());
         }
         PeerMessage::Bitfield { bitfield } => {
-            let mut buffe: Vec<u8> = vec![];
-            let lenght: usize = bitfield.len() + 1;
-            buffe = lenght.to_be_bytes().into();
-            buffe.push(5);
-            buffe.extend_from_slice(&bitfield);
-            message_bytes.extend_from_slice(&buffe);
+            let length: u32 = 1 + bitfield.len() as u32; // 1 byte ID + bitfield bytes
+            message_bytes.extend_from_slice(&length.to_be_bytes());
+            message_bytes.push(5);
+            message_bytes.extend_from_slice(&bitfield);
         }
         PeerMessage::Request {
             index,
             begin,
             length,
         } => {
-            let mut buffe: Vec<u8> = vec![];
-            let length_all: u32 = index + begin + length + 1;
-            buffe = length_all.to_be_bytes().into();
-            buffe.extend_from_slice(&length_all.to_be_bytes());
-            buffe.push(6 as u8);
-            message_bytes.extend_from_slice(&buffe);
+            let msg_length: u32 = 13; // 1 byte ID + 4 bytes index + 4 bytes begin + 4 bytes length
+            message_bytes.extend_from_slice(&msg_length.to_be_bytes());
+            message_bytes.push(6);
             message_bytes.extend_from_slice(&index.to_be_bytes());
+            message_bytes.extend_from_slice(&begin.to_be_bytes());
+            message_bytes.extend_from_slice(&length.to_be_bytes());
         }
         PeerMessage::Piece {
             index,
             begin,
             block,
         } => {
-            let mut buffe: Vec<u8> = vec![];
-            let length_all: u32 = index + begin + block.len() as u32 + 1;
-            buffe.extend_from_slice(&length_all.to_be_bytes());
-            buffe.push(7 as u8);
-            buffe.extend_from_slice(&index.to_be_bytes());
-            buffe.extend_from_slice(&begin.to_be_bytes());
-            buffe.extend_from_slice(&block);
-            message_bytes.extend_from_slice(&buffe);
+            let msg_length: u32 = 9 + block.len() as u32; // 1 byte ID + 4 bytes index + 4 bytes begin + block bytes
+            message_bytes.extend_from_slice(&msg_length.to_be_bytes());
+            message_bytes.push(7);
+            message_bytes.extend_from_slice(&index.to_be_bytes());
+            message_bytes.extend_from_slice(&begin.to_be_bytes());
+            message_bytes.extend_from_slice(&block);
         }
         PeerMessage::Cancel {
             index,
             begin,
             length,
         } => {
-            let mut buffe: Vec<u8> = vec![];
-            let length_all: u32 = index + begin + length + 1;
-            buffe = length_all.to_be_bytes().into();
-            buffe.extend_from_slice(&length_all.to_be_bytes());
-            buffe.push(6 as u8);
-            message_bytes.extend_from_slice(&buffe);
+            let msg_length: u32 = 13; // 1 byte ID + 4 bytes index + 4 bytes begin + 4 bytes length
+            message_bytes.extend_from_slice(&msg_length.to_be_bytes());
+            message_bytes.push(8);
             message_bytes.extend_from_slice(&index.to_be_bytes());
+            message_bytes.extend_from_slice(&begin.to_be_bytes());
+            message_bytes.extend_from_slice(&length.to_be_bytes());
         }
         PeerMessage::KeepAlive => {
-            message_bytes.extend_from_slice(&[0, 0, 0, 0]);
+            message_bytes.extend_from_slice(&0u32.to_be_bytes());
         }
     };
-    Ok(())
+    Ok(message_bytes)
 }
