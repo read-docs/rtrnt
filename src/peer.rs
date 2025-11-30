@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
 
-enum PeerMessage {
+pub enum PeerMessage {
     Choke,
     Unchoke,
     Interested,
@@ -131,8 +131,68 @@ impl PeerConnection {
     }
 
     pub async fn send_message(&mut self, peer_message: PeerMessage) -> Result<()> {
-        self.socket
+        let bytes = get_message_bytes(peer_message)?;
+        self.socket.write_all(&bytes).await?;
         Ok(())
+    }
+
+    pub async fn receive_message(&mut self) -> Result<PeerMessage> {
+        let length = self.socket.read_u32().await?;
+
+        if length == 0 {
+            return Ok(PeerMessage::KeepAlive);
+        }
+
+        let id = self.socket.read_u8().await?;
+
+        match id {
+            0 => Ok(PeerMessage::Choke),
+            1 => Ok(PeerMessage::Unchoke),
+            2 => Ok(PeerMessage::Interested),
+            3 => Ok(PeerMessage::NotInterested),
+            4 => {
+                let piece_index = self.socket.read_u32().await?;
+                Ok(PeerMessage::Have { piece_index })
+            }
+            5 => {
+                let mut bitfield = vec![0u8; (length - 1) as usize];
+                self.socket.read_exact(&mut bitfield).await?;
+                Ok(PeerMessage::Bitfield { bitfield })
+            }
+            6 => {
+                let index = self.socket.read_u32().await?;
+                let begin = self.socket.read_u32().await?;
+                let length = self.socket.read_u32().await?;
+                Ok(PeerMessage::Request {
+                    index,
+                    begin,
+                    length,
+                })
+            }
+            7 => {
+                let index = self.socket.read_u32().await?;
+                let begin = self.socket.read_u32().await?;
+                let block_len = length - 9;
+                let mut block = vec![0u8; block_len as usize];
+                self.socket.read_exact(&mut block).await?;
+                Ok(PeerMessage::Piece {
+                    index,
+                    begin,
+                    block,
+                })
+            }
+            8 => {
+                let index = self.socket.read_u32().await?;
+                let begin = self.socket.read_u32().await?;
+                let length = self.socket.read_u32().await?;
+                Ok(PeerMessage::Cancel {
+                    index,
+                    begin,
+                    length,
+                })
+            }
+            _ => Err(anyhow!("Unknown message ID: {}", id)),
+        }
     }
 }
 
@@ -142,7 +202,7 @@ pub async fn connect(
     info_hash: [u8; 20],
 ) -> Result<PeerConnection> {
     let addr = format!("{}:{}", peer_ip, peer_port);
-    let connection_timeout = Duration::from_secs(5);
+    let connection_timeout = Duration::from_secs(30);
 
     let socket = timeout(connection_timeout, TcpStream::connect(&addr))
         .await
