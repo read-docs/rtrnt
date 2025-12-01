@@ -136,6 +136,23 @@ impl PeerConnection {
         Ok(())
     }
 
+    pub async fn negotiate(&mut self) -> Result<()> {
+        let _bitfield = self.receive_message().await?;
+
+        self.send_message(PeerMessage::Interested).await?;
+        self.am_interested = true;
+
+        loop {
+            let msg = self.receive_message().await?;
+            if matches!(msg, PeerMessage::Unchoke) {
+                self.peer_choking = false;
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn receive_message(&mut self) -> Result<PeerMessage> {
         let length = self.socket.read_u32().await?;
 
@@ -202,7 +219,7 @@ pub async fn connect(
     info_hash: [u8; 20],
 ) -> Result<PeerConnection> {
     let addr = format!("{}:{}", peer_ip, peer_port);
-    let connection_timeout = Duration::from_secs(30);
+    let connection_timeout = Duration::from_secs(3);
 
     let socket = timeout(connection_timeout, TcpStream::connect(&addr))
         .await
