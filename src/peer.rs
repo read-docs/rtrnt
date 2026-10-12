@@ -1,4 +1,5 @@
 use crate::extension::{self, ExtendedHandshake};
+use crate::fast;
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::{Buf, BytesMut};
 use rand::Rng;
@@ -72,14 +73,46 @@ pub enum PeerMessage {
         id: u8,
         payload: Vec<u8>,
     },
-    /// A message type we don't implement (e.g. the fast extension); it is
-    /// skipped.
+    /// Fast extension (BEP 6): the receiver might like to download this
+    /// piece. Only a hint.
+    SuggestPiece {
+        piece_index: u32,
+    },
+    /// Fast extension: the sender has every piece. Stands in for a Bitfield.
+    HaveAll,
+    /// Fast extension: the sender has no piece. Stands in for a Bitfield.
+    HaveNone,
+    /// Fast extension: the sender will not serve this request.
+    RejectRequest {
+        index: u32,
+        begin: u32,
+        length: u32,
+    },
+    /// Fast extension: the sender serves requests for this piece even while
+    /// it chokes the receiver (once it has the piece).
+    AllowedFast {
+        piece_index: u32,
+    },
+    /// A message type we don't implement; it is skipped.
     Unknown {
         id: u8,
     },
 }
 
 impl PeerMessage {
+    /// Whether this is one of the fast extension's messages, which only
+    /// peers that both support it may send.
+    pub fn is_fast(&self) -> bool {
+        matches!(
+            self,
+            PeerMessage::SuggestPiece { .. }
+                | PeerMessage::HaveAll
+                | PeerMessage::HaveNone
+                | PeerMessage::RejectRequest { .. }
+                | PeerMessage::AllowedFast { .. }
+        )
+    }
+
     /// Serializes the message, including its 4-byte length prefix.
     pub fn encode(&self) -> Vec<u8> {
         let mut payload = Vec::new();
@@ -130,6 +163,26 @@ impl PeerMessage {
             PeerMessage::Port { port } => {
                 payload.push(9);
                 payload.extend_from_slice(&port.to_be_bytes());
+            }
+            PeerMessage::SuggestPiece { piece_index } => {
+                payload.push(0x0d);
+                payload.extend_from_slice(&piece_index.to_be_bytes());
+            }
+            PeerMessage::HaveAll => payload.push(0x0e),
+            PeerMessage::HaveNone => payload.push(0x0f),
+            PeerMessage::RejectRequest {
+                index,
+                begin,
+                length,
+            } => {
+                payload.push(0x10);
+                payload.extend_from_slice(&index.to_be_bytes());
+                payload.extend_from_slice(&begin.to_be_bytes());
+                payload.extend_from_slice(&length.to_be_bytes());
+            }
+            PeerMessage::AllowedFast { piece_index } => {
+                payload.push(0x11);
+                payload.extend_from_slice(&piece_index.to_be_bytes());
             }
             PeerMessage::Extended { id, payload: body } => {
                 payload.push(20);
@@ -207,6 +260,28 @@ impl PeerMessage {
                     port: u16::from_be_bytes([body[0], body[1]]),
                 }
             }
+            0x0d => {
+                expect_len(4)?;
+                PeerMessage::SuggestPiece {
+                    piece_index: be_u32(body, 0)?,
+                }
+            }
+            0x0e => expect_len(0).map(|_| PeerMessage::HaveAll)?,
+            0x0f => expect_len(0).map(|_| PeerMessage::HaveNone)?,
+            0x10 => {
+                expect_len(12)?;
+                PeerMessage::RejectRequest {
+                    index: be_u32(body, 0)?,
+                    begin: be_u32(body, 4)?,
+                    length: be_u32(body, 8)?,
+                }
+            }
+            0x11 => {
+                expect_len(4)?;
+                PeerMessage::AllowedFast {
+                    piece_index: be_u32(body, 0)?,
+                }
+            }
             20 => {
                 let Some((&id, payload)) = body.split_first() else {
                     bail!("extended message has no extended id");
@@ -246,9 +321,11 @@ pub fn handshake_bytes(info_hash: &[u8; 20], peer_id: &[u8; 20]) -> [u8; 68] {
     handshake[0] = PROTOCOL.len() as u8;
     handshake[1..20].copy_from_slice(PROTOCOL);
     // Bytes 20..28 are reserved extension bits. We set the extension
-    // protocol's (BEP 10) and the DHT's (BEP 5).
+    // protocol's (BEP 10), the DHT's (BEP 5) and the fast extension's
+    // (BEP 6).
     handshake[20 + extension::RESERVED_BYTE] |= extension::RESERVED_BIT;
     handshake[27] |= RESERVED_DHT;
+    handshake[20 + fast::RESERVED_BYTE] |= fast::RESERVED_BIT;
     handshake[28..48].copy_from_slice(info_hash);
     handshake[48..68].copy_from_slice(peer_id);
     handshake
@@ -272,6 +349,11 @@ impl Handshake {
     /// message.
     pub fn supports_dht(&self) -> bool {
         self.reserved[7] & RESERVED_DHT != 0
+    }
+
+    /// Whether the peer supports the fast extension (BEP 6).
+    pub fn supports_fast(&self) -> bool {
+        self.reserved[fast::RESERVED_BYTE] & fast::RESERVED_BIT != 0
     }
 }
 
@@ -325,6 +407,11 @@ pub struct PeerConnection {
     extensions: bool,
     /// The peer's extension handshake, once it has sent one.
     peer_extensions: Option<ExtendedHandshake>,
+    /// Whether both sides support the fast extension (BEP 6).
+    fast: bool,
+    /// Pieces the peer said it serves us even while it chokes us (Allowed
+    /// Fast).
+    allowed_fast: Vec<bool>,
 }
 
 impl PeerConnection {
@@ -406,6 +493,9 @@ impl PeerConnection {
             // We always set the bit ourselves.
             extensions: handshake.supports_extensions(),
             peer_extensions: None,
+            // We always set this bit too.
+            fast: handshake.supports_fast(),
+            allowed_fast: vec![false; num_pieces],
         }
     }
 
@@ -457,6 +547,27 @@ impl PeerConnection {
     /// Whether the peer runs a DHT node, and so wants our `Port` message.
     pub fn supports_dht(&self) -> bool {
         self.dht
+    }
+
+    /// Whether both sides support the fast extension (BEP 6), so that its
+    /// messages may be sent and every request gets a Piece or a Reject.
+    pub fn supports_fast(&self) -> bool {
+        self.fast
+    }
+
+    /// Pieces the peer said it serves us even while it chokes us. It may
+    /// not have them yet.
+    pub fn allowed_fast(&self) -> &[bool] {
+        &self.allowed_fast
+    }
+
+    /// Stops counting piece `index` as allowed fast, say because the peer
+    /// rejected a request for it while choking us after all. A later
+    /// Allowed Fast for it counts again.
+    pub fn disallow_fast(&mut self, index: u32) {
+        if let Some(allowed) = self.allowed_fast.get_mut(index as usize) {
+            *allowed = false;
+        }
     }
 
     pub fn is_choked(&self) -> bool {
@@ -517,7 +628,8 @@ impl PeerConnection {
 
     /// Sends Choke or Unchoke if our choke state changed. A choked peer's
     /// pending requests are dropped, and it knows to ask again once
-    /// unchoked.
+    /// unchoked; with the fast extension, the caller rejects them after
+    /// this.
     pub async fn set_choking(&mut self, choking: bool) -> Result<()> {
         if choking != self.am_choking {
             let message = if choking {
@@ -574,6 +686,11 @@ impl PeerConnection {
     }
 
     fn apply(&mut self, message: &PeerMessage) -> Result<()> {
+        if message.is_fast() && !self.fast {
+            bail!(ProtocolViolation(
+                "fast extension message without the fast extension"
+            ));
+        }
         match message {
             PeerMessage::Choke => self.peer_choking = true,
             PeerMessage::Unchoke => self.peer_choking = false,
@@ -595,6 +712,14 @@ impl PeerConnection {
                 }
                 for (i, has) in self.peer_has.iter_mut().enumerate() {
                     *has = bitfield[i / 8] & (0x80 >> (i % 8)) != 0;
+                }
+            }
+            PeerMessage::HaveAll => self.peer_has.fill(true),
+            PeerMessage::HaveNone => self.peer_has.fill(false),
+            PeerMessage::AllowedFast { piece_index } => {
+                // Like Have, an index past the end is ignored.
+                if let Some(allowed) = self.allowed_fast.get_mut(*piece_index as usize) {
+                    *allowed = true;
                 }
             }
             PeerMessage::Extended {
@@ -667,6 +792,15 @@ mod tests {
                 id: 3,
                 payload: vec![],
             },
+            PeerMessage::SuggestPiece { piece_index: 7 },
+            PeerMessage::HaveAll,
+            PeerMessage::HaveNone,
+            PeerMessage::RejectRequest {
+                index: 1,
+                begin: 16384,
+                length: 16384,
+            },
+            PeerMessage::AllowedFast { piece_index: 9 },
             PeerMessage::Unknown { id: 21 },
         ];
         for message in messages {
@@ -687,6 +821,11 @@ mod tests {
             &[8],
             &[9, 1],
             &[20],
+            &[0x0d, 0, 0, 0],
+            &[0x0e, 0],
+            &[0x0f, 0],
+            &[0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            &[0x11, 0, 0, 0, 0, 0],
         ];
         for case in cases {
             assert!(PeerMessage::decode(case).is_err(), "accepted {:?}", case);
@@ -701,11 +840,12 @@ mod tests {
         assert!(peer_id[8..].iter().all(u8::is_ascii_alphanumeric));
 
         let handshake = handshake_bytes(&info_hash, &peer_id);
-        assert_eq!(handshake[20..28], [0, 0, 0, 0, 0, 0x10, 0, 0x01]);
+        assert_eq!(handshake[20..28], [0, 0, 0, 0, 0, 0x10, 0, 0x05]);
         let parsed = parse_handshake(&handshake, &info_hash).unwrap();
         assert_eq!(parsed.peer_id, peer_id);
         assert!(parsed.supports_extensions());
         assert!(parsed.supports_dht());
+        assert!(parsed.supports_fast());
         assert!(parse_handshake(&handshake, &[4u8; 20]).is_err());
 
         let mut bad = handshake;
@@ -714,10 +854,12 @@ mod tests {
 
         // Other clients' bits are recorded, and the extension bit read alone.
         let mut other = handshake;
-        other[20..28].copy_from_slice(&[0x80, 0, 0, 0, 0, 0xef, 0, 0x05]);
+        other[20..28].copy_from_slice(&[0x80, 0, 0, 0, 0, 0xef, 0, 0x0b]);
         let parsed = parse_handshake(&other, &info_hash).unwrap();
-        assert_eq!(parsed.reserved, [0x80, 0, 0, 0, 0, 0xef, 0, 0x05]);
+        assert_eq!(parsed.reserved, [0x80, 0, 0, 0, 0, 0xef, 0, 0x0b]);
         assert!(!parsed.supports_extensions());
+        assert!(!parsed.supports_fast());
+        assert!(parsed.supports_dht());
     }
 
     /// A mock peer's handshake, with the extension protocol bit cleared
@@ -789,9 +931,11 @@ mod tests {
     }
 
     /// Connects to a mock peer that answers the handshake, sends
-    /// `messages`, and returns everything it receives until we hang up.
+    /// `messages`, and returns everything it receives until we hang up. The
+    /// mock supports the fast extension if `fast`.
     async fn mock_peer(
         num_pieces: usize,
+        fast: bool,
         messages: Vec<PeerMessage>,
     ) -> (PeerConnection, tokio::task::JoinHandle<Vec<PeerMessage>>) {
         let info_hash = [5u8; 20];
@@ -802,7 +946,10 @@ mod tests {
             let mut handshake = [0u8; 68];
             socket.read_exact(&mut handshake).await.unwrap();
             // Without the extension protocol, so no extension handshake.
-            let reply = remote_handshake(&info_hash, false);
+            let mut reply = remote_handshake(&info_hash, false);
+            if !fast {
+                reply[20 + fast::RESERVED_BYTE] &= !fast::RESERVED_BIT;
+            }
             socket.write_all(&reply).await.unwrap();
             for message in messages {
                 socket.write_all(&message.encode()).await.unwrap();
@@ -831,7 +978,8 @@ mod tests {
             PeerMessage::Interested,
             PeerMessage::NotInterested,
         ];
-        let (mut conn, remote) = mock_peer(3, messages).await;
+        let (mut conn, remote) = mock_peer(3, false, messages).await;
+        assert!(!conn.supports_fast());
         assert!(conn.am_choking());
         assert!(!conn.peer_interested());
         conn.receive().await.unwrap();
@@ -991,5 +1139,50 @@ mod tests {
         let err = conn.receive().await.unwrap_err();
         assert!(err.is::<ProtocolViolation>(), "{err:#}");
         assert!(conn.peer_extensions().is_none());
+    }
+
+    #[tokio::test]
+    async fn tracks_have_all_have_none_and_allowed_fast() {
+        let messages = vec![
+            PeerMessage::HaveAll,
+            PeerMessage::AllowedFast { piece_index: 1 },
+            // Past the end: ignored.
+            PeerMessage::AllowedFast { piece_index: 3 },
+            PeerMessage::SuggestPiece { piece_index: 2 },
+            PeerMessage::HaveNone,
+        ];
+        let (mut conn, _remote) = mock_peer(3, true, messages).await;
+        assert!(conn.supports_fast());
+        conn.receive().await.unwrap();
+        assert_eq!(conn.peer_has(), [true; 3]);
+        conn.receive().await.unwrap();
+        conn.receive().await.unwrap();
+        assert_eq!(conn.allowed_fast(), [false, true, false]);
+        conn.receive().await.unwrap();
+        assert_eq!(conn.receive().await.unwrap(), PeerMessage::HaveNone);
+        assert_eq!(conn.peer_has(), [false; 3]);
+    }
+
+    #[tokio::test]
+    async fn fast_messages_without_the_fast_extension_are_a_protocol_violation() {
+        let fast_messages = [
+            PeerMessage::HaveAll,
+            PeerMessage::HaveNone,
+            PeerMessage::SuggestPiece { piece_index: 0 },
+            PeerMessage::AllowedFast { piece_index: 0 },
+            PeerMessage::RejectRequest {
+                index: 0,
+                begin: 0,
+                length: 16384,
+            },
+        ];
+        for message in fast_messages {
+            assert!(message.is_fast());
+            let (mut conn, _remote) = mock_peer(3, false, vec![message.clone()]).await;
+            let err = conn.receive().await.unwrap_err();
+            assert!(err.is::<ProtocolViolation>(), "{message:?}: {err:#}");
+            assert_eq!(conn.peer_has(), [false; 3]);
+        }
+        assert!(!PeerMessage::Choke.is_fast());
     }
 }
