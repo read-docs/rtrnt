@@ -22,19 +22,24 @@ A terminal-based BitTorrent client written in Rust.
 cargo run --release -- path/to/file.torrent -o ~/Downloads
 ```
 
-Options: `-o, --output <DIR>` (default `.`), `--max-peers <N>` (default 30), `-p, --port <PORT>` to listen on for incoming peers over IPv4 and IPv6 (default 6881), `--no-dht` to find peers through trackers only, `--check` to verify a finished download, `--scrape` to print each tracker's seeder, leecher and completed counts without downloading, and `--seed-ratio <RATIO>` and `--seed-time <MINUTES>` to keep seeding once the download is complete, until we have uploaded that many times the torrent's size or for that long, whichever comes first (both default to 0, which exits at completion). Without `--no-dht`, peers are also looked up in the BitTorrent DHT (on UDP, same port), so torrents without trackers download too. Set `RUST_LOG=debug` for per-peer logs.
+Options: `-o, --output <DIR>` (default `.`), `--max-peers <N>` (default 30), `-p, --port <PORT>` to listen on for incoming peers over IPv4 and IPv6 (default 6881), `--no-dht` to find peers through trackers only (`--dht` turns the DHT back on if the config file turned it off), `--check` to verify a finished download, `--scrape` to print each tracker's seeder, leecher and completed counts without downloading, `--seed-ratio <RATIO>` and `--seed-time <MINUTES>` to keep seeding once the download is complete, until we have uploaded that many times the torrent's size or for that long, whichever comes first (both default to 0, which exits at completion), and `--max-download-rate <KIB/S>` and `--max-upload-rate <KIB/S>` to limit how fast piece data moves each way, in KiB per second across all peers (both default to 0, unlimited). The limits count piece data only, not protocol messages or TCP/IP headers, so the traffic on the wire is slightly higher. Without `--no-dht`, peers are also looked up in the BitTorrent DHT (on UDP, same port), so torrents without trackers download too. Set `RUST_LOG=debug` for per-peer logs.
 
 ### Config file
 
-The first three options can also be set in `~/.config/rtrnt/config.toml` (or `$XDG_CONFIG_HOME/rtrnt/config.toml`), or in a file given with `--config <PATH>`. Keys are the long option names, and every key is optional:
+Every option except `--check`, `--scrape`, `--config` and `--print-config` can also be set in `~/.config/rtrnt/config.toml` (or `$XDG_CONFIG_HOME/rtrnt/config.toml`), or in a file given with `--config <PATH>`. Keys are the long option names, except that `--no-dht` is `dht = false`, and every key is optional:
 
 ```toml
 output = "~/Downloads"
 max-peers = 50
 port = 51413
+seed-ratio = 1.5
+seed-time = 120
+dht = false
+max-download-rate = 2048
+max-upload-rate = 256
 ```
 
-A flag on the command line overrides the file, and the file overrides the built-in defaults. `--print-config` shows the effective settings and where each one came from. Unknown keys are errors, so typos don't go unnoticed. The seeding limits and `--no-dht` can only be set on the command line for now.
+A flag on the command line overrides the file, and the file overrides the built-in defaults. `--print-config` shows the effective settings and where each one came from. Unknown keys are errors, so typos don't go unnoticed.
 
 Run the tests with `cargo test`. They include a loopback integration test against a mock seeder.
 
@@ -73,6 +78,7 @@ src/
 ├── extension.rs # Extension protocol (BEP 10) handshake
 ├── peer.rs      # Peer wire protocol: handshake, message encode/decode
 ├── peer_pool.rs # Known peers, retry backoff and bans
+├── rate_limit.rs # Upload and download rate limits (shared token buckets)
 ├── storage.rs   # Maps pieces onto files on disk (single and multi-file)
 ├── torrent.rs   # Torrent file parsing and validation
 └── tracker.rs   # Tracker communication (UDP/HTTP)

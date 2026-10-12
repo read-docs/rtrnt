@@ -9,6 +9,7 @@ pub mod download;
 pub mod extension;
 pub mod peer;
 mod peer_pool;
+pub mod rate_limit;
 pub mod storage;
 pub mod torrent;
 pub mod tracker;
