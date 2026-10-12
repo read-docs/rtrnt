@@ -10,10 +10,11 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
 use sha1::Digest;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::Poll;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
@@ -99,8 +100,8 @@ pub async fn download_file(
         return Ok(());
     }
 
-    let listener = listen(config.listen_port).await;
-    let port = match listener.as_ref().map(TcpListener::local_addr) {
+    let listeners = listen(config.listen_port).await;
+    let port = match listeners.first().map(TcpListener::local_addr) {
         Some(Ok(addr)) => {
             info!(port = addr.port(), "listening for peers");
             addr.port()
@@ -129,7 +130,7 @@ pub async fn download_file(
         &have,
         &peers,
         config.max_peers,
-        listener,
+        listeners,
         Some(announcer),
         shutdown,
     )
@@ -139,9 +140,11 @@ pub async fn download_file(
 }
 
 /// Listens for incoming peers on `port`, or on a free port if that one is
-/// taken (say, by another download). Without a listener we still download,
-/// over the connections we open ourselves.
-async fn listen(port: u16) -> Option<TcpListener> {
+/// taken (say, by another download): over IPv4, and over IPv6 on the port
+/// the IPv4 listener got, so trackers can be told a single port. The IPv4
+/// listener comes first. Without IPv6 we listen over IPv4 only, and without
+/// any listener we still download, over the connections we open ourselves.
+pub async fn listen(port: u16) -> Vec<TcpListener> {
     let bind = |port| TcpListener::bind((Ipv4Addr::UNSPECIFIED, port));
     let result = match bind(port).await {
         Err(e) if port != 0 => {
@@ -150,9 +153,32 @@ async fn listen(port: u16) -> Option<TcpListener> {
         }
         result => result,
     };
-    result
+    let v4 = result
         .inspect_err(|e| warn!("cannot listen for peers: {e}"))
-        .ok()
+        .ok();
+    let port = match v4.as_ref().map(TcpListener::local_addr) {
+        Some(Ok(addr)) => addr.port(),
+        _ => port,
+    };
+    let v6 = listen_v6(port)
+        .inspect_err(|e| info!(port, "cannot listen for IPv6 peers: {e}"))
+        .ok();
+    v4.into_iter().chain(v6).collect()
+}
+
+/// Listens on `[::]:port` for IPv6 only, so that the socket does not also
+/// claim the port for IPv4.
+fn listen_v6(port: u16) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_only_v6(true)?;
+    // As `TcpListener::bind` does on Unix, so a restart can reuse the port.
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
+    socket.listen(1024)?;
+    TcpListener::from_std(socket.into())
 }
 
 /// Verifies a download against its torrent without changing anything on
@@ -224,9 +250,9 @@ fn verified_bytes(torrent: &TorrentFile, have: &[bool]) -> Result<u64> {
 /// most `max_peers` at once. A peer that drops is replaced by the next one,
 /// and failed peers are retried with backoff (see `PeerPool`).
 ///
-/// With a `listener`, peers that connect to us are downloaded from too, while
-/// there is room under `max_peers`. One that misbehaves is turned away by IP
-/// address from then on.
+/// Peers that connect to us on any of `listeners` are downloaded from too,
+/// while there is room under `max_peers`. One that misbehaves is turned away
+/// by IP address from then on.
 ///
 /// With an `announcer`, the tracker is re-announced to on its interval and
 /// the peers it returns join the pool. If we run out of peers, the tracker is
@@ -242,7 +268,7 @@ pub async fn download_from_peers(
     have: &[bool],
     peers: &[SocketAddr],
     max_peers: usize,
-    listener: Option<TcpListener>,
+    listeners: Vec<TcpListener>,
     mut announcer: Option<Announcer>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
@@ -345,7 +371,7 @@ pub async fn download_from_peers(
                     }
                 }
             }
-            (socket, addr) = accept(listener.as_ref()) => {
+            (socket, addr) = accept(&listeners) => {
                 if workers.len() >= max_peers {
                     debug!(%addr, "turning away incoming peer: too many peers");
                 } else if banned_ips.contains(&addr.ip()) {
@@ -370,7 +396,7 @@ pub async fn download_from_peers(
     // connecting are cut short. A worker writing a piece finishes the write
     // first, and even if aborted, the write runs on to the end on the
     // blocking pool. New peers are refused meanwhile.
-    drop(listener);
+    drop(listeners);
     queue.close();
     let drain = async { while workers.join_next().await.is_some() {} };
     if tokio::time::timeout(SHUTDOWN_GRACE, drain).await.is_err() {
@@ -408,14 +434,22 @@ async fn sleep_until_some(at: Option<Instant>) {
     }
 }
 
-/// Accepts the next incoming connection, or waits forever without a
-/// listener. Cancel-safe.
-async fn accept(listener: Option<&TcpListener>) -> (TcpStream, SocketAddr) {
-    let Some(listener) = listener else {
-        return std::future::pending().await;
+/// Accepts the next incoming connection on any of `listeners`, or waits
+/// forever without one. Cancel-safe.
+async fn accept(listeners: &[TcpListener]) -> (TcpStream, SocketAddr) {
+    let next = || {
+        std::future::poll_fn(|cx| {
+            listeners
+                .iter()
+                .find_map(|listener| match listener.poll_accept(cx) {
+                    Poll::Ready(result) => Some(result),
+                    Poll::Pending => None,
+                })
+                .map_or(Poll::Pending, Poll::Ready)
+        })
     };
     loop {
-        match listener.accept().await {
+        match next().await {
             Ok(incoming) => return incoming,
             Err(e) => {
                 warn!("cannot accept a peer: {e}");

@@ -1,7 +1,7 @@
 //! End-to-end downloads from mock seeders (and a mock tracker) over loopback.
 
 use rtrnt::announcer::Announcer;
-use rtrnt::download::{Interrupted, Session, download_from_peers};
+use rtrnt::download::{Interrupted, Session, download_from_peers, listen};
 use rtrnt::peer::{PeerMessage, generate_peer_id, handshake_bytes, parse_handshake};
 use rtrnt::storage::Storage;
 use rtrnt::torrent::{FileInfo, Info, TorrentFile};
@@ -10,7 +10,7 @@ use rtrnt::verify;
 use serde_bytes::ByteBuf;
 use sha1::Digest;
 use std::future::pending;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,6 +82,18 @@ async fn accept_partial(
 /// Connects to the leecher listening at `addr`, completes the handshake and
 /// advertises every piece.
 async fn connect_to_leecher(addr: SocketAddr, info_hash: [u8; 20], num_pieces: usize) -> TcpStream {
+    let all: Vec<usize> = (0..num_pieces).collect();
+    connect_partial(addr, info_hash, num_pieces, &all).await
+}
+
+/// Connects to the leecher listening at `addr`, completes the handshake and
+/// advertises `has`.
+async fn connect_partial(
+    addr: SocketAddr,
+    info_hash: [u8; 20],
+    num_pieces: usize,
+    has: &[usize],
+) -> TcpStream {
     let mut socket = TcpStream::connect(addr).await.unwrap();
     socket
         .write_all(&handshake_bytes(&info_hash, &generate_peer_id()))
@@ -90,8 +102,7 @@ async fn connect_to_leecher(addr: SocketAddr, info_hash: [u8; 20], num_pieces: u
     let mut handshake = [0u8; 68];
     socket.read_exact(&mut handshake).await.unwrap();
     parse_handshake(&handshake, &info_hash).unwrap();
-    let all: Vec<usize> = (0..num_pieces).collect();
-    send_bitfield(&mut socket, num_pieces, &all).await;
+    send_bitfield(&mut socket, num_pieces, has).await;
     socket
 }
 
@@ -239,7 +250,7 @@ async fn downloads_multi_file_torrent_from_mock_seeder() {
             &vec![false; num_pieces],
             &[dead_addr, seeder_addr],
             10,
-            None,
+            Vec::new(),
             None,
             pending(),
         ),
@@ -317,7 +328,7 @@ async fn replaces_peers_that_fail() {
             &vec![false; num_pieces],
             &[dead_addr, flaky_addr, healthy_addr],
             1,
-            None,
+            Vec::new(),
             None,
             pending(),
         ),
@@ -381,7 +392,7 @@ async fn endgame_finishes_despite_a_stalled_peer() {
             &vec![false; num_pieces],
             &[stalled_addr, healthy_addr],
             10,
-            None,
+            Vec::new(),
             None,
             pending(),
         ),
@@ -454,7 +465,7 @@ async fn loses_interest_when_a_peer_has_nothing_left_we_need() {
             &vec![false; num_pieces],
             &[choking_addr, partial_addr, last_addr],
             10,
-            None,
+            Vec::new(),
             None,
             pending(),
         ),
@@ -526,7 +537,7 @@ async fn pipelines_requests_across_pieces() {
             &vec![false; num_pieces],
             &[seeder_addr],
             10,
-            None,
+            Vec::new(),
             None,
             pending(),
         ),
@@ -604,7 +615,15 @@ async fn resumes_from_data_on_disk() {
 
     tokio::time::timeout(
         Duration::from_secs(30),
-        download_from_peers(session, &have, &[seeder_addr], 10, None, None, pending()),
+        download_from_peers(
+            session,
+            &have,
+            &[seeder_addr],
+            10,
+            Vec::new(),
+            None,
+            pending(),
+        ),
     )
     .await
     .expect("download timed out")
@@ -657,7 +676,7 @@ async fn downloads_from_a_peer_that_connects_to_us() {
             &vec![false; num_pieces],
             &[empty_addr, our_addr],
             10,
-            Some(listener),
+            vec![listener],
             None,
             pending(),
         ),
@@ -768,7 +787,7 @@ async fn reports_events_and_progress_to_the_tracker() {
             &vec![false; num_pieces],
             &peers,
             10,
-            None,
+            Vec::new(),
             Some(announcer),
             pending(),
         ),
@@ -868,7 +887,7 @@ async fn interrupted_download_keeps_pieces_and_tells_the_tracker() {
             &vec![false; num_pieces],
             &peers,
             10,
-            None,
+            Vec::new(),
             Some(announcer),
             shutdown,
         ),
@@ -1075,4 +1094,68 @@ async fn scrape_command_reports_each_tracker() {
     let (success, _, stderr) = run(&torrent).await;
     assert!(!success);
     assert!(stderr.contains("no tracker answered"), "{stderr}");
+}
+
+/// `listen` listens over IPv6 too, on the port the IPv4 listener got. Two
+/// seeders connect to us on that port, one over `127.0.0.1` with piece 0
+/// and one over `[::1]` with the rest, so the download needs both. The one
+/// peer we know of, which keeps the download from running out of peers
+/// until the seeders arrive, is reached over IPv6 as well. Skipped where
+/// IPv6 is unavailable.
+#[tokio::test]
+async fn downloads_from_peers_that_connect_over_ipv4_and_ipv6() {
+    init_tracing();
+    if TcpListener::bind("[::1]:0").await.is_err() {
+        eprintln!("skipping: IPv6 is not available");
+        return;
+    }
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+    assert_eq!(num_pieces, 3);
+
+    let empty = TcpListener::bind("[::1]:0").await.unwrap();
+    let empty_addr = empty.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut socket = accept_partial(&empty, info_hash, num_pieces, &[]).await;
+        while read_message(&mut socket).await.is_some() {}
+    });
+
+    let listeners = listen(0).await;
+    let addrs: Vec<SocketAddr> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+    assert_eq!(addrs.len(), 2, "not listening over both: {addrs:?}");
+    assert!(addrs[0].is_ipv4() && addrs[1].is_ipv6(), "{addrs:?}");
+    assert_eq!(addrs[0].port(), addrs[1].port());
+    let port = addrs[0].port();
+
+    for (ip, has) in [
+        (IpAddr::from(Ipv4Addr::LOCALHOST), vec![0]),
+        (IpAddr::from(Ipv6Addr::LOCALHOST), vec![1, 2]),
+    ] {
+        let seeder_data = Arc::clone(&data);
+        tokio::spawn(async move {
+            let our_addr = SocketAddr::new(ip, port);
+            let mut socket = connect_partial(our_addr, info_hash, num_pieces, &has).await;
+            send(&mut socket, PeerMessage::Unchoke).await;
+            serve(socket, &seeder_data).await;
+        });
+    }
+
+    let out = tempfile::tempdir().unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        download_from_peers(
+            session(torrent, info_hash, out.path()),
+            &vec![false; num_pieces],
+            &[empty_addr],
+            10,
+            listeners,
+            None,
+            pending(),
+        ),
+    )
+    .await
+    .expect("download timed out")
+    .expect("download failed");
+    assert_files_match(out.path(), &data);
 }

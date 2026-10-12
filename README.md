@@ -22,7 +22,7 @@ A terminal-based BitTorrent client written in Rust.
 cargo run --release -- path/to/file.torrent -o ~/Downloads
 ```
 
-Options: `-o, --output <DIR>` (default `.`), `--max-peers <N>` (default 30), `-p, --port <PORT>` to listen on for incoming peers (default 6881), `--check` to verify a finished download and `--scrape` to print each tracker's seeder, leecher and completed counts without downloading. Set `RUST_LOG=debug` for per-peer logs.
+Options: `-o, --output <DIR>` (default `.`), `--max-peers <N>` (default 30), `-p, --port <PORT>` to listen on for incoming peers over IPv4 and IPv6 (default 6881), `--check` to verify a finished download and `--scrape` to print each tracker's seeder, leecher and completed counts without downloading. Set `RUST_LOG=debug` for per-peer logs.
 
 Run the tests with `cargo test`. They include a loopback integration test against a mock seeder.
 
