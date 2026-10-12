@@ -11,7 +11,7 @@ A terminal-based BitTorrent client written in Rust.
 
 - 🚀 **Async/Await Architecture** - Built with Tokio for high-performance concurrent downloads
 - 🌐 **Multi-Protocol Support** - Compatible with both UDP and HTTP trackers
-- 🔗 **Peer Protocol Implementation** - Full BitTorrent peer wire protocol support
+- 🔗 **Peer Protocol Implementation** - Full BitTorrent peer wire protocol support, with the extension protocol (BEP 10) and the fast extension (BEP 6)
 - ⚡ **Parallel Downloads** - Concurrent piece downloading from multiple peers
 - 🔒 **Data Integrity** - SHA-1 hash verification for downloaded pieces
 - 📦 **Bencode Support** - Native torrent file parsing
@@ -76,6 +76,7 @@ src/
 │   └── search.rs  # Periodic lookups for the torrent being downloaded
 ├── download.rs  # Piece queue, peer workers, block pipelining, seeding
 ├── extension.rs # Extension protocol (BEP 10) handshake
+├── fast.rs      # Fast extension (BEP 6): allowed fast set, Have All/Have None
 ├── peer.rs      # Peer wire protocol: handshake, message encode/decode
 ├── peer_pool.rs # Known peers, retry backoff and bans
 ├── pex.rs       # Peer exchange (BEP 11): telling peers about each other
