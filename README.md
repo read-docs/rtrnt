@@ -44,14 +44,16 @@ See [ROADMAP.md](ROADMAP.md) for what's done and what's next.
 src/
 ├── main.rs      # CLI entry point (clap + tracing)
 ├── lib.rs       # Library root
+├── announcer.rs # Re-announces and completed/stopped events
 ├── bencode.rs   # Raw bencode scanning (info-hash span)
 ├── download.rs  # Piece queue, peer workers, block pipelining
 ├── peer.rs      # Peer wire protocol: handshake, message encode/decode
+├── peer_pool.rs # Known peers, retry backoff and bans
 ├── storage.rs   # Maps pieces onto files on disk (single and multi-file)
 ├── torrent.rs   # Torrent file parsing and validation
 └── tracker.rs   # Tracker communication (UDP/HTTP)
 tests/
-└── loopback.rs  # End-to-end download from a mock seeder
+└── loopback.rs  # End-to-end downloads from mock seeders and a mock tracker
 ```
 
 ## How It Works

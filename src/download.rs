@@ -1,8 +1,9 @@
+use crate::announcer::Announcer;
 use crate::peer::{self, PeerConnection, PeerMessage};
 use crate::peer_pool::PeerPool;
 use crate::storage::Storage;
 use crate::torrent::{self, TorrentFile};
-use crate::tracker::{self, AnnounceRequest};
+use crate::tracker::{AnnounceEvent, AnnounceRequest};
 use anyhow::{Result, anyhow, bail};
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
@@ -10,6 +11,7 @@ use sha1::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -52,6 +54,10 @@ pub async fn download_file(torrent_path: &Path, config: &DownloadConfig) -> Resu
         "loaded torrent"
     );
 
+    // Before announcing, so a bad output directory does not leave the
+    // tracker without a `stopped`.
+    let storage = Arc::new(Storage::new(&torrent.info, &config.output_dir)?);
+
     let peer_id = peer::generate_peer_id();
     let request = AnnounceRequest {
         info_hash,
@@ -60,18 +66,22 @@ pub async fn download_file(torrent_path: &Path, config: &DownloadConfig) -> Resu
         uploaded: 0,
         downloaded: 0,
         left: torrent.length(),
+        event: AnnounceEvent::Started,
     };
-    let response = tracker::announce(&torrent.trackers(), &request).await?;
-    info!(peers = response.peers.len(), "tracker announce succeeded");
+    let (announcer, peers) = Announcer::start(torrent.trackers(), request).await?;
+    if peers.is_empty() {
+        announcer.stop(false, 0).await;
+        bail!("no tracker returned any peers");
+    }
+    info!(peers = peers.len(), "tracker announce succeeded");
 
-    let storage = Arc::new(Storage::new(&torrent.info, &config.output_dir)?);
     let session = Arc::new(Session {
         torrent,
         info_hash,
         peer_id,
         storage,
     });
-    download_from_peers(session, &response.peers, config.max_peers).await?;
+    download_from_peers(session, &peers, config.max_peers, Some(announcer)).await?;
     info!(output = %config.output_dir.display(), "download complete");
     Ok(())
 }
@@ -79,26 +89,36 @@ pub async fn download_file(torrent_path: &Path, config: &DownloadConfig) -> Resu
 /// Downloads every piece from `peers`, connected to at most `max_peers` at
 /// once. A peer that drops is replaced by the next one, and failed peers are
 /// retried with backoff (see `PeerPool`).
+///
+/// With an `announcer`, the tracker is re-announced to on its interval and
+/// the peers it returns join the pool. If we run out of peers, the tracker is
+/// asked for more once before giving up. At the end the tracker is sent
+/// `completed` (if the download finished) and `stopped`.
 pub async fn download_from_peers(
     session: Arc<Session>,
     peers: &[SocketAddr],
     max_peers: usize,
+    mut announcer: Option<Announcer>,
 ) -> Result<()> {
     let num_pieces = session.torrent.num_pieces();
     let queue = Arc::new(PieceQueue::new(num_pieces));
-    let progress = progress_bar(session.torrent.length());
+    let progress = Arc::new(Progress::new(session.torrent.length()));
     let mut pool = PeerPool::default();
     pool.add(peers.iter().copied());
 
     let mut workers = JoinSet::new();
+    // Set once we ran out of peers and asked the tracker for more; cleared
+    // when a new connection is started.
+    let mut asked_for_peers = false;
     while !queue.is_done() {
         while workers.len() < max_peers {
             let Some(addr) = pool.next(Instant::now()) else {
                 break;
             };
+            asked_for_peers = false;
             let session = Arc::clone(&session);
             let queue = Arc::clone(&queue);
-            let progress = progress.clone();
+            let progress = Arc::clone(&progress);
             workers.spawn(async move {
                 let mut pieces = 0;
                 let result = peer_worker(&session, &queue, &progress, addr, &mut pieces).await;
@@ -108,7 +128,14 @@ pub async fn download_from_peers(
 
         let retry_at = pool.next_retry().filter(|_| workers.len() < max_peers);
         if workers.is_empty() && retry_at.is_none() {
-            break;
+            match &mut announcer {
+                Some(announcer) if !asked_for_peers => {
+                    info!("out of peers, asking the tracker for more");
+                    announcer.hurry();
+                    asked_for_peers = true;
+                }
+                _ => break,
+            }
         }
         tokio::select! {
             Some(joined) = workers.join_next() => {
@@ -132,6 +159,7 @@ pub async fn download_from_peers(
                 }
             }
             () = sleep_until_some(retry_at) => {}
+            peers = reannounce(&mut announcer, &progress.downloaded) => pool.add(peers),
         }
     }
 
@@ -141,9 +169,13 @@ pub async fn download_from_peers(
     if tokio::time::timeout(SHUTDOWN_GRACE, drain).await.is_err() {
         workers.shutdown().await;
     }
-    progress.finish();
+    progress.bar.finish();
 
     let remaining = queue.remaining();
+    if let Some(announcer) = announcer {
+        let downloaded = progress.downloaded.load(Ordering::Relaxed);
+        announcer.stop(remaining == 0, downloaded).await;
+    }
     if remaining > 0 {
         bail!("download incomplete: {remaining} of {num_pieces} pieces missing and no peers left");
     }
@@ -154,6 +186,15 @@ pub async fn download_from_peers(
 async fn sleep_until_some(at: Option<Instant>) {
     match at {
         Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Runs the next re-announce and returns its peers, or waits forever
+/// without a tracker. Cancel-safe.
+async fn reannounce(announcer: &mut Option<Announcer>, downloaded: &AtomicU64) -> Vec<SocketAddr> {
+    match announcer {
+        Some(announcer) => announcer.poll(downloaded).await,
         None => std::future::pending().await,
     }
 }
@@ -170,15 +211,32 @@ impl std::fmt::Display for Misbehaved {
 
 impl std::error::Error for Misbehaved {}
 
-fn progress_bar(total: u64) -> ProgressBar {
-    let bar = ProgressBar::new(total);
-    let style = ProgressStyle::with_template(
-        "{bar:40.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec} eta {eta} {msg}",
-    );
-    if let Ok(style) = style {
-        bar.set_style(style);
+/// Bytes verified and written, shown on the progress bar and reported to the
+/// tracker.
+struct Progress {
+    bar: ProgressBar,
+    downloaded: AtomicU64,
+}
+
+impl Progress {
+    fn new(total: u64) -> Self {
+        let bar = ProgressBar::new(total);
+        let style = ProgressStyle::with_template(
+            "{bar:40.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec} eta {eta} {msg}",
+        );
+        if let Ok(style) = style {
+            bar.set_style(style);
+        }
+        Self {
+            bar,
+            downloaded: AtomicU64::new(0),
+        }
     }
-    bar
+
+    fn add(&self, bytes: u64) {
+        self.bar.inc(bytes);
+        self.downloaded.fetch_add(bytes, Ordering::Relaxed);
+    }
 }
 
 /// Downloads from one peer until the torrent is complete or the peer fails.
@@ -186,7 +244,7 @@ fn progress_bar(total: u64) -> ProgressBar {
 async fn peer_worker(
     session: &Session,
     queue: &PieceQueue,
-    progress: &ProgressBar,
+    progress: &Progress,
     addr: SocketAddr,
     pieces_done: &mut usize,
 ) -> Result<()> {
@@ -234,7 +292,7 @@ async fn peer_worker(
                 session.storage.write_piece(index, data).await?;
                 if claim.complete() {
                     *pieces_done += 1;
-                    progress.inc(piece_len);
+                    progress.add(piece_len);
                     debug!(%addr, index, "piece complete");
                 }
             }

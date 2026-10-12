@@ -25,6 +25,42 @@ pub struct AnnounceRequest {
     pub uploaded: u64,
     pub downloaded: u64,
     pub left: u64,
+    pub event: AnnounceEvent,
+}
+
+/// Why we are announcing (the `event` parameter of BEP 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnounceEvent {
+    /// A re-announce on the tracker's interval; sends no event.
+    Regular,
+    Started,
+    Completed,
+    Stopped,
+}
+
+impl AnnounceEvent {
+    fn http_name(self) -> Option<&'static str> {
+        match self {
+            AnnounceEvent::Regular => None,
+            AnnounceEvent::Started => Some("started"),
+            AnnounceEvent::Completed => Some("completed"),
+            AnnounceEvent::Stopped => Some("stopped"),
+        }
+    }
+
+    fn udp_code(self) -> u32 {
+        match self {
+            AnnounceEvent::Regular => 0,
+            AnnounceEvent::Completed => 1,
+            AnnounceEvent::Started => 2,
+            AnnounceEvent::Stopped => 3,
+        }
+    }
+
+    /// Whether we announce to get peers, rather than only to report.
+    fn wants_peers(self) -> bool {
+        matches!(self, AnnounceEvent::Regular | AnnounceEvent::Started)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,24 +68,32 @@ pub struct AnnounceResponse {
     pub peers: Vec<SocketAddr>,
     /// Seconds the tracker asks us to wait before re-announcing.
     pub interval: Option<u64>,
+    /// Seconds the tracker requires between announces (HTTP only).
+    pub min_interval: Option<u64>,
 }
 
-/// Announces to each tracker in turn and returns the first non-empty peer list.
+/// Announces to each tracker in turn. When looking for peers, returns the
+/// first response with any, or an empty one if no tracker had peers; when
+/// only reporting (`completed`, `stopped`), returns the first success.
 pub async fn announce(trackers: &[String], request: &AnnounceRequest) -> Result<AnnounceResponse> {
     if trackers.is_empty() {
         bail!("torrent has no trackers");
     }
+    let mut empty = None;
     for tracker in trackers {
         match announce_one(tracker, request).await {
-            Ok(response) if !response.peers.is_empty() => {
-                debug!(%tracker, peers = response.peers.len(), "announce succeeded");
+            Ok(response) if !response.peers.is_empty() || !request.event.wants_peers() => {
+                debug!(%tracker, event = ?request.event, peers = response.peers.len(), "announce succeeded");
                 return Ok(response);
             }
-            Ok(_) => warn!(%tracker, "tracker returned no peers"),
+            Ok(response) => {
+                warn!(%tracker, "tracker returned no peers");
+                empty.get_or_insert(response);
+            }
             Err(e) => warn!(%tracker, "announce failed: {e:#}"),
         }
     }
-    bail!("no tracker returned any peers")
+    empty.ok_or_else(|| anyhow!("every tracker failed"))
 }
 
 async fn announce_one(tracker: &str, request: &AnnounceRequest) -> Result<AnnounceResponse> {
@@ -73,8 +117,8 @@ async fn announce_http(tracker: &str, request: &AnnounceRequest) -> Result<Annou
 }
 
 fn http_announce_url(tracker: &str, request: &AnnounceRequest) -> String {
-    let query = format!(
-        "info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}&compact=1&event=started",
+    let mut query = format!(
+        "info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}&compact=1",
         percent_encode(&request.info_hash),
         percent_encode(&request.peer_id),
         request.port,
@@ -82,6 +126,10 @@ fn http_announce_url(tracker: &str, request: &AnnounceRequest) -> String {
         request.downloaded,
         request.left,
     );
+    if let Some(event) = request.event.http_name() {
+        query.push_str("&event=");
+        query.push_str(event);
+    }
     let separator = if tracker.contains('?') { '&' } else { '?' };
     format!("{tracker}{separator}{query}")
 }
@@ -96,6 +144,8 @@ struct HttpTrackerResponse {
     failure_reason: Option<String>,
     #[serde(default)]
     interval: Option<u64>,
+    #[serde(rename = "min interval", default)]
+    min_interval: Option<u64>,
     #[serde(default)]
     peers: Option<Value>,
     #[serde(default)]
@@ -122,6 +172,7 @@ fn parse_http_response(body: &[u8]) -> Result<AnnounceResponse> {
     Ok(AnnounceResponse {
         peers,
         interval: response.interval,
+        min_interval: response.min_interval,
     })
 }
 
@@ -206,7 +257,7 @@ async fn announce_udp(url: &Url, request: &AnnounceRequest) -> Result<AnnounceRe
     announce.extend_from_slice(&request.downloaded.to_be_bytes());
     announce.extend_from_slice(&request.left.to_be_bytes());
     announce.extend_from_slice(&request.uploaded.to_be_bytes());
-    announce.extend_from_slice(&2u32.to_be_bytes()); // event = started
+    announce.extend_from_slice(&request.event.udp_code().to_be_bytes());
     announce.extend_from_slice(&0u32.to_be_bytes()); // IP = default
     announce.extend_from_slice(&rand::random::<u32>().to_be_bytes()); // key
     announce.extend_from_slice(&(-1i32).to_be_bytes()); // num_want = default
@@ -268,6 +319,7 @@ fn parse_udp_announce(response: &[u8], ipv6: bool) -> Result<AnnounceResponse> {
     Ok(AnnounceResponse {
         peers,
         interval: Some(interval.into()),
+        min_interval: None,
     })
 }
 
@@ -283,6 +335,7 @@ mod tests {
             uploaded: 1,
             downloaded: 2,
             left: 3,
+            event: AnnounceEvent::Started,
         }
     }
 
@@ -304,11 +357,12 @@ mod tests {
 
     #[test]
     fn http_response_compact() {
-        let mut body = b"d8:intervali1800e5:peers6:".to_vec();
+        let mut body = b"d8:intervali1800e12:min intervali60e5:peers6:".to_vec();
         body.extend_from_slice(&[1, 2, 3, 4, 0, 80]);
         body.push(b'e');
         let response = parse_http_response(&body).unwrap();
         assert_eq!(response.interval, Some(1800));
+        assert_eq!(response.min_interval, Some(60));
         assert_eq!(response.peers, ["1.2.3.4:80".parse().unwrap()]);
     }
 
@@ -331,8 +385,30 @@ mod tests {
         assert!(url.starts_with("http://t/announce?info_hash=%ab%ab"));
         assert!(url.contains("&peer_id=%2d%52%54"));
         assert!(url.contains("&port=6881&uploaded=1&downloaded=2&left=3&compact=1"));
+        assert!(url.ends_with("&event=started"));
         let url = http_announce_url("http://t/announce?key=1", &request());
         assert!(url.starts_with("http://t/announce?key=1&info_hash="));
+    }
+
+    #[test]
+    fn http_url_events() {
+        let url = |event| http_announce_url("http://t/a", &AnnounceRequest { event, ..request() });
+        assert!(!url(AnnounceEvent::Regular).contains("event="));
+        assert!(url(AnnounceEvent::Completed).ends_with("&event=completed"));
+        assert!(url(AnnounceEvent::Stopped).ends_with("&event=stopped"));
+    }
+
+    #[test]
+    fn udp_event_codes() {
+        // BEP 15: 0 none, 1 completed, 2 started, 3 stopped.
+        let codes = [
+            AnnounceEvent::Regular,
+            AnnounceEvent::Completed,
+            AnnounceEvent::Started,
+            AnnounceEvent::Stopped,
+        ]
+        .map(AnnounceEvent::udp_code);
+        assert_eq!(codes, [0, 1, 2, 3]);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! rtrnt: a terminal BitTorrent client.
 
+pub mod announcer;
 pub mod bencode;
 pub mod download;
 pub mod peer;

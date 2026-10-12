@@ -1,18 +1,20 @@
-//! End-to-end download from a mock seeder over loopback, no tracker involved.
+//! End-to-end downloads from mock seeders (and a mock tracker) over loopback.
 
+use rtrnt::announcer::Announcer;
 use rtrnt::download::{Session, download_from_peers};
 use rtrnt::peer::{PeerMessage, generate_peer_id, handshake_bytes, parse_handshake};
 use rtrnt::storage::Storage;
 use rtrnt::torrent::{FileInfo, Info, TorrentFile};
+use rtrnt::tracker::{AnnounceEvent, AnnounceRequest};
 use serde_bytes::ByteBuf;
 use sha1::Digest;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 const PIECE_LENGTH: u64 = 32 * 1024;
 const FILES: &[(&str, usize)] = &[("a.bin", 40_000), ("empty.bin", 0), ("b.bin", 50_123)];
@@ -204,6 +206,7 @@ async fn downloads_multi_file_torrent_from_mock_seeder() {
             session(torrent, info_hash, out.path()),
             &[dead_addr, seeder_addr],
             10,
+            None,
         ),
     )
     .await
@@ -278,6 +281,7 @@ async fn replaces_peers_that_fail() {
             session(torrent, info_hash, out.path()),
             &[dead_addr, flaky_addr, healthy_addr],
             1,
+            None,
         ),
     )
     .await
@@ -338,6 +342,7 @@ async fn endgame_finishes_despite_a_stalled_peer() {
             session(torrent, info_hash, out.path()),
             &[stalled_addr, healthy_addr],
             10,
+            None,
         ),
     )
     .await
@@ -349,4 +354,118 @@ async fn endgame_finishes_despite_a_stalled_peer() {
         .await
         .expect("stalled peer never got a Cancel")
         .unwrap();
+}
+
+/// A minimal HTTP tracker: answers every announce with `peers` and forwards
+/// each request's query string.
+async fn mock_tracker(peers: Vec<SocketAddr>) -> (String, mpsc::UnboundedReceiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/announce", listener.local_addr().unwrap());
+    let (queries, queries_rx) = mpsc::unbounded_channel();
+    let mut compact = Vec::new();
+    for peer in &peers {
+        let IpAddr::V4(ip) = peer.ip() else {
+            panic!("IPv4 peers only")
+        };
+        compact.extend_from_slice(&ip.octets());
+        compact.extend_from_slice(&peer.port().to_be_bytes());
+    }
+    let mut body = format!("d8:intervali1800e5:peers{}:", compact.len()).into_bytes();
+    body.extend_from_slice(&compact);
+    body.push(b'e');
+
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.ends_with(b"\r\n\r\n") {
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0, "tracker connection closed mid-request");
+                request.extend_from_slice(&buf[..n]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            let target = request.split(' ').nth(1).unwrap();
+            let (_, query) = target.split_once('?').unwrap();
+            let _ = queries.send(query.to_string());
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(&body).await.unwrap();
+        }
+    });
+    (url, queries_rx)
+}
+
+fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v)
+}
+
+/// The tracker hears `started` with everything left, then `completed` and
+/// `stopped` reporting the full download.
+#[tokio::test]
+async fn reports_events_and_progress_to_the_tracker() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+    let total = data.len() as u64;
+
+    let seeder = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seeder_addr = seeder.local_addr().unwrap();
+    let seeder_data = Arc::clone(&data);
+    tokio::spawn(async move {
+        let mut socket = accept_leecher(&seeder, info_hash, num_pieces).await;
+        send(&mut socket, PeerMessage::Unchoke).await;
+        serve(socket, &seeder_data).await;
+    });
+
+    let (tracker_url, mut queries) = mock_tracker(vec![seeder_addr]).await;
+    let request = AnnounceRequest {
+        info_hash,
+        peer_id: generate_peer_id(),
+        port: 6881,
+        uploaded: 0,
+        downloaded: 0,
+        left: total,
+        event: AnnounceEvent::Started,
+    };
+    let (announcer, peers) = Announcer::start(vec![tracker_url], request).await.unwrap();
+    assert_eq!(peers, [seeder_addr]);
+
+    let out = tempfile::tempdir().unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        download_from_peers(
+            session(torrent, info_hash, out.path()),
+            &peers,
+            10,
+            Some(announcer),
+        ),
+    )
+    .await
+    .expect("download timed out")
+    .expect("download failed");
+    assert_files_match(out.path(), &data);
+
+    let total = total.to_string();
+    let mut announces = Vec::new();
+    while let Ok(query) = queries.try_recv() {
+        let param = |key| query_param(&query, key).unwrap_or("").to_string();
+        announces.push([param("event"), param("downloaded"), param("left")]);
+    }
+    assert_eq!(
+        announces,
+        [
+            ["started".into(), "0".into(), total.clone()],
+            ["completed".into(), total.clone(), "0".into()],
+            ["stopped".into(), total, "0".into()],
+        ]
+    );
 }
