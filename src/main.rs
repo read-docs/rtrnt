@@ -1,9 +1,10 @@
 use anyhow::{Context, bail};
 use clap::Parser;
-use rtrnt::download::{self, Interrupted};
+use rtrnt::download::{self, Interrupted, SeedLimits};
 use rtrnt::{config, torrent, tracker};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -44,6 +45,23 @@ struct Args {
     /// answers
     #[arg(long, conflicts_with = "check")]
     scrape: bool,
+    /// Once the download is complete, keep seeding until we have uploaded
+    /// this many times the torrent's size (0: no ratio limit)
+    #[arg(long, default_value_t = 0.0, value_name = "RATIO", value_parser = parse_ratio)]
+    seed_ratio: f64,
+    /// Once the download is complete, keep seeding for this many minutes
+    /// (0: no time limit). Seeding stops at whichever limit comes first, or
+    /// on Ctrl-C; with neither, the run ends at completion
+    #[arg(long, default_value_t = 0, value_name = "MINUTES")]
+    seed_time: u64,
+}
+
+/// Parses `--seed-ratio`, which must be a finite number, 0 or more.
+fn parse_ratio(arg: &str) -> Result<f64, String> {
+    match arg.parse::<f64>() {
+        Ok(ratio) if ratio.is_finite() && ratio >= 0.0 => Ok(ratio),
+        _ => Err(format!("{arg:?} is not a ratio of 0 or more")),
+    }
 }
 
 /// Exit code for a run stopped by Ctrl-C (128 + SIGINT).
@@ -72,7 +90,11 @@ async fn main() -> anyhow::Result<ExitCode> {
     if let Some(path) = &file.path {
         info!(path = %path.display(), "loaded config file");
     }
-    let config = config::resolve(cli, file.options);
+    let mut config = config::resolve(cli, file.options);
+    config.seed = SeedLimits {
+        ratio: args.seed_ratio,
+        time: Duration::from_secs(args.seed_time.saturating_mul(60)),
+    };
     // clap requires the torrent unless --print-config is given.
     let torrent = args.torrent.context("no torrent given")?;
 

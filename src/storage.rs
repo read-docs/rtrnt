@@ -135,6 +135,19 @@ impl Storage {
         tokio::task::spawn_blocking(move || storage.write_at(offset, &data)).await?
     }
 
+    /// Reads `length` bytes from offset `begin` in piece `index` on the
+    /// blocking thread pool, to answer a peer's request.
+    pub async fn read_block(
+        self: &Arc<Self>,
+        index: usize,
+        begin: u32,
+        length: u32,
+    ) -> Result<Vec<u8>> {
+        let storage = Arc::clone(self);
+        let offset = index as u64 * self.piece_length + u64::from(begin);
+        tokio::task::spawn_blocking(move || storage.read_at(offset, length as usize)).await?
+    }
+
     pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
         if !self.writable {
             bail!("storage was opened read-only");
@@ -352,6 +365,20 @@ mod tests {
         assert_eq!(storage.read_at(2, 5).unwrap(), b"cdefg");
         assert!(storage.write_at(8, b"jk").is_err());
         assert!(storage.read_at(u64::MAX, 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn reads_blocks_by_piece_and_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = multi_file_info(&[(&["a"], 3), (&["b"], 6)]);
+        let storage = Arc::new(Storage::new(&info, dir.path()).unwrap());
+        storage.write_at(0, b"abcdefghi").unwrap();
+        // Piece 1 is "efgh", and its middle spans no file boundary.
+        assert_eq!(storage.read_block(1, 1, 2).await.unwrap(), b"fg");
+        // Piece 0 spans both files; piece 2 is the short last one.
+        assert_eq!(storage.read_block(0, 2, 2).await.unwrap(), b"cd");
+        assert_eq!(storage.read_block(2, 0, 1).await.unwrap(), b"i");
+        assert!(storage.read_block(2, 0, 2).await.is_err());
     }
 
     #[test]

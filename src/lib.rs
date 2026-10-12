@@ -2,6 +2,7 @@
 
 pub mod announcer;
 pub mod bencode;
+mod choker;
 pub mod config;
 pub mod download;
 pub mod extension;

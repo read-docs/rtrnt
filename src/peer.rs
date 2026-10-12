@@ -227,6 +227,16 @@ fn be_u32(bytes: &[u8], at: usize) -> Result<u32> {
         .ok_or_else(|| anyhow!("message truncated"))
 }
 
+/// Packs piece flags into a Bitfield payload: piece 0 is the high bit of the
+/// first byte, and the spare bits at the end are zero.
+pub fn encode_bitfield(has: &[bool]) -> Vec<u8> {
+    let mut bitfield = vec![0u8; has.len().div_ceil(8)];
+    for (i, _) in has.iter().enumerate().filter(|(_, has)| **has) {
+        bitfield[i / 8] |= 0x80 >> (i % 8);
+    }
+    bitfield
+}
+
 /// Our handshake.
 pub fn handshake_bytes(info_hash: &[u8; 20], peer_id: &[u8; 20]) -> [u8; 68] {
     let mut handshake = [0u8; 68];
@@ -294,6 +304,10 @@ pub struct PeerConnection {
     peer_choking: bool,
     peer_has: Vec<bool>,
     am_interested: bool,
+    /// Whether we refuse to upload to the peer. Every connection starts
+    /// choked on both sides.
+    am_choking: bool,
+    peer_interested: bool,
     last_sent: Instant,
     /// Whether both sides support the extension protocol (BEP 10).
     extensions: bool,
@@ -373,6 +387,8 @@ impl PeerConnection {
             peer_choking: true,
             peer_has: vec![false; num_pieces],
             am_interested: false,
+            am_choking: true,
+            peer_interested: false,
             last_sent: Instant::now(),
             // We always set the bit ourselves.
             extensions: handshake.supports_extensions(),
@@ -429,6 +445,16 @@ impl PeerConnection {
         self.peer_choking
     }
 
+    /// Whether we are choking the peer, so it may not download from us.
+    pub fn am_choking(&self) -> bool {
+        self.am_choking
+    }
+
+    /// Whether the peer wants to download from us.
+    pub fn peer_interested(&self) -> bool {
+        self.peer_interested
+    }
+
     /// Which pieces the peer has advertised (via Bitfield and Have).
     pub fn peer_has(&self) -> &[bool] {
         &self.peer_has
@@ -467,6 +493,22 @@ impl PeerConnection {
             };
             self.send(&message).await?;
             self.am_interested = interested;
+        }
+        Ok(())
+    }
+
+    /// Sends Choke or Unchoke if our choke state changed. A choked peer's
+    /// pending requests are dropped, and it knows to ask again once
+    /// unchoked.
+    pub async fn set_choking(&mut self, choking: bool) -> Result<()> {
+        if choking != self.am_choking {
+            let message = if choking {
+                PeerMessage::Choke
+            } else {
+                PeerMessage::Unchoke
+            };
+            self.send(&message).await?;
+            self.am_choking = choking;
         }
         Ok(())
     }
@@ -517,6 +559,8 @@ impl PeerConnection {
         match message {
             PeerMessage::Choke => self.peer_choking = true,
             PeerMessage::Unchoke => self.peer_choking = false,
+            PeerMessage::Interested => self.peer_interested = true,
+            PeerMessage::NotInterested => self.peer_interested = false,
             PeerMessage::Have { piece_index } => {
                 if let Some(has) = self.peer_has.get_mut(*piece_index as usize) {
                     *has = true;
@@ -710,6 +754,82 @@ mod tests {
                 PeerMessage::NotInterested,
                 PeerMessage::KeepAlive,
             ]
+        );
+    }
+
+    #[test]
+    fn bitfield_encoding_matches_decoding() {
+        let has = [
+            true, false, false, true, false, false, false, false, true, true,
+        ];
+        let bitfield = encode_bitfield(&has);
+        assert_eq!(bitfield, [0b1001_0000, 0b1100_0000]);
+        assert!(encode_bitfield(&[]).is_empty());
+        assert_eq!(encode_bitfield(&[false; 9]), [0, 0]);
+    }
+
+    /// Connects to a mock peer that answers the handshake, sends
+    /// `messages`, and returns everything it receives until we hang up.
+    async fn mock_peer(
+        num_pieces: usize,
+        messages: Vec<PeerMessage>,
+    ) -> (PeerConnection, tokio::task::JoinHandle<Vec<PeerMessage>>) {
+        let info_hash = [5u8; 20];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let remote = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut handshake = [0u8; 68];
+            socket.read_exact(&mut handshake).await.unwrap();
+            // Without the extension protocol, so no extension handshake.
+            let reply = remote_handshake(&info_hash, false);
+            socket.write_all(&reply).await.unwrap();
+            for message in messages {
+                socket.write_all(&message.encode()).await.unwrap();
+            }
+            let mut received = Vec::new();
+            while let Ok(len) = socket.read_u32().await {
+                let mut payload = vec![0u8; len as usize];
+                socket.read_exact(&mut payload).await.unwrap();
+                received.push(PeerMessage::decode(&payload).unwrap());
+            }
+            received
+        });
+        let conn = PeerConnection::connect(addr, info_hash, [2u8; 20], num_pieces, None)
+            .await
+            .unwrap();
+        (conn, remote)
+    }
+
+    #[tokio::test]
+    async fn tracks_peer_interest_and_sends_choke_changes() {
+        let has = [true, false, true];
+        let messages = vec![
+            PeerMessage::Bitfield {
+                bitfield: encode_bitfield(&has),
+            },
+            PeerMessage::Interested,
+            PeerMessage::NotInterested,
+        ];
+        let (mut conn, remote) = mock_peer(3, messages).await;
+        assert!(conn.am_choking());
+        assert!(!conn.peer_interested());
+        conn.receive().await.unwrap();
+        assert_eq!(conn.peer_has(), has);
+        conn.receive().await.unwrap();
+        assert!(conn.peer_interested());
+        conn.receive().await.unwrap();
+        assert!(!conn.peer_interested());
+
+        conn.set_choking(true).await.unwrap();
+        conn.set_choking(false).await.unwrap();
+        conn.set_choking(false).await.unwrap();
+        assert!(!conn.am_choking());
+        conn.set_choking(true).await.unwrap();
+        drop(conn);
+        assert_eq!(
+            remote.await.unwrap(),
+            [PeerMessage::Unchoke, PeerMessage::Choke]
         );
     }
 

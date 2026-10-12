@@ -1,4 +1,6 @@
-use crate::announcer::Announcer;
+use crate::announcer::{Announcer, Transferred};
+use crate::choker::Choker;
+use crate::extension;
 use crate::peer::{self, PeerConnection, PeerMessage};
 use crate::peer_pool::PeerPool;
 use crate::storage::Storage;
@@ -6,13 +8,13 @@ use crate::torrent::{self, TorrentFile};
 use crate::tracker::{AnnounceEvent, AnnounceRequest};
 use crate::verify;
 use anyhow::{Result, anyhow, bail};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use rand::Rng;
 use sha1::Digest;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 use std::time::Duration;
@@ -48,26 +50,72 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// How long to wait before accepting again after an error, such as running
 /// out of file descriptors.
 const ACCEPT_RETRY: Duration = Duration::from_secs(1);
+/// Longest block a peer may request. 16 KiB is what every client asks for;
+/// some serve up to 128 KiB, but nobody needs that.
+const MAX_REQUEST_LEN: u32 = BLOCK_SIZE;
+/// Requests a peer may have queued with us; more are dropped. Told to peers
+/// in the extension handshake (`reqq`).
+const MAX_QUEUED_UPLOADS: usize = extension::MAX_QUEUED_REQUESTS as usize;
+/// Messages a worker handles from a peer that keeps sending, before it sends
+/// the next block that peer asked for.
+const MAX_MESSAGES_PER_BLOCK: usize = 16;
+/// How often a seed limit is checked, and the upload count on the progress
+/// bar brought up to date, while seeding.
+const SEED_CHECK: Duration = Duration::from_secs(1);
 
 pub struct DownloadConfig {
     pub output_dir: PathBuf,
     pub max_peers: usize,
     /// Port to listen on for incoming peers; 0 picks a free one.
     pub listen_port: u16,
+    pub seed: SeedLimits,
 }
 
-/// Everything a peer worker needs to know about the torrent.
+/// How long to keep seeding once every piece is done. Seeding stops at
+/// whichever limit is reached first; with neither, the run ends as soon as
+/// the download is complete.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SeedLimits {
+    /// Stop once we have uploaded this many times the torrent's size this
+    /// session; 0 for no ratio limit. The torrent's size rather than what we
+    /// downloaded, so that a download resumed from disk still gives back
+    /// its share.
+    pub ratio: f64,
+    /// Stop after seeding this long; zero for no time limit.
+    pub time: Duration,
+}
+
+impl SeedLimits {
+    /// Whether to seed at all once the download is complete.
+    pub fn enabled(&self) -> bool {
+        self.ratio > 0.0 || !self.time.is_zero()
+    }
+
+    /// Whether a limit is reached after uploading `uploaded` bytes of a
+    /// torrent of `size` bytes, having seeded for `seeded`.
+    fn reached(&self, uploaded: u64, size: u64, seeded: Duration) -> bool {
+        (self.ratio > 0.0 && uploaded as f64 >= self.ratio * size as f64)
+            || (!self.time.is_zero() && seeded >= self.time)
+    }
+}
+
+/// A torrent to download and seed: what the peer workers need to know about
+/// it, and how long to stay once it is complete.
 pub struct Session {
     pub torrent: TorrentFile,
     pub info_hash: [u8; 20],
     pub peer_id: [u8; 20],
     pub storage: Arc<Storage>,
+    pub seed: SeedLimits,
 }
 
-/// Downloads the torrent at `torrent_path`, stopping early (see
-/// `download_from_peers`) if `shutdown` resolves. It is first polled once
-/// the tracker has answered, so a signal handler behind it is only
-/// installed then.
+/// Downloads the torrent at `torrent_path` and seeds it for as long as
+/// `config.seed` says, stopping early (see `download_from_peers`) if
+/// `shutdown` resolves. It is first polled once the tracker has answered,
+/// so a signal handler behind it is only installed then.
+///
+/// A download that is already complete on disk exits at once, unless it is
+/// to be seeded.
 pub async fn download_file(
     torrent_path: &Path,
     config: &DownloadConfig,
@@ -90,6 +138,7 @@ pub async fn download_file(
         info_hash,
         peer_id: peer::generate_peer_id(),
         storage,
+        seed: config.seed,
     });
 
     let candidates = verify::candidates(&session.torrent, &session.storage)?;
@@ -97,7 +146,9 @@ pub async fn download_file(
     let left = session.torrent.length() - verified_bytes(&session.torrent, &have)?;
     if left == 0 {
         info!(output = %config.output_dir.display(), "already complete");
-        return Ok(());
+        if !config.seed.enabled() {
+            return Ok(());
+        }
     }
 
     let listeners = listen(config.listen_port).await;
@@ -119,8 +170,9 @@ pub async fn download_file(
     };
     let tiers = session.torrent.tracker_tiers();
     let (announcer, peers) = Announcer::start(tiers, request).await?;
-    if peers.is_empty() {
-        announcer.stop(false, 0).await;
+    // A seed can wait for peers to connect to it.
+    if peers.is_empty() && left > 0 {
+        announcer.stop(&Transferred::default()).await;
         bail!("no tracker returned any peers");
     }
     info!(peers = peers.len(), "tracker announce succeeded");
@@ -135,7 +187,7 @@ pub async fn download_file(
         shutdown,
     )
     .await?;
-    info!(output = %config.output_dir.display(), "download complete");
+    info!(output = %config.output_dir.display(), "done");
     Ok(())
 }
 
@@ -193,6 +245,7 @@ pub async fn check_file(torrent_path: &Path, output_dir: &Path) -> Result<()> {
         info_hash,
         peer_id: peer::generate_peer_id(),
         storage,
+        seed: SeedLimits::default(),
     });
     let have = hash_pieces(&session, pieces).await?;
 
@@ -254,10 +307,20 @@ fn verified_bytes(torrent: &TorrentFile, have: &[bool]) -> Result<u64> {
 /// while there is room under `max_peers`. One that misbehaves is turned away
 /// by IP address from then on.
 ///
+/// Every connected peer may download the pieces we have, as far as the
+/// choker (see `choker`) unchokes it.
+///
+/// Once every piece is done, we seed until a limit in `session.seed` is
+/// reached (or not at all without one): workers keep serving their peers,
+/// new peers are still taken on, and running out of peers no longer ends
+/// the run. A peer that is a seed too is let go.
+///
 /// With an `announcer`, the tracker is re-announced to on its interval and
-/// the peers it returns join the pool. If we run out of peers, the tracker is
-/// asked for more once before giving up. At the end the tracker is sent
-/// `completed` (if the download finished) and `stopped`.
+/// the peers it returns join the pool. If we run out of peers while
+/// downloading, the tracker is asked for more once before giving up. The
+/// tracker is sent `completed` when the download finishes (not if it was
+/// complete from the start) and `stopped` at the end, with the bytes
+/// downloaded and uploaded.
 ///
 /// When `shutdown` resolves, no more blocks are requested and workers exit,
 /// each finishing any piece write it has started. The tracker is still sent
@@ -277,12 +340,19 @@ pub async fn download_from_peers(
     if have.len() != num_pieces {
         bail!("have {} piece flags for {num_pieces} pieces", have.len());
     }
-    let queue = Arc::new(PieceQueue::new(have));
-    let progress = Arc::new(Progress::new(
-        torrent.length(),
-        verified_bytes(torrent, have)?,
-    ));
-    let connected = Arc::new(ConnectedPeers::default());
+    let seed = session.seed;
+    let swarm = Arc::new(Swarm {
+        queue: PieceQueue::new(have).seeding(seed.enabled()),
+        progress: Progress::new(torrent.length(), verified_bytes(torrent, have)?),
+        connected: ConnectedPeers::default(),
+        choker: Choker::default(),
+    });
+    let Swarm {
+        queue,
+        progress,
+        choker,
+        ..
+    } = &*swarm;
     let mut pool = PeerPool::default();
     pool.add(peers.iter().copied());
     // Incoming peers have no address we could ban in the pool.
@@ -299,23 +369,12 @@ pub async fn download_from_peers(
     // connected to us on, answers its handshake.
     let spawn = |workers: &mut JoinSet<WorkerExit>, addr, socket: Option<TcpStream>| {
         let session = Arc::clone(&session);
-        let queue = Arc::clone(&queue);
-        let progress = Arc::clone(&progress);
-        let connected = Arc::clone(&connected);
+        let swarm = Arc::clone(&swarm);
         let inbound = socket.is_some();
         workers.spawn(async move {
             let mut pieces = 0;
-            let result = peer_worker(
-                &session,
-                &queue,
-                &progress,
-                &connected,
-                addr,
-                socket,
-                listen_port,
-                &mut pieces,
-            )
-            .await;
+            let result =
+                peer_worker(&session, &swarm, addr, socket, listen_port, &mut pieces).await;
             WorkerExit {
                 addr,
                 inbound,
@@ -327,9 +386,39 @@ pub async fn download_from_peers(
     // Set once we ran out of peers and asked the tracker for more; cleared
     // when a new connection is started.
     let mut asked_for_peers = false;
+    // Upload slots go by download rate, and by upload rate once we seed.
+    let mut choking = std::pin::pin!(choker.run(|| queue.is_done()));
     let mut shutdown = std::pin::pin!(shutdown);
     let mut interrupted = false;
-    while !queue.is_done() {
+    // Whether the download finishes this session, rather than having been
+    // complete on disk.
+    let downloading = !queue.is_done();
+    // When we finished downloading and started seeding.
+    let mut seeding_since = None;
+    loop {
+        if queue.is_done() {
+            let since = match seeding_since {
+                Some(since) => since,
+                None => {
+                    if let Some(announcer) = announcer.as_mut().filter(|_| downloading) {
+                        announcer.complete();
+                    }
+                    if !seed.enabled() {
+                        break;
+                    }
+                    info!(ratio = seed.ratio, time = ?seed.time, "download complete, seeding");
+                    *seeding_since.insert(Instant::now())
+                }
+            };
+            let uploaded = progress.transferred.uploaded.load(Ordering::Relaxed);
+            progress
+                .bar
+                .set_message(format!("seeding, {} up", HumanBytes(uploaded)));
+            if seed.reached(uploaded, torrent.length(), since.elapsed()) {
+                info!(uploaded, "seed limit reached");
+                break;
+            }
+        }
         while workers.len() < max_peers {
             let Some(addr) = pool.next(Instant::now()) else {
                 break;
@@ -339,7 +428,7 @@ pub async fn download_from_peers(
         }
 
         let retry_at = pool.next_retry().filter(|_| workers.len() < max_peers);
-        if workers.is_empty() && retry_at.is_none() {
+        if workers.is_empty() && retry_at.is_none() && seeding_since.is_none() {
             match &mut announcer {
                 Some(announcer) if !asked_for_peers => {
                     info!("out of peers, asking the tracker for more");
@@ -389,7 +478,10 @@ pub async fn download_from_peers(
                 }
             }
             () = sleep_until_some(retry_at) => {}
-            peers = reannounce(&mut announcer, &progress.downloaded) => pool.add(peers),
+            peers = reannounce(&mut announcer, &progress.transferred) => pool.add(peers),
+            () = &mut choking => {}
+            () = queue.wait_for(|| queue.is_done()), if seeding_since.is_none() => {}
+            () = tokio::time::sleep(SEED_CHECK), if seeding_since.is_some() => {}
             () = &mut shutdown => {
                 info!("interrupted, stopping");
                 interrupted = true;
@@ -418,8 +510,7 @@ pub async fn download_from_peers(
         progress.bar.abandon();
     }
     if let Some(announcer) = announcer {
-        let downloaded = progress.downloaded.load(Ordering::Relaxed);
-        announcer.stop(remaining == 0, downloaded).await;
+        announcer.stop(&progress.transferred).await;
     }
     if remaining > 0 {
         if interrupted {
@@ -471,6 +562,15 @@ async fn accept(listeners: &[TcpListener]) -> (TcpStream, SocketAddr) {
     }
 }
 
+/// What the peer workers of a download share.
+struct Swarm {
+    queue: PieceQueue,
+    progress: Progress,
+    connected: ConnectedPeers,
+    /// Decides which peers may download from us.
+    choker: Choker,
+}
+
 /// How a peer worker ended.
 struct WorkerExit {
     addr: SocketAddr,
@@ -512,9 +612,12 @@ impl Drop for Connected<'_> {
 
 /// Runs the next re-announce and returns its peers, or waits forever
 /// without a tracker. Cancel-safe.
-async fn reannounce(announcer: &mut Option<Announcer>, downloaded: &AtomicU64) -> Vec<SocketAddr> {
+async fn reannounce(
+    announcer: &mut Option<Announcer>,
+    transferred: &Transferred,
+) -> Vec<SocketAddr> {
     match announcer {
-        Some(announcer) => announcer.poll(downloaded).await,
+        Some(announcer) => announcer.poll(transferred).await,
         None => std::future::pending().await,
     }
 }
@@ -554,12 +657,11 @@ impl std::fmt::Display for Interrupted {
 
 impl std::error::Error for Interrupted {}
 
-/// Bytes verified and written, shown on the progress bar and reported to the
-/// tracker.
+/// Bytes verified and written, shown on the progress bar, and bytes moved
+/// either way, reported to the tracker.
 struct Progress {
     bar: ProgressBar,
-    /// Downloaded this session, not counting data already on disk.
-    downloaded: AtomicU64,
+    transferred: Transferred,
 }
 
 impl Progress {
@@ -578,32 +680,46 @@ impl Progress {
         bar.reset_eta();
         Self {
             bar,
-            downloaded: AtomicU64::new(0),
+            transferred: Transferred::default(),
         }
     }
 
+    /// Counts a verified piece.
     fn add(&self, bytes: u64) {
         self.bar.inc(bytes);
-        self.downloaded.fetch_add(bytes, Ordering::Relaxed);
+        self.transferred
+            .downloaded
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Counts a block sent to a peer.
+    fn uploaded(&self, bytes: u64) {
+        self.transferred
+            .uploaded
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 }
 
-/// Downloads from one peer until the torrent is complete, the queue is
-/// closed or the peer fails. Connects to `addr`, or with a `socket` the peer
-/// connected to us on, answers its handshake. `listen_port` is where we
-/// accept peers, if anywhere. `pieces_done` counts the pieces this peer
-/// delivered first, even on error.
-#[allow(clippy::too_many_arguments)]
+/// Downloads from one peer, and uploads to it while the choker unchokes it,
+/// until the torrent is complete, the queue is closed or the peer fails.
+/// Connects to `addr`, or with a `socket` the peer connected to us on,
+/// answers its handshake. `listen_port` is where we accept peers, if
+/// anywhere. `pieces_done` counts the pieces this peer delivered first, even
+/// on error.
 async fn peer_worker(
     session: &Session,
-    queue: &PieceQueue,
-    progress: &Progress,
-    connected: &ConnectedPeers,
+    swarm: &Swarm,
     addr: SocketAddr,
     socket: Option<TcpStream>,
     listen_port: Option<u16>,
     pieces_done: &mut usize,
 ) -> Result<()> {
+    let Swarm {
+        queue,
+        progress,
+        connected,
+        choker,
+    } = swarm;
     let torrent = &session.torrent;
     let (info_hash, peer_id, num_pieces) =
         (session.info_hash, session.peer_id, torrent.num_pieces());
@@ -624,7 +740,15 @@ async fn peer_worker(
     };
     debug!(%addr, inbound, "connected");
 
+    // Our pieces, unless we have none yet, which the spec lets us leave
+    // unsaid. Pieces completed from now on are announced with Have.
+    let (bitfield, mut announced) = queue.bitfield();
+    if let Some(bitfield) = bitfield {
+        conn.send(&PeerMessage::Bitfield { bitfield }).await?;
+    }
+
     let mut pieces = queue.register_peer();
+    let mut slot = choker.register();
     // Pieces we hold a claim on, with requests spread over all of them so the
     // pipeline does not drain at every piece boundary.
     let mut active: Vec<ActivePiece<'_>> = Vec::new();
@@ -634,8 +758,20 @@ async fn peer_worker(
     // Set while we are interested but choked.
     let mut unchoke_deadline = None;
     let mut has_changed = true;
+    // Blocks the peer asked us for, sent one per turn of the loop.
+    let mut uploads = Uploads::default();
+    // Messages handled since the last block we sent, and whether the last
+    // look for one found nothing waiting.
+    let mut messages_since_block = 0;
+    let mut drained = false;
     loop {
+        // Registered before anything is checked, so that a change in the
+        // queue from here on still wakes the idle wait below.
+        let mut changed = std::pin::pin!(queue.changed.notified());
+        changed.as_mut().enable();
+
         drop_completed(&mut conn, &mut active).await?;
+        announce_pieces(&mut conn, queue, &mut announced).await?;
         if queue.is_finished() {
             return Ok(());
         }
@@ -643,12 +779,27 @@ async fn peer_worker(
             pieces.update(conn.peer_has());
             has_changed = false;
         }
+        if queue.is_done() && conn.peer_has().iter().all(|&has| has) {
+            debug!(%addr, "both seeding, letting go");
+            return Ok(());
+        }
         // Interested only while the peer has a piece we still need, even if
         // another peer is downloading it right now. Any piece we hold counts.
         let wanted = !active.is_empty() || queue.wants(&pieces);
         conn.set_interested(wanted).await?;
+        // The choker hears of interest changes at once, and its answer
+        // wakes the waits below.
+        slot.set_interested(conn.peer_interested());
+        let choking = !slot.is_unchoked();
+        conn.set_choking(choking).await?;
+        if choking {
+            // A choke drops the peer's requests; without the fast extension
+            // there is no way to reject them one by one.
+            uploads.clear();
+        }
         let now = Instant::now();
-        if wanted {
+        // Worth keeping while either side wants something from the other.
+        if wanted || conn.peer_interested() {
             last_useful = now;
         }
         unchoke_deadline = match unchoke_deadline {
@@ -668,35 +819,66 @@ async fn peer_worker(
             .await?;
         }
 
+        // Send the next block the peer asked for once the messages that had
+        // already arrived are handled, so that a Cancel among them is
+        // honored, or after `MAX_MESSAGES_PER_BLOCK` of them, so that a peer
+        // that keeps sending still gets its blocks.
+        if uploads.is_empty() {
+            messages_since_block = 0;
+        } else if drained || messages_since_block >= MAX_MESSAGES_PER_BLOCK {
+            if let Some(request) = uploads.pop() {
+                serve_block(&mut conn, &session.storage, request).await?;
+                slot.uploaded(request.length.into());
+                progress.uploaded(request.length.into());
+            }
+            messages_since_block = 0;
+        }
+
         // `receive` and `receive_untimed` are cancel-safe, so losing a race
         // loses no data.
-        let message = if active.is_empty() {
+        let message = if !uploads.is_empty() {
+            // More blocks to send: only take a message that is already here.
+            tokio::select! {
+                biased;
+                message = conn.receive_untimed() => Some(message?),
+                () = std::future::ready(()) => None,
+            }
+        } else if active.is_empty() {
             if unchoke_deadline.is_some_and(|deadline| now >= deadline) {
                 bail!("peer did not unchoke us");
             }
             if now - last_useful > IDLE_TIMEOUT {
-                bail!("peer has no pieces we need");
+                bail!("neither side has pieces the other needs");
             }
             conn.keep_alive().await?;
             // Wait for an unchoke, for a piece to be returned or completed,
-            // for the queue to close, or for the peer to announce a new
-            // piece.
+            // for the queue to close, for the peer to announce a new piece or
+            // ask for one of ours, or for the choker to (un)choke it.
             tokio::select! {
-                _ = queue.changed.notified() => None,
+                () = &mut changed => None,
                 message = conn.receive_untimed() => Some(message?),
+                () = slot.changed() => None,
                 _ = tokio::time::sleep(IDLE_POLL) => None,
             }
         } else {
             conn.keep_alive().await?;
-            let completed_elsewhere = || active.iter().any(|piece| piece.claim.is_completed());
+            // A piece completed by any worker is announced to this peer.
+            let woken = || {
+                queue.is_closed()
+                    || queue.completed_count() > announced
+                    || active.iter().any(|piece| piece.claim.is_completed())
+            };
             tokio::select! {
                 message = conn.receive() => Some(message?),
-                () = queue.wait_for(|| queue.is_closed() || completed_elsewhere()) => None,
+                () = queue.wait_for(woken) => None,
+                () = slot.changed() => None,
             }
         };
+        drained = message.is_none();
         let Some(message) = message else {
             continue;
         };
+        messages_since_block += 1;
 
         match message {
             PeerMessage::Have { .. } | PeerMessage::Bitfield { .. } => has_changed = true,
@@ -720,6 +902,7 @@ async fn peer_worker(
                     continue;
                 }
                 pipeline.received(block.len() as u64, Instant::now());
+                slot.downloaded(block.len() as u64);
                 if !active[pos].is_complete() {
                     continue;
                 }
@@ -745,8 +928,141 @@ async fn peer_worker(
                     debug!(%addr, index, "piece complete");
                 }
             }
+            PeerMessage::Request {
+                index,
+                begin,
+                length,
+            } => {
+                let request = BlockRequest {
+                    index,
+                    begin,
+                    length,
+                };
+                // We only ever advertise pieces we have, so asking for
+                // another is a protocol violation.
+                if !queue.has(index as usize) {
+                    bail!(Misbehaved("peer requested a piece we do not have"));
+                }
+                request.check(torrent.piece_len(index as usize)?)?;
+                if conn.am_choking() {
+                    // Sent before our Choke arrived, which dropped it.
+                    debug!(%addr, ?request, "ignoring request from choked peer");
+                } else if !uploads.push(request) {
+                    debug!(%addr, ?request, "dropping request: too many queued");
+                }
+            }
+            PeerMessage::Cancel {
+                index,
+                begin,
+                length,
+            } => uploads.cancel(&BlockRequest {
+                index,
+                begin,
+                length,
+            }),
             _ => {}
         }
+    }
+}
+
+/// Sends Have for every piece completed since the last call, except those
+/// the peer has itself (Have suppression, which the spec allows).
+async fn announce_pieces(
+    conn: &mut PeerConnection,
+    queue: &PieceQueue,
+    announced: &mut usize,
+) -> Result<()> {
+    let completed = queue.completed_since(*announced);
+    *announced += completed.len();
+    let peer_has = conn.peer_has();
+    let haves = completed
+        .into_iter()
+        .filter(|&index| !peer_has.get(index).copied().unwrap_or(false))
+        .map(|index| {
+            let piece_index = u32::try_from(index).map_err(|_| anyhow!("piece index too large"))?;
+            Ok(PeerMessage::Have { piece_index })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !haves.is_empty() {
+        conn.send_all(&haves).await?;
+    }
+    Ok(())
+}
+
+/// Reads a block the peer asked for from disk and sends it.
+async fn serve_block(
+    conn: &mut PeerConnection,
+    storage: &Arc<Storage>,
+    request: BlockRequest,
+) -> Result<()> {
+    let BlockRequest {
+        index,
+        begin,
+        length,
+    } = request;
+    let block = storage.read_block(index as usize, begin, length).await?;
+    conn.send(&PeerMessage::Piece {
+        index,
+        begin,
+        block,
+    })
+    .await
+}
+
+/// A block a peer asked us for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockRequest {
+    index: u32,
+    begin: u32,
+    length: u32,
+}
+
+impl BlockRequest {
+    /// Checks that the block lies inside its piece, `piece_len` bytes long,
+    /// and is no longer than `MAX_REQUEST_LEN`.
+    fn check(&self, piece_len: u64) -> Result<()> {
+        let end = u64::from(self.begin) + u64::from(self.length);
+        if self.length == 0 || self.length > MAX_REQUEST_LEN || end > piece_len {
+            bail!(Misbehaved("peer sent an invalid request"));
+        }
+        Ok(())
+    }
+}
+
+/// Blocks a peer asked us for that have not been sent yet, oldest first.
+#[derive(Default)]
+struct Uploads(VecDeque<BlockRequest>);
+
+impl Uploads {
+    /// Queues a request, unless it is queued already. Returns false, dropping
+    /// it, if `MAX_QUEUED_UPLOADS` requests are queued.
+    fn push(&mut self, request: BlockRequest) -> bool {
+        if self.0.contains(&request) {
+            return true;
+        }
+        if self.0.len() >= MAX_QUEUED_UPLOADS {
+            return false;
+        }
+        self.0.push_back(request);
+        true
+    }
+
+    /// Drops a queued request. A block already sent cannot be called back,
+    /// and the peer ignores it.
+    fn cancel(&mut self, request: &BlockRequest) {
+        self.0.retain(|queued| queued != request);
+    }
+
+    fn pop(&mut self) -> Option<BlockRequest> {
+        self.0.pop_front()
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
@@ -982,9 +1298,17 @@ struct QueueState {
     remaining: usize,
     /// How many connected peers have each piece.
     availability: Vec<u32>,
+    /// Pieces verified and on disk, which peers may download from us.
+    have: Vec<bool>,
+    /// Pieces completed this session, in order, so that each worker can tell
+    /// its peer about the ones it has not announced yet.
+    completed: Vec<usize>,
     /// Set when the download stops: no more pieces are handed out, and
     /// workers exit.
     closed: bool,
+    /// Whether workers keep serving their peers once every piece is done,
+    /// until the queue is closed.
+    seed: bool,
 }
 
 impl PieceQueue {
@@ -997,10 +1321,23 @@ impl PieceQueue {
                 pending,
                 in_flight: BTreeMap::new(),
                 availability: vec![0; have.len()],
+                have: have.to_vec(),
+                completed: Vec::new(),
                 closed: false,
+                seed: false,
             }),
             changed: Notify::new(),
         }
+    }
+
+    /// Keeps workers going once every piece is done if `seed` is set, so
+    /// they can upload to their peers, until the queue is closed.
+    fn seeding(mut self, seed: bool) -> Self {
+        self.state
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .seed = seed;
+        self
     }
 
     fn lock(&self) -> MutexGuard<'_, QueueState> {
@@ -1085,6 +1422,37 @@ impl PieceQueue {
         }
     }
 
+    /// Whether piece `index` is verified and on disk.
+    fn has(&self, index: usize) -> bool {
+        self.lock().have.get(index).copied().unwrap_or(false)
+    }
+
+    /// Our bitfield, or `None` while we have no piece, and how many
+    /// completions it covers: pass that to `completed_since` for the pieces
+    /// completed after it was taken.
+    fn bitfield(&self) -> (Option<Vec<u8>>, usize) {
+        let state = self.lock();
+        let bitfield = state
+            .have
+            .contains(&true)
+            .then(|| peer::encode_bitfield(&state.have));
+        (bitfield, state.completed.len())
+    }
+
+    /// Pieces completed after the first `seen` completions of the session.
+    fn completed_since(&self, seen: usize) -> Vec<usize> {
+        self.lock()
+            .completed
+            .get(seen..)
+            .map(<[usize]>::to_vec)
+            .unwrap_or_default()
+    }
+
+    /// Pieces completed this session.
+    fn completed_count(&self) -> usize {
+        self.lock().completed.len()
+    }
+
     fn remaining(&self) -> usize {
         self.lock().remaining
     }
@@ -1103,11 +1471,11 @@ impl PieceQueue {
         self.lock().closed
     }
 
-    /// Whether workers should exit: every piece is done or the queue is
-    /// closed.
+    /// Whether workers should exit: the queue is closed, or every piece is
+    /// done and we are not seeding.
     fn is_finished(&self) -> bool {
         let state = self.lock();
-        state.remaining == 0 || state.closed
+        state.closed || (state.remaining == 0 && !state.seed)
     }
 }
 
@@ -1127,6 +1495,8 @@ impl PieceClaim<'_> {
             let first = state.in_flight.remove(&self.index).is_some();
             if first {
                 state.remaining -= 1;
+                state.have[self.index] = true;
+                state.completed.push(self.index);
             }
             first
         };
@@ -1646,6 +2016,139 @@ mod tests {
         let _b = peers.register([2; 20]).unwrap();
         drop(a);
         assert!(peers.register([1; 20]).is_some());
+    }
+
+    #[test]
+    fn bitfield_and_haves_follow_completed_pieces() {
+        let queue = PieceQueue::new(&[false; 3]);
+        assert_eq!(queue.bitfield(), (None, 0));
+        assert!(!queue.has(0));
+        let seed = peer(&queue, &[true; 3]);
+        let first = queue.claim(&seed, &[]).unwrap();
+        let second = queue.claim(&seed, &[]).unwrap();
+        let (a, b) = (first.index, second.index);
+
+        assert!(second.complete());
+        assert!(queue.has(b));
+        let (bitfield, seen) = queue.bitfield();
+        assert_eq!(
+            bitfield,
+            Some(peer::encode_bitfield(&[0, 1, 2].map(|i| i == b)))
+        );
+        assert_eq!(seen, 1);
+        // A worker that sent this bitfield announces only what follows.
+        assert!(queue.completed_since(seen).is_empty());
+        assert!(first.complete());
+        assert_eq!(queue.completed_since(seen), [a]);
+        assert_eq!(queue.completed_since(0), [b, a]);
+        assert_eq!(queue.completed_count(), 2);
+        assert!(queue.completed_since(5).is_empty());
+        assert!(!queue.has(3));
+    }
+
+    #[test]
+    fn seed_limits_stop_at_whichever_comes_first() {
+        let minute = Duration::from_secs(60);
+        let none = SeedLimits::default();
+        assert!(!none.enabled());
+        let ratio = SeedLimits {
+            ratio: 1.5,
+            time: Duration::ZERO,
+        };
+        assert!(ratio.enabled());
+        assert!(!ratio.reached(149, 100, 1000 * minute));
+        assert!(ratio.reached(150, 100, Duration::ZERO));
+        let time = SeedLimits {
+            ratio: 0.0,
+            time: minute,
+        };
+        assert!(time.enabled());
+        assert!(!time.reached(u64::MAX, 100, minute / 2));
+        assert!(time.reached(0, 100, minute));
+        let both = SeedLimits {
+            ratio: 2.0,
+            time: minute,
+        };
+        assert!(both.reached(200, 100, Duration::ZERO));
+        assert!(both.reached(0, 100, minute));
+        assert!(!both.reached(199, 100, minute / 2));
+    }
+
+    #[test]
+    fn a_seeding_queue_keeps_workers_until_closed() {
+        let queue = PieceQueue::new(&[true, true]);
+        assert!(queue.is_done() && queue.is_finished());
+        let queue = PieceQueue::new(&[true, true]).seeding(true);
+        assert!(queue.is_done() && !queue.is_finished());
+        queue.close();
+        assert!(queue.is_finished());
+    }
+
+    #[test]
+    fn pieces_on_disk_are_in_the_bitfield_but_never_announced() {
+        let queue = PieceQueue::new(&[true, false, true]);
+        assert!(queue.has(0) && !queue.has(1) && queue.has(2));
+        assert_eq!(queue.bitfield(), (Some(vec![0b1010_0000]), 0));
+        assert!(queue.completed_since(0).is_empty());
+    }
+
+    #[test]
+    fn request_must_lie_inside_the_piece_and_be_one_block_at_most() {
+        let request = |begin, length| BlockRequest {
+            index: 0,
+            begin,
+            length,
+        };
+        let piece_len = 3 * u64::from(BLOCK_SIZE) - 100;
+        for (begin, length) in [
+            (0, BLOCK_SIZE),
+            (BLOCK_SIZE, BLOCK_SIZE),
+            // The short last block, and odd but valid ranges.
+            (2 * BLOCK_SIZE, BLOCK_SIZE - 100),
+            (7, 1),
+            (2 * BLOCK_SIZE - 100, BLOCK_SIZE),
+        ] {
+            assert!(request(begin, length).check(piece_len).is_ok());
+        }
+        for (begin, length) in [
+            (0, 0),
+            (0, BLOCK_SIZE + 1),
+            (0, 2 * BLOCK_SIZE),
+            (2 * BLOCK_SIZE, BLOCK_SIZE),
+            (3 * BLOCK_SIZE, 1),
+            (u32::MAX, BLOCK_SIZE),
+        ] {
+            let err = request(begin, length).check(piece_len).unwrap_err();
+            assert!(err.is::<Misbehaved>(), "{begin}+{length}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn uploads_are_served_in_order_cancelled_and_capped() {
+        let request = |begin| BlockRequest {
+            index: 1,
+            begin,
+            length: BLOCK_SIZE,
+        };
+        let mut uploads = Uploads::default();
+        assert!(uploads.push(request(0)));
+        assert!(uploads.push(request(1)));
+        assert!(uploads.push(request(2)));
+        // Asked twice, sent once.
+        assert!(uploads.push(request(0)));
+        uploads.cancel(&request(1));
+        uploads.cancel(&request(9));
+        assert_eq!(uploads.pop(), Some(request(0)));
+        assert_eq!(uploads.pop(), Some(request(2)));
+        assert_eq!(uploads.pop(), None);
+
+        for begin in 0..MAX_QUEUED_UPLOADS as u32 {
+            assert!(uploads.push(request(begin)));
+        }
+        assert!(!uploads.push(request(u32::MAX)));
+        uploads.clear();
+        assert!(uploads.is_empty());
+        assert!(uploads.push(request(u32::MAX)));
     }
 
     #[tokio::test]

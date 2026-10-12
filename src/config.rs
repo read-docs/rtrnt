@@ -4,7 +4,7 @@
 //! config file, else from its built-in default. Keys in the file are the
 //! long option names, so `--max-peers 50` is `max-peers = 50`.
 
-use crate::download::DownloadConfig;
+use crate::download::{DownloadConfig, SeedLimits};
 use crate::peer;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -50,6 +50,8 @@ impl Options {
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_OUTPUT_DIR)),
             max_peers: self.max_peers.unwrap_or(DEFAULT_MAX_PEERS),
             listen_port: self.port.unwrap_or(peer::DEFAULT_LISTEN_PORT),
+            // Only set on the command line for now.
+            seed: SeedLimits::default(),
         }
     }
 }

@@ -22,7 +22,7 @@ A terminal-based BitTorrent client written in Rust.
 cargo run --release -- path/to/file.torrent -o ~/Downloads
 ```
 
-Options: `-o, --output <DIR>` (default `.`), `--max-peers <N>` (default 30), `-p, --port <PORT>` to listen on for incoming peers over IPv4 and IPv6 (default 6881), `--check` to verify a finished download and `--scrape` to print each tracker's seeder, leecher and completed counts without downloading. Set `RUST_LOG=debug` for per-peer logs.
+Options: `-o, --output <DIR>` (default `.`), `--max-peers <N>` (default 30), `-p, --port <PORT>` to listen on for incoming peers over IPv4 and IPv6 (default 6881), `--check` to verify a finished download, `--scrape` to print each tracker's seeder, leecher and completed counts without downloading, and `--seed-ratio <RATIO>` and `--seed-time <MINUTES>` to keep seeding once the download is complete, until we have uploaded that many times the torrent's size or for that long, whichever comes first (both default to 0, which exits at completion). Set `RUST_LOG=debug` for per-peer logs.
 
 ### Config file
 
@@ -34,7 +34,7 @@ max-peers = 50
 port = 51413
 ```
 
-A flag on the command line overrides the file, and the file overrides the built-in defaults. `--print-config` shows the effective settings and where each one came from. Unknown keys are errors, so typos don't go unnoticed.
+A flag on the command line overrides the file, and the file overrides the built-in defaults. `--print-config` shows the effective settings and where each one came from. Unknown keys are errors, so typos don't go unnoticed. The seeding limits can only be set on the command line for now.
 
 Run the tests with `cargo test`. They include a loopback integration test against a mock seeder.
 
@@ -59,8 +59,9 @@ src/
 ├── lib.rs       # Library root
 ├── announcer.rs # Re-announces and completed/stopped events
 ├── bencode.rs   # Raw bencode scanning (info-hash span)
+├── choker.rs    # Choking algorithm: who may download from us
 ├── config.rs    # Config file loading and CLI > file > default precedence
-├── download.rs  # Piece queue, peer workers, block pipelining
+├── download.rs  # Piece queue, peer workers, block pipelining, seeding
 ├── extension.rs # Extension protocol (BEP 10) handshake
 ├── peer.rs      # Peer wire protocol: handshake, message encode/decode
 ├── peer_pool.rs # Known peers, retry backoff and bans

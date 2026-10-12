@@ -24,8 +24,9 @@ pub const RESERVED_BIT: u8 = 0x10;
 pub const HANDSHAKE_ID: u8 = 0;
 /// Our client name and version, sent as `v`.
 pub const CLIENT: &str = concat!("rtrnt ", env!("CARGO_PKG_VERSION"));
-/// How many requests we queue from one peer, sent as `reqq`.
-pub const MAX_QUEUED_REQUESTS: u32 = 250;
+/// How many requests we queue from one peer, sent as `reqq`; more are
+/// dropped. libtorrent allows as many by default.
+pub const MAX_QUEUED_REQUESTS: u32 = 500;
 /// The extensions we implement, each with the extended message id peers
 /// must send its messages to us with. Advertised in our handshake as `m`.
 /// None yet; `ut_metadata` (BEP 9) and `ut_pex` (BEP 11) go here once they
@@ -185,7 +186,7 @@ mod tests {
         assert_eq!(
             payload,
             format!(
-                "d1:mde1:pi6881e4:reqqi250e1:v{}:{}6:yourip4:\x0a\x01\x02\x03e",
+                "d1:mde1:pi6881e4:reqqi500e1:v{}:{}6:yourip4:\x0a\x01\x02\x03e",
                 CLIENT.len(),
                 CLIENT
             )
