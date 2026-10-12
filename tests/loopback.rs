@@ -5,7 +5,7 @@ use rtrnt::download::{Interrupted, Session, download_from_peers};
 use rtrnt::peer::{PeerMessage, generate_peer_id, handshake_bytes, parse_handshake};
 use rtrnt::storage::Storage;
 use rtrnt::torrent::{FileInfo, Info, TorrentFile};
-use rtrnt::tracker::{AnnounceEvent, AnnounceRequest};
+use rtrnt::tracker::{AnnounceEvent, AnnounceRequest, ScrapeStats, scrape, scrape_tiers};
 use rtrnt::verify;
 use serde_bytes::ByteBuf;
 use sha1::Digest;
@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
 
 const PIECE_LENGTH: u64 = 32 * 1024;
@@ -669,11 +669,8 @@ async fn downloads_from_a_peer_that_connects_to_us() {
 }
 
 /// A minimal HTTP tracker: answers every announce with `peers` and forwards
-/// each request's query string.
+/// each request's target (path and query).
 async fn mock_tracker(peers: Vec<SocketAddr>) -> (String, mpsc::UnboundedReceiver<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/announce", listener.local_addr().unwrap());
-    let (queries, queries_rx) = mpsc::unbounded_channel();
     let mut compact = Vec::new();
     for peer in &peers {
         let IpAddr::V4(ip) = peer.ip() else {
@@ -685,7 +682,16 @@ async fn mock_tracker(peers: Vec<SocketAddr>) -> (String, mpsc::UnboundedReceive
     let mut body = format!("d8:intervali1800e5:peers{}:", compact.len()).into_bytes();
     body.extend_from_slice(&compact);
     body.push(b'e');
+    let (addr, targets) = mock_http(body).await;
+    (format!("http://{addr}/announce"), targets)
+}
 
+/// A minimal HTTP server: answers every request with `body` and forwards
+/// each request's target (path and query).
+async fn mock_http(body: Vec<u8>) -> (SocketAddr, mpsc::UnboundedReceiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (targets, targets_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         loop {
             let (mut socket, _) = listener.accept().await.unwrap();
@@ -698,8 +704,7 @@ async fn mock_tracker(peers: Vec<SocketAddr>) -> (String, mpsc::UnboundedReceive
             }
             let request = String::from_utf8(request).unwrap();
             let target = request.split(' ').nth(1).unwrap();
-            let (_, query) = target.split_once('?').unwrap();
-            let _ = queries.send(query.to_string());
+            let _ = targets.send(target.to_string());
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
@@ -708,10 +713,12 @@ async fn mock_tracker(peers: Vec<SocketAddr>) -> (String, mpsc::UnboundedReceive
             socket.write_all(&body).await.unwrap();
         }
     });
-    (url, queries_rx)
+    (addr, targets_rx)
 }
 
-fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+/// The value of `key` in the query of a request target.
+fn query_param<'a>(target: &'a str, key: &str) -> Option<&'a str> {
+    let (_, query) = target.split_once('?')?;
     query
         .split('&')
         .filter_map(|pair| pair.split_once('='))
@@ -892,4 +899,180 @@ async fn interrupted_download_keeps_pieces_and_tells_the_tracker() {
             ["stopped".into(), piece, left],
         ]
     );
+}
+
+/// A minimal UDP tracker (BEP 15): answers connects, and answers each scrape
+/// with `stats` (seeders, completed, leechers) for every torrent asked
+/// about, or with an error saying `error` if one is given.
+async fn mock_udp_tracker(stats: [u32; 3], error: Option<&'static str>) -> String {
+    const CONNECTION_ID: u64 = 0x0123_4567_89ab_cdef;
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("udp://{}/announce", socket.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        loop {
+            let (n, from) = socket.recv_from(&mut buf).await.unwrap();
+            let request = &buf[..n];
+            let action = u32::from_be_bytes(request[8..12].try_into().unwrap());
+            let transaction = &request[12..16];
+            let mut response = Vec::new();
+            match (action, error) {
+                (0, _) => {
+                    assert_eq!(request[..8], 0x417_2710_1980u64.to_be_bytes());
+                    response.extend_from_slice(&0u32.to_be_bytes());
+                    response.extend_from_slice(transaction);
+                    response.extend_from_slice(&CONNECTION_ID.to_be_bytes());
+                }
+                (2, Some(error)) => {
+                    response.extend_from_slice(&3u32.to_be_bytes());
+                    response.extend_from_slice(transaction);
+                    response.extend_from_slice(error.as_bytes());
+                }
+                (2, None) => {
+                    assert_eq!(request[..8], CONNECTION_ID.to_be_bytes());
+                    let hashes = &request[16..];
+                    assert_eq!(hashes.len() % 20, 0, "partial info hash");
+                    response.extend_from_slice(&2u32.to_be_bytes());
+                    response.extend_from_slice(transaction);
+                    for _ in hashes.chunks(20) {
+                        for count in stats {
+                            response.extend_from_slice(&count.to_be_bytes());
+                        }
+                    }
+                }
+                _ => panic!("unexpected action {action}"),
+            }
+            socket.send_to(&response, from).await.unwrap();
+        }
+    });
+    url
+}
+
+/// An HTTP scrape body listing `info_hash` with 5 seeders, 10 leechers and
+/// 50 completed downloads.
+fn http_scrape_body(info_hash: [u8; 20]) -> Vec<u8> {
+    let mut body = b"d5:filesd20:".to_vec();
+    body.extend_from_slice(&info_hash);
+    body.extend_from_slice(b"d8:completei5e10:downloadedi50e10:incompletei10eeee");
+    body
+}
+
+/// A tracker URL on a port nobody listens on.
+async fn dead_tracker() -> String {
+    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    format!("http://{}/announce", dead.local_addr().unwrap())
+}
+
+/// Every tracker is asked, and each answer is reported in tier order: HTTP
+/// and UDP counts, a UDP error response and an unsupported tracker.
+#[tokio::test]
+async fn scrapes_http_and_udp_trackers() {
+    init_tracing();
+    // Not valid UTF-8, as the `files` keys are raw bytes.
+    let info_hash = [0xc3; 20];
+    let (addr, mut targets) = mock_http(http_scrape_body(info_hash)).await;
+    let http = format!("http://{addr}/announce?passkey=x");
+    let udp = mock_udp_tracker([7, 70, 3], None).await;
+    let refusing = mock_udp_tracker([0; 3], Some("torrent not registered")).await;
+    let tiers = vec![
+        vec![http.clone()],
+        vec![udp.clone(), refusing.clone(), "wss://t/announce".into()],
+    ];
+    let scrapes = tokio::time::timeout(Duration::from_secs(10), scrape_tiers(&tiers, info_hash))
+        .await
+        .expect("scrape timed out");
+
+    let summary: Vec<_> = scrapes
+        .iter()
+        .map(|s| {
+            let result = s.result.as_ref().map_err(|e| format!("{e:#}"));
+            (s.tier, s.tracker.as_str(), result.cloned())
+        })
+        .collect();
+    let stats = |seeders, leechers, completed| {
+        Ok(Some(ScrapeStats {
+            seeders,
+            leechers,
+            completed,
+        }))
+    };
+    assert_eq!(summary[0], (1, http.as_str(), stats(5, 10, 50)));
+    assert_eq!(summary[1], (2, udp.as_str(), stats(7, 3, 70)));
+    assert_eq!(summary[2].1, refusing);
+    let Err(error) = &summary[2].2 else {
+        panic!("UDP error response not reported: {summary:?}");
+    };
+    assert!(error.contains("torrent not registered"), "{error}");
+    assert_eq!(summary[3].1, "wss://t/announce");
+    assert!(summary[3].2.is_err());
+    assert_eq!(summary.len(), 4);
+
+    let target = targets.try_recv().unwrap();
+    assert_eq!(
+        target,
+        format!("/scrape?passkey=x&info_hash={}", "%c3".repeat(20))
+    );
+}
+
+/// A UDP scrape of more torrents than fit in a packet is split into several
+/// requests, and the answers come back in the order asked.
+#[tokio::test]
+async fn udp_scrape_of_many_torrents() {
+    init_tracing();
+    let udp = mock_udp_tracker([1, 2, 3], None).await;
+    let info_hashes: Vec<[u8; 20]> = (0..100u8).map(|i| [i; 20]).collect();
+    let stats = tokio::time::timeout(Duration::from_secs(10), scrape(&udp, &info_hashes))
+        .await
+        .expect("scrape timed out")
+        .unwrap();
+    let expected = ScrapeStats {
+        seeders: 1,
+        leechers: 3,
+        completed: 2,
+    };
+    assert_eq!(stats, vec![Some(expected); 100]);
+}
+
+/// `--scrape` prints one line per tracker and fails only when no tracker
+/// answers.
+#[tokio::test]
+async fn scrape_command_reports_each_tracker() {
+    init_tracing();
+    let (mut torrent, info_hash) = make_torrent(&test_data());
+    let (addr, _targets) = mock_http(http_scrape_body(info_hash)).await;
+    let http = format!("http://{addr}/announce");
+    let dead = dead_tracker().await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let run = async |torrent: &TorrentFile| {
+        let path = dir.path().join("t.torrent");
+        std::fs::write(&path, serde_bencode::to_bytes(torrent).unwrap()).unwrap();
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_rtrnt"))
+            .arg("--scrape")
+            .arg(&path)
+            .output();
+        let output = tokio::time::timeout(Duration::from_secs(20), output)
+            .await
+            .expect("--scrape timed out")
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        (output.status.success(), stdout, stderr)
+    };
+
+    torrent.announce_list = Some(vec![vec![http.clone()], vec![dead.clone()]]);
+    let (success, stdout, stderr) = run(&torrent).await;
+    assert!(success, "{stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "{stdout}");
+    assert_eq!(
+        lines[0],
+        format!("tier 1  {http}  5 seeders, 10 leechers, 50 completed")
+    );
+    assert!(lines[1].starts_with(&format!("tier 2  {dead}  failed: ")));
+
+    torrent.announce_list = Some(vec![vec![dead]]);
+    let (success, _, stderr) = run(&torrent).await;
+    assert!(!success);
+    assert!(stderr.contains("no tracker answered"), "{stderr}");
 }

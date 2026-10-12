@@ -1,7 +1,8 @@
+use anyhow::bail;
 use clap::Parser;
 use rtrnt::download::{self, DownloadConfig, Interrupted};
-use rtrnt::peer;
-use std::path::PathBuf;
+use rtrnt::{peer, torrent, tracker};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
@@ -27,6 +28,11 @@ struct Args {
     /// downloading; exits with an error unless every piece is intact
     #[arg(long)]
     check: bool,
+    /// Ask every tracker of the torrent how many seeders and leechers it
+    /// knows of instead of downloading; exits with an error unless one
+    /// answers
+    #[arg(long, conflicts_with = "check")]
+    scrape: bool,
 }
 
 /// Exit code for a run stopped by Ctrl-C (128 + SIGINT).
@@ -46,6 +52,10 @@ async fn main() -> anyhow::Result<ExitCode> {
         download::check_file(&args.torrent, &args.output).await?;
         return Ok(ExitCode::SUCCESS);
     }
+    if args.scrape {
+        scrape(&args.torrent).await?;
+        return Ok(ExitCode::SUCCESS);
+    }
     let config = DownloadConfig {
         output_dir: args.output,
         max_peers: args.max_peers,
@@ -59,6 +69,27 @@ async fn main() -> anyhow::Result<ExitCode> {
         }
         Err(e) => Err(e),
     }
+}
+
+/// Scrapes every tracker of the torrent at `path` and prints what each one
+/// knows of the swarm, tier by tier. Trackers in different tiers often keep
+/// separate swarms, so each one is asked rather than only the first to
+/// answer; they are asked all at once, so a dead one costs its timeout only
+/// once. Fails if no tracker answered.
+async fn scrape(path: &Path) -> anyhow::Result<()> {
+    let (torrent, info_hash) = torrent::load_file(path).await?;
+    let tiers = torrent.tracker_tiers();
+    if tiers.is_empty() {
+        bail!("torrent has no trackers");
+    }
+    let scrapes = tracker::scrape_tiers(&tiers, info_hash).await;
+    for scrape in &scrapes {
+        println!("{scrape}");
+    }
+    if !scrapes.iter().any(|scrape| scrape.result.is_ok()) {
+        bail!("no tracker answered the scrape");
+    }
+    Ok(())
 }
 
 /// Resolves on the first Ctrl-C. A second one, or one that comes once
