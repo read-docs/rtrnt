@@ -35,7 +35,7 @@ Faster, steadier downloads in real swarms.
 
 - [x] **Resume**: at startup, pieces that overlap a file that already had data are hashed (on up to 4 threads, with a progress bar), and those that match are marked done. Pieces lying entirely in newly created files are skipped, so a new download starts at once. The tracker hears the real `left`, the progress bar starts at the data already on disk, and a download that is already complete exits without contacting the tracker. (There is no resume file, so an interrupted run's zero-filled pieces are hashed too.)
 - [x] **`--check` mode**: verify a finished download against the torrent. Files are opened read-only and nothing is created or resized. Every piece whose bytes are all on disk is hashed, and each file is reported as missing, the wrong size, or with its number of bad pieces (a piece spanning two files counts against both). The exit code is non-zero unless every piece is intact.
-- [ ] **Graceful shutdown**: on Ctrl-C, finish in-flight writes and send `stopped` to the tracker.
+- [x] **Graceful shutdown**: on Ctrl-C the piece queue closes and workers exit at their next wait. A worker writing a piece finishes the write first, and a worker aborted after the 2 s grace period cannot tear a write, because writes run to the end on the blocking pool. The tracker gets `stopped` (with the real `downloaded`/`left`), the progress bar stays where it was, and the exit code is 130. A second Ctrl-C quits at once. The handler is only installed once the download starts, so Ctrl-C while hashing or during the first announce still kills the process at once. (Blocks of partly downloaded pieces are lost.)
 
 ## Phase 4: Seeding
 

@@ -40,7 +40,8 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const UNCHOKE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How often an idle worker re-checks the queue.
 const IDLE_POLL: Duration = Duration::from_secs(2);
-/// How long finished workers get to wind down before being aborted.
+/// How long workers get to wind down, once the download is complete or
+/// interrupted, before being aborted.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 pub struct DownloadConfig {
@@ -56,7 +57,15 @@ pub struct Session {
     pub storage: Arc<Storage>,
 }
 
-pub async fn download_file(torrent_path: &Path, config: &DownloadConfig) -> Result<()> {
+/// Downloads the torrent at `torrent_path`, stopping early (see
+/// `download_from_peers`) if `shutdown` resolves. It is first polled once
+/// the tracker has answered, so a signal handler behind it is only
+/// installed then.
+pub async fn download_file(
+    torrent_path: &Path,
+    config: &DownloadConfig,
+    shutdown: impl Future<Output = ()>,
+) -> Result<()> {
     let (torrent, info_hash) = torrent::load_file(torrent_path).await?;
     info!(
         name = %torrent.info.name,
@@ -101,7 +110,15 @@ pub async fn download_file(torrent_path: &Path, config: &DownloadConfig) -> Resu
     }
     info!(peers = peers.len(), "tracker announce succeeded");
 
-    download_from_peers(session, &have, &peers, config.max_peers, Some(announcer)).await?;
+    download_from_peers(
+        session,
+        &have,
+        &peers,
+        config.max_peers,
+        Some(announcer),
+        shutdown,
+    )
+    .await?;
     info!(output = %config.output_dir.display(), "download complete");
     Ok(())
 }
@@ -179,12 +196,18 @@ fn verified_bytes(torrent: &TorrentFile, have: &[bool]) -> Result<u64> {
 /// the peers it returns join the pool. If we run out of peers, the tracker is
 /// asked for more once before giving up. At the end the tracker is sent
 /// `completed` (if the download finished) and `stopped`.
+///
+/// When `shutdown` resolves, no more blocks are requested and workers exit,
+/// each finishing any piece write it has started. The tracker is still sent
+/// `stopped`, and the result is an `Interrupted` error unless every piece
+/// was done.
 pub async fn download_from_peers(
     session: Arc<Session>,
     have: &[bool],
     peers: &[SocketAddr],
     max_peers: usize,
     mut announcer: Option<Announcer>,
+    shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let torrent = &session.torrent;
     let num_pieces = torrent.num_pieces();
@@ -203,6 +226,8 @@ pub async fn download_from_peers(
     // Set once we ran out of peers and asked the tracker for more; cleared
     // when a new connection is started.
     let mut asked_for_peers = false;
+    let mut shutdown = std::pin::pin!(shutdown);
+    let mut interrupted = false;
     while !queue.is_done() {
         while workers.len() < max_peers {
             let Some(addr) = pool.next(Instant::now()) else {
@@ -253,23 +278,43 @@ pub async fn download_from_peers(
             }
             () = sleep_until_some(retry_at) => {}
             peers = reannounce(&mut announcer, &progress.downloaded) => pool.add(peers),
+            () = &mut shutdown => {
+                info!("interrupted, stopping");
+                interrupted = true;
+                break;
+            }
         }
     }
 
-    // Workers still downloading notice completion and exit (sending Cancel
-    // for duplicate endgame requests); ones still connecting are cut short.
+    // Workers still downloading notice completion or the closed queue and
+    // exit (sending Cancel for duplicate endgame requests); ones still
+    // connecting are cut short. A worker writing a piece finishes the write
+    // first, and even if aborted, the write runs on to the end on the
+    // blocking pool.
+    queue.close();
     let drain = async { while workers.join_next().await.is_some() {} };
     if tokio::time::timeout(SHUTDOWN_GRACE, drain).await.is_err() {
         workers.shutdown().await;
     }
-    progress.bar.finish();
 
     let remaining = queue.remaining();
+    if remaining == 0 {
+        progress.bar.finish();
+    } else {
+        // `finish` would fill the bar.
+        progress.bar.abandon();
+    }
     if let Some(announcer) = announcer {
         let downloaded = progress.downloaded.load(Ordering::Relaxed);
         announcer.stop(remaining == 0, downloaded).await;
     }
     if remaining > 0 {
+        if interrupted {
+            bail!(Interrupted {
+                remaining,
+                pieces: num_pieces
+            });
+        }
         bail!("download incomplete: {remaining} of {num_pieces} pieces missing and no peers left");
     }
     Ok(())
@@ -303,6 +348,28 @@ impl std::fmt::Display for Misbehaved {
 }
 
 impl std::error::Error for Misbehaved {}
+
+/// The download was stopped by its shutdown signal before every piece was
+/// done. What was verified is on disk for the next run to resume from.
+#[derive(Debug)]
+pub struct Interrupted {
+    /// Pieces still missing.
+    pub remaining: usize,
+    /// Pieces in the torrent.
+    pub pieces: usize,
+}
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "download interrupted with {} of {} pieces missing",
+            self.remaining, self.pieces
+        )
+    }
+}
+
+impl std::error::Error for Interrupted {}
 
 /// Bytes verified and written, shown on the progress bar and reported to the
 /// tracker.
@@ -338,8 +405,9 @@ impl Progress {
     }
 }
 
-/// Downloads from one peer until the torrent is complete or the peer fails.
-/// `pieces_done` counts the pieces this peer delivered first, even on error.
+/// Downloads from one peer until the torrent is complete, the queue is
+/// closed or the peer fails. `pieces_done` counts the pieces this peer
+/// delivered first, even on error.
 async fn peer_worker(
     session: &Session,
     queue: &PieceQueue,
@@ -369,7 +437,7 @@ async fn peer_worker(
     let mut has_changed = true;
     loop {
         drop_completed(&mut conn, &mut active).await?;
-        if queue.is_done() {
+        if queue.is_finished() {
             return Ok(());
         }
         if has_changed {
@@ -412,7 +480,8 @@ async fn peer_worker(
             }
             conn.keep_alive().await?;
             // Wait for an unchoke, for a piece to be returned or completed,
-            // or for the peer to announce a new piece.
+            // for the queue to close, or for the peer to announce a new
+            // piece.
             tokio::select! {
                 _ = queue.changed.notified() => None,
                 message = conn.receive_untimed() => Some(message?),
@@ -423,7 +492,7 @@ async fn peer_worker(
             let completed_elsewhere = || active.iter().any(|piece| piece.claim.is_completed());
             tokio::select! {
                 message = conn.receive() => Some(message?),
-                () = queue.wait_for(completed_elsewhere) => None,
+                () = queue.wait_for(|| queue.is_closed() || completed_elsewhere()) => None,
             }
         };
         let Some(message) = message else {
@@ -694,7 +763,8 @@ impl<'a> ActivePiece<'a> {
 /// Pieces not yet downloaded, shared between all peer workers.
 struct PieceQueue {
     state: Mutex<QueueState>,
-    /// Signalled when a piece is returned to the queue or completed.
+    /// Signalled when a piece is returned to the queue or completed, and
+    /// when the queue is closed.
     changed: Notify,
 }
 
@@ -708,6 +778,9 @@ struct QueueState {
     remaining: usize,
     /// How many connected peers have each piece.
     availability: Vec<u32>,
+    /// Set when the download stops: no more pieces are handed out, and
+    /// workers exit.
+    closed: bool,
 }
 
 impl PieceQueue {
@@ -720,6 +793,7 @@ impl PieceQueue {
                 pending,
                 in_flight: BTreeMap::new(),
                 availability: vec![0; have.len()],
+                closed: false,
             }),
             changed: Notify::new(),
         }
@@ -747,10 +821,13 @@ impl PieceQueue {
     ///
     /// The piece goes back to the queue when its last claim is dropped
     /// without `complete()`. Pieces in `held`, which the caller already
-    /// claimed, are never duplicated.
+    /// claimed, are never duplicated. A closed queue hands out nothing.
     fn claim(&self, peer: &PeerPieces<'_>, held: &[usize]) -> Option<PieceClaim<'_>> {
         let mut guard = self.lock();
         let state = &mut *guard;
+        if state.closed {
+            return None;
+        }
         let mut rng = rand::rng();
         let index = if state.pending.is_empty() {
             let candidates = state
@@ -810,6 +887,23 @@ impl PieceQueue {
 
     fn is_done(&self) -> bool {
         self.remaining() == 0
+    }
+
+    /// Stops handing out pieces and wakes every worker so it can exit.
+    fn close(&self) {
+        self.lock().closed = true;
+        self.changed.notify_waiters();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.lock().closed
+    }
+
+    /// Whether workers should exit: every piece is done or the queue is
+    /// closed.
+    fn is_finished(&self) -> bool {
+        let state = self.lock();
+        state.remaining == 0 || state.closed
     }
 }
 
@@ -1137,6 +1231,31 @@ mod tests {
         assert!(queue.is_done());
         assert!(queue.lock().pending.is_empty());
         assert!(queue.claim(&seed, &[]).is_none());
+    }
+
+    #[tokio::test]
+    async fn closed_queue_hands_out_nothing_and_wakes_workers() {
+        let queue = PieceQueue::new(&[false; 2]);
+        let seed = peer(&queue, &[true; 2]);
+        let held = queue.claim(&seed, &[]).unwrap();
+        assert!(!queue.is_finished());
+
+        let close_later = async {
+            tokio::task::yield_now().await;
+            queue.close();
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(queue.wait_for(|| queue.is_closed()), close_later)
+        })
+        .await
+        .expect("not woken by close");
+        assert!(queue.is_finished());
+        assert!(!queue.is_done());
+        assert!(queue.claim(&seed, &[]).is_none());
+
+        // A piece written after the close still counts.
+        assert!(held.complete());
+        assert_eq!(queue.remaining(), 1);
     }
 
     /// A piece of two and a half blocks, its hash, and an `ActivePiece` for it.
