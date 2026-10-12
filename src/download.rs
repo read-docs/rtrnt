@@ -9,7 +9,7 @@ use anyhow::{Result, anyhow, bail};
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
 use sha1::Digest;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,6 +47,16 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// How long to wait before accepting again after an error, such as running
 /// out of file descriptors.
 const ACCEPT_RETRY: Duration = Duration::from_secs(1);
+/// Longest block a peer may request. 16 KiB is what every client asks for;
+/// some serve up to 128 KiB, but nobody needs that.
+const MAX_REQUEST_LEN: u32 = BLOCK_SIZE;
+/// Requests a peer may have queued with us; more are dropped. libtorrent
+/// allows as many by default, and the extension handshake (BEP 10 `reqq`)
+/// would let us tell peers.
+const MAX_QUEUED_UPLOADS: usize = 500;
+/// Messages a worker handles from a peer that keeps sending, before it sends
+/// the next block that peer asked for.
+const MAX_MESSAGES_PER_BLOCK: usize = 16;
 
 pub struct DownloadConfig {
     pub output_dir: PathBuf,
@@ -574,6 +584,13 @@ async fn peer_worker(
     };
     debug!(%addr, inbound, "connected");
 
+    // Our pieces, unless we have none yet, which the spec lets us leave
+    // unsaid. Pieces completed from now on are announced with Have.
+    let (bitfield, mut announced) = queue.bitfield();
+    if let Some(bitfield) = bitfield {
+        conn.send(&PeerMessage::Bitfield { bitfield }).await?;
+    }
+
     let mut pieces = queue.register_peer();
     // Pieces we hold a claim on, with requests spread over all of them so the
     // pipeline does not drain at every piece boundary.
@@ -584,8 +601,20 @@ async fn peer_worker(
     // Set while we are interested but choked.
     let mut unchoke_deadline = None;
     let mut has_changed = true;
+    // Blocks the peer asked us for, sent one per turn of the loop.
+    let mut uploads = Uploads::default();
+    // Messages handled since the last block we sent, and whether the last
+    // look for one found nothing waiting.
+    let mut messages_since_block = 0;
+    let mut drained = false;
     loop {
+        // Registered before anything is checked, so that a change in the
+        // queue from here on still wakes the idle wait below.
+        let mut changed = std::pin::pin!(queue.changed.notified());
+        changed.as_mut().enable();
+
         drop_completed(&mut conn, &mut active).await?;
+        announce_pieces(&mut conn, queue, &mut announced).await?;
         if queue.is_finished() {
             return Ok(());
         }
@@ -597,8 +626,17 @@ async fn peer_worker(
         // another peer is downloading it right now. Any piece we hold counts.
         let wanted = !active.is_empty() || queue.wants(&pieces);
         conn.set_interested(wanted).await?;
+        // For now, any peer that wants to download from us may.
+        let choking = !conn.peer_interested();
+        conn.set_choking(choking).await?;
+        if choking {
+            // A choke drops the peer's requests; without the fast extension
+            // there is no way to reject them one by one.
+            uploads.clear();
+        }
         let now = Instant::now();
-        if wanted {
+        // Worth keeping while either side wants something from the other.
+        if wanted || conn.peer_interested() {
             last_useful = now;
         }
         unchoke_deadline = match unchoke_deadline {
@@ -618,35 +656,62 @@ async fn peer_worker(
             .await?;
         }
 
+        // Send the next block the peer asked for once the messages that had
+        // already arrived are handled, so that a Cancel among them is
+        // honored, or after `MAX_MESSAGES_PER_BLOCK` of them, so that a peer
+        // that keeps sending still gets its blocks.
+        if uploads.is_empty() {
+            messages_since_block = 0;
+        } else if drained || messages_since_block >= MAX_MESSAGES_PER_BLOCK {
+            if let Some(request) = uploads.pop() {
+                serve_block(&mut conn, &session.storage, request).await?;
+            }
+            messages_since_block = 0;
+        }
+
         // `receive` and `receive_untimed` are cancel-safe, so losing a race
         // loses no data.
-        let message = if active.is_empty() {
+        let message = if !uploads.is_empty() {
+            // More blocks to send: only take a message that is already here.
+            tokio::select! {
+                biased;
+                message = conn.receive_untimed() => Some(message?),
+                () = std::future::ready(()) => None,
+            }
+        } else if active.is_empty() {
             if unchoke_deadline.is_some_and(|deadline| now >= deadline) {
                 bail!("peer did not unchoke us");
             }
             if now - last_useful > IDLE_TIMEOUT {
-                bail!("peer has no pieces we need");
+                bail!("neither side has pieces the other needs");
             }
             conn.keep_alive().await?;
             // Wait for an unchoke, for a piece to be returned or completed,
             // for the queue to close, or for the peer to announce a new
-            // piece.
+            // piece or ask for one of ours.
             tokio::select! {
-                _ = queue.changed.notified() => None,
+                () = &mut changed => None,
                 message = conn.receive_untimed() => Some(message?),
                 _ = tokio::time::sleep(IDLE_POLL) => None,
             }
         } else {
             conn.keep_alive().await?;
-            let completed_elsewhere = || active.iter().any(|piece| piece.claim.is_completed());
+            // A piece completed by any worker is announced to this peer.
+            let woken = || {
+                queue.is_closed()
+                    || queue.completed_count() > announced
+                    || active.iter().any(|piece| piece.claim.is_completed())
+            };
             tokio::select! {
                 message = conn.receive() => Some(message?),
-                () = queue.wait_for(|| queue.is_closed() || completed_elsewhere()) => None,
+                () = queue.wait_for(woken) => None,
             }
         };
+        drained = message.is_none();
         let Some(message) = message else {
             continue;
         };
+        messages_since_block += 1;
 
         match message {
             PeerMessage::Have { .. } | PeerMessage::Bitfield { .. } => has_changed = true,
@@ -695,8 +760,141 @@ async fn peer_worker(
                     debug!(%addr, index, "piece complete");
                 }
             }
+            PeerMessage::Request {
+                index,
+                begin,
+                length,
+            } => {
+                let request = BlockRequest {
+                    index,
+                    begin,
+                    length,
+                };
+                // We only ever advertise pieces we have, so asking for
+                // another is a protocol violation.
+                if !queue.has(index as usize) {
+                    bail!(Misbehaved("peer requested a piece we do not have"));
+                }
+                request.check(torrent.piece_len(index as usize)?)?;
+                if conn.am_choking() {
+                    // Sent before our Choke arrived, which dropped it.
+                    debug!(%addr, ?request, "ignoring request from choked peer");
+                } else if !uploads.push(request) {
+                    debug!(%addr, ?request, "dropping request: too many queued");
+                }
+            }
+            PeerMessage::Cancel {
+                index,
+                begin,
+                length,
+            } => uploads.cancel(&BlockRequest {
+                index,
+                begin,
+                length,
+            }),
             _ => {}
         }
+    }
+}
+
+/// Sends Have for every piece completed since the last call, except those
+/// the peer has itself (Have suppression, which the spec allows).
+async fn announce_pieces(
+    conn: &mut PeerConnection,
+    queue: &PieceQueue,
+    announced: &mut usize,
+) -> Result<()> {
+    let completed = queue.completed_since(*announced);
+    *announced += completed.len();
+    let peer_has = conn.peer_has();
+    let haves = completed
+        .into_iter()
+        .filter(|&index| !peer_has.get(index).copied().unwrap_or(false))
+        .map(|index| {
+            let piece_index = u32::try_from(index).map_err(|_| anyhow!("piece index too large"))?;
+            Ok(PeerMessage::Have { piece_index })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !haves.is_empty() {
+        conn.send_all(&haves).await?;
+    }
+    Ok(())
+}
+
+/// Reads a block the peer asked for from disk and sends it.
+async fn serve_block(
+    conn: &mut PeerConnection,
+    storage: &Arc<Storage>,
+    request: BlockRequest,
+) -> Result<()> {
+    let BlockRequest {
+        index,
+        begin,
+        length,
+    } = request;
+    let block = storage.read_block(index as usize, begin, length).await?;
+    conn.send(&PeerMessage::Piece {
+        index,
+        begin,
+        block,
+    })
+    .await
+}
+
+/// A block a peer asked us for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockRequest {
+    index: u32,
+    begin: u32,
+    length: u32,
+}
+
+impl BlockRequest {
+    /// Checks that the block lies inside its piece, `piece_len` bytes long,
+    /// and is no longer than `MAX_REQUEST_LEN`.
+    fn check(&self, piece_len: u64) -> Result<()> {
+        let end = u64::from(self.begin) + u64::from(self.length);
+        if self.length == 0 || self.length > MAX_REQUEST_LEN || end > piece_len {
+            bail!(Misbehaved("peer sent an invalid request"));
+        }
+        Ok(())
+    }
+}
+
+/// Blocks a peer asked us for that have not been sent yet, oldest first.
+#[derive(Default)]
+struct Uploads(VecDeque<BlockRequest>);
+
+impl Uploads {
+    /// Queues a request, unless it is queued already. Returns false, dropping
+    /// it, if `MAX_QUEUED_UPLOADS` requests are queued.
+    fn push(&mut self, request: BlockRequest) -> bool {
+        if self.0.contains(&request) {
+            return true;
+        }
+        if self.0.len() >= MAX_QUEUED_UPLOADS {
+            return false;
+        }
+        self.0.push_back(request);
+        true
+    }
+
+    /// Drops a queued request. A block already sent cannot be called back,
+    /// and the peer ignores it.
+    fn cancel(&mut self, request: &BlockRequest) {
+        self.0.retain(|queued| queued != request);
+    }
+
+    fn pop(&mut self) -> Option<BlockRequest> {
+        self.0.pop_front()
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
@@ -927,6 +1125,11 @@ struct QueueState {
     remaining: usize,
     /// How many connected peers have each piece.
     availability: Vec<u32>,
+    /// Pieces verified and on disk, which peers may download from us.
+    have: Vec<bool>,
+    /// Pieces completed this session, in order, so that each worker can tell
+    /// its peer about the ones it has not announced yet.
+    completed: Vec<usize>,
     /// Set when the download stops: no more pieces are handed out, and
     /// workers exit.
     closed: bool,
@@ -942,6 +1145,8 @@ impl PieceQueue {
                 pending,
                 in_flight: BTreeMap::new(),
                 availability: vec![0; have.len()],
+                have: have.to_vec(),
+                completed: Vec::new(),
                 closed: false,
             }),
             changed: Notify::new(),
@@ -1030,6 +1235,37 @@ impl PieceQueue {
         }
     }
 
+    /// Whether piece `index` is verified and on disk.
+    fn has(&self, index: usize) -> bool {
+        self.lock().have.get(index).copied().unwrap_or(false)
+    }
+
+    /// Our bitfield, or `None` while we have no piece, and how many
+    /// completions it covers: pass that to `completed_since` for the pieces
+    /// completed after it was taken.
+    fn bitfield(&self) -> (Option<Vec<u8>>, usize) {
+        let state = self.lock();
+        let bitfield = state
+            .have
+            .contains(&true)
+            .then(|| peer::encode_bitfield(&state.have));
+        (bitfield, state.completed.len())
+    }
+
+    /// Pieces completed after the first `seen` completions of the session.
+    fn completed_since(&self, seen: usize) -> Vec<usize> {
+        self.lock()
+            .completed
+            .get(seen..)
+            .map(<[usize]>::to_vec)
+            .unwrap_or_default()
+    }
+
+    /// Pieces completed this session.
+    fn completed_count(&self) -> usize {
+        self.lock().completed.len()
+    }
+
     fn remaining(&self) -> usize {
         self.lock().remaining
     }
@@ -1072,6 +1308,8 @@ impl PieceClaim<'_> {
             let first = state.in_flight.remove(&self.index).is_some();
             if first {
                 state.remaining -= 1;
+                state.have[self.index] = true;
+                state.completed.push(self.index);
             }
             first
         };
@@ -1591,6 +1829,101 @@ mod tests {
         let _b = peers.register([2; 20]).unwrap();
         drop(a);
         assert!(peers.register([1; 20]).is_some());
+    }
+
+    #[test]
+    fn bitfield_and_haves_follow_completed_pieces() {
+        let queue = PieceQueue::new(&[false; 3]);
+        assert_eq!(queue.bitfield(), (None, 0));
+        assert!(!queue.has(0));
+        let seed = peer(&queue, &[true; 3]);
+        let first = queue.claim(&seed, &[]).unwrap();
+        let second = queue.claim(&seed, &[]).unwrap();
+        let (a, b) = (first.index, second.index);
+
+        assert!(second.complete());
+        assert!(queue.has(b));
+        let (bitfield, seen) = queue.bitfield();
+        assert_eq!(
+            bitfield,
+            Some(peer::encode_bitfield(&[0, 1, 2].map(|i| i == b)))
+        );
+        assert_eq!(seen, 1);
+        // A worker that sent this bitfield announces only what follows.
+        assert!(queue.completed_since(seen).is_empty());
+        assert!(first.complete());
+        assert_eq!(queue.completed_since(seen), [a]);
+        assert_eq!(queue.completed_since(0), [b, a]);
+        assert_eq!(queue.completed_count(), 2);
+        assert!(queue.completed_since(5).is_empty());
+        assert!(!queue.has(3));
+    }
+
+    #[test]
+    fn pieces_on_disk_are_in_the_bitfield_but_never_announced() {
+        let queue = PieceQueue::new(&[true, false, true]);
+        assert!(queue.has(0) && !queue.has(1) && queue.has(2));
+        assert_eq!(queue.bitfield(), (Some(vec![0b1010_0000]), 0));
+        assert!(queue.completed_since(0).is_empty());
+    }
+
+    #[test]
+    fn request_must_lie_inside_the_piece_and_be_one_block_at_most() {
+        let request = |begin, length| BlockRequest {
+            index: 0,
+            begin,
+            length,
+        };
+        let piece_len = 3 * u64::from(BLOCK_SIZE) - 100;
+        for (begin, length) in [
+            (0, BLOCK_SIZE),
+            (BLOCK_SIZE, BLOCK_SIZE),
+            // The short last block, and odd but valid ranges.
+            (2 * BLOCK_SIZE, BLOCK_SIZE - 100),
+            (7, 1),
+            (2 * BLOCK_SIZE - 100, BLOCK_SIZE),
+        ] {
+            assert!(request(begin, length).check(piece_len).is_ok());
+        }
+        for (begin, length) in [
+            (0, 0),
+            (0, BLOCK_SIZE + 1),
+            (0, 2 * BLOCK_SIZE),
+            (2 * BLOCK_SIZE, BLOCK_SIZE),
+            (3 * BLOCK_SIZE, 1),
+            (u32::MAX, BLOCK_SIZE),
+        ] {
+            let err = request(begin, length).check(piece_len).unwrap_err();
+            assert!(err.is::<Misbehaved>(), "{begin}+{length}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn uploads_are_served_in_order_cancelled_and_capped() {
+        let request = |begin| BlockRequest {
+            index: 1,
+            begin,
+            length: BLOCK_SIZE,
+        };
+        let mut uploads = Uploads::default();
+        assert!(uploads.push(request(0)));
+        assert!(uploads.push(request(1)));
+        assert!(uploads.push(request(2)));
+        // Asked twice, sent once.
+        assert!(uploads.push(request(0)));
+        uploads.cancel(&request(1));
+        uploads.cancel(&request(9));
+        assert_eq!(uploads.pop(), Some(request(0)));
+        assert_eq!(uploads.pop(), Some(request(2)));
+        assert_eq!(uploads.pop(), None);
+
+        for begin in 0..MAX_QUEUED_UPLOADS as u32 {
+            assert!(uploads.push(request(begin)));
+        }
+        assert!(!uploads.push(request(u32::MAX)));
+        uploads.clear();
+        assert!(uploads.is_empty());
+        assert!(uploads.push(request(u32::MAX)));
     }
 
     #[tokio::test]

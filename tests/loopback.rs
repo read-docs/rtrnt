@@ -82,6 +82,15 @@ async fn accept_partial(
 /// Connects to the leecher listening at `addr`, completes the handshake and
 /// advertises every piece.
 async fn connect_to_leecher(addr: SocketAddr, info_hash: [u8; 20], num_pieces: usize) -> TcpStream {
+    let mut socket = connect_to(addr, info_hash).await;
+    let all: Vec<usize> = (0..num_pieces).collect();
+    send_bitfield(&mut socket, num_pieces, &all).await;
+    socket
+}
+
+/// Connects to the client listening at `addr` and completes the handshake,
+/// as a peer with no pieces (which need not send a bitfield).
+async fn connect_to(addr: SocketAddr, info_hash: [u8; 20]) -> TcpStream {
     let mut socket = TcpStream::connect(addr).await.unwrap();
     socket
         .write_all(&handshake_bytes(&info_hash, &generate_peer_id()))
@@ -90,8 +99,6 @@ async fn connect_to_leecher(addr: SocketAddr, info_hash: [u8; 20], num_pieces: u
     let mut handshake = [0u8; 68];
     socket.read_exact(&mut handshake).await.unwrap();
     parse_handshake(&handshake, &info_hash).unwrap();
-    let all: Vec<usize> = (0..num_pieces).collect();
-    send_bitfield(&mut socket, num_pieces, &all).await;
     socket
 }
 
@@ -109,6 +116,47 @@ async fn read_message(socket: &mut TcpStream) -> Option<PeerMessage> {
     let mut payload = vec![0u8; len as usize];
     socket.read_exact(&mut payload).await.ok()?;
     Some(PeerMessage::decode(&payload).unwrap())
+}
+
+/// Reads the next message other than a keep-alive, or `None` once the
+/// client disconnects. Fails if nothing comes for 5 s.
+async fn next_message(socket: &mut TcpStream) -> Option<PeerMessage> {
+    let next = async {
+        loop {
+            match read_message(socket).await {
+                Some(PeerMessage::KeepAlive) => {}
+                other => return other,
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), next)
+        .await
+        .expect("client went silent")
+}
+
+/// Sends several messages in one write, so they arrive together.
+async fn send_batch(socket: &mut TcpStream, messages: &[PeerMessage]) {
+    let bytes: Vec<u8> = messages.iter().flat_map(PeerMessage::encode).collect();
+    socket.write_all(&bytes).await.unwrap();
+}
+
+fn request(index: u32, begin: u32, length: u32) -> PeerMessage {
+    PeerMessage::Request {
+        index,
+        begin,
+        length,
+    }
+}
+
+/// The Piece message answering a request for `length` bytes of `data` at
+/// `begin` in piece `index`.
+fn piece(data: &[u8], index: u32, begin: u32, length: u32) -> PeerMessage {
+    let start = index as usize * PIECE_LENGTH as usize + begin as usize;
+    PeerMessage::Piece {
+        index,
+        begin,
+        block: data[start..start + length as usize].to_vec(),
+    }
 }
 
 /// Answers block requests from `data` until the leecher disconnects.
@@ -464,7 +512,9 @@ async fn loses_interest_when_a_peer_has_nothing_left_we_need() {
     .expect("download failed");
     assert_files_match(out.path(), &data);
 
-    let received = choking_task.await.unwrap();
+    // It also hears Have for the pieces it lacks, as they complete.
+    let mut received = choking_task.await.unwrap();
+    received.retain(|message| !matches!(message, PeerMessage::Have { .. }));
     assert_eq!(
         received,
         [PeerMessage::Interested, PeerMessage::NotInterested]
@@ -666,6 +716,169 @@ async fn downloads_from_a_peer_that_connects_to_us() {
     .expect("download timed out")
     .expect("download failed");
     assert_files_match(out.path(), &data);
+}
+
+const BLOCK: u32 = 16 * 1024;
+
+/// Writes every file of the torrent in place, as a finished download would.
+fn write_files(out: &Path, data: &[u8]) {
+    let dir = out.join("multi/dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut offset = 0;
+    for (name, len) in FILES {
+        std::fs::write(dir.join(name), &data[offset..offset + len]).unwrap();
+        offset += len;
+    }
+}
+
+/// A seeder of piece 1 alone that only unchokes us once `release` fires, so
+/// the download keeps running until then.
+async fn gated_seeder(
+    data: Arc<Vec<u8>>,
+    info_hash: [u8; 20],
+    num_pieces: usize,
+    release: oneshot::Receiver<()>,
+) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut socket = accept_partial(&listener, info_hash, num_pieces, &[1]).await;
+        release.await.unwrap();
+        send(&mut socket, PeerMessage::Unchoke).await;
+        serve(socket, &data).await;
+    });
+    addr
+}
+
+/// We have pieces 0 and 2 and download piece 1. A leecher that connects to
+/// us gets our bitfield, is unchoked once interested, and gets the blocks it
+/// asks for, except one it cancels before it was sent. Once piece 1 is done,
+/// it hears Have for it.
+#[tokio::test]
+async fn serves_blocks_to_a_peer_that_connects_to_us() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+    let out = tempfile::tempdir().unwrap();
+    write_files(out.path(), &data);
+
+    let (release, release_rx) = oneshot::channel();
+    let seeder_addr = gated_seeder(Arc::clone(&data), info_hash, num_pieces, release_rx).await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let our_addr = listener.local_addr().unwrap();
+    let leecher_data = Arc::clone(&data);
+    let leecher = tokio::spawn(async move {
+        let data = &leecher_data;
+        let mut socket = connect_to(our_addr, info_hash).await;
+        let bitfield = vec![0b1010_0000];
+        assert_eq!(
+            next_message(&mut socket).await,
+            Some(PeerMessage::Bitfield { bitfield })
+        );
+        send(&mut socket, PeerMessage::Interested).await;
+        assert_eq!(next_message(&mut socket).await, Some(PeerMessage::Unchoke));
+
+        // The cancel arrives with the requests, before the block is sent.
+        let cancel = PeerMessage::Cancel {
+            index: 0,
+            begin: BLOCK,
+            length: BLOCK,
+        };
+        let batch = [
+            request(0, 0, BLOCK),
+            request(2, 0, BLOCK),
+            request(0, BLOCK, BLOCK),
+            cancel,
+        ];
+        send_batch(&mut socket, &batch).await;
+        assert_eq!(
+            next_message(&mut socket).await,
+            Some(piece(data, 0, 0, BLOCK))
+        );
+        assert_eq!(
+            next_message(&mut socket).await,
+            Some(piece(data, 2, 0, BLOCK))
+        );
+        // The short last block; the cancelled one never comes first.
+        let last = data.len() as u32 - 2 * PIECE_LENGTH as u32 - BLOCK;
+        send(&mut socket, request(2, BLOCK, last)).await;
+        assert_eq!(
+            next_message(&mut socket).await,
+            Some(piece(data, 2, BLOCK, last))
+        );
+
+        release.send(()).unwrap();
+        assert_eq!(
+            next_message(&mut socket).await,
+            Some(PeerMessage::Have { piece_index: 1 })
+        );
+    });
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        download_from_peers(
+            session(torrent, info_hash, out.path()),
+            &[true, false, true],
+            &[seeder_addr],
+            10,
+            Some(listener),
+            None,
+            pending(),
+        ),
+    )
+    .await
+    .expect("download timed out")
+    .expect("download failed");
+    leecher.await.unwrap();
+    assert_files_match(out.path(), &data);
+}
+
+/// A peer that asks for a piece we do not have is cut off without an answer.
+#[tokio::test]
+async fn drops_a_peer_that_requests_a_piece_we_do_not_have() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+    let out = tempfile::tempdir().unwrap();
+    write_files(out.path(), &data);
+
+    let (release, release_rx) = oneshot::channel();
+    let seeder_addr = gated_seeder(Arc::clone(&data), info_hash, num_pieces, release_rx).await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let our_addr = listener.local_addr().unwrap();
+    let leecher = tokio::spawn(async move {
+        let mut socket = connect_to(our_addr, info_hash).await;
+        assert!(matches!(
+            next_message(&mut socket).await,
+            Some(PeerMessage::Bitfield { .. })
+        ));
+        send(&mut socket, PeerMessage::Interested).await;
+        assert_eq!(next_message(&mut socket).await, Some(PeerMessage::Unchoke));
+        send_batch(&mut socket, &[request(1, 0, BLOCK), request(0, 0, BLOCK)]).await;
+        assert_eq!(next_message(&mut socket).await, None);
+        release.send(()).unwrap();
+    });
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        download_from_peers(
+            session(torrent, info_hash, out.path()),
+            &[true, false, true],
+            &[seeder_addr],
+            10,
+            Some(listener),
+            None,
+            pending(),
+        ),
+    )
+    .await
+    .expect("download timed out")
+    .expect("download failed");
+    leecher.await.unwrap();
 }
 
 /// A minimal HTTP tracker: answers every announce with `peers` and forwards
