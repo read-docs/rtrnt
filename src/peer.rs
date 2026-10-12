@@ -14,7 +14,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-const UNCHOKE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Peers commonly drop connections that stay silent for two minutes.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(90);
 const PROTOCOL: &[u8; 19] = b"BitTorrent protocol";
 const PEER_ID_PREFIX: &[u8; 8] = b"-RT0100-";
 
@@ -233,6 +234,8 @@ pub struct PeerConnection {
     pub peer_id: [u8; 20],
     peer_choking: bool,
     peer_has: Vec<bool>,
+    am_interested: bool,
+    last_sent: Instant,
 }
 
 impl PeerConnection {
@@ -266,6 +269,8 @@ impl PeerConnection {
             peer_id: remote_id,
             peer_choking: true,
             peer_has: vec![false; num_pieces],
+            am_interested: false,
+            last_sent: Instant::now(),
         })
     }
 
@@ -288,6 +293,30 @@ impl PeerConnection {
         timeout(WRITE_TIMEOUT, self.socket.write_all(&bytes))
             .await
             .context("write timed out")??;
+        self.last_sent = Instant::now();
+        Ok(())
+    }
+
+    /// Sends a keep-alive if nothing has been sent for `KEEPALIVE_INTERVAL`,
+    /// so the peer does not time out an idle connection.
+    pub async fn keep_alive(&mut self) -> Result<()> {
+        if self.last_sent.elapsed() >= KEEPALIVE_INTERVAL {
+            self.send(&PeerMessage::KeepAlive).await?;
+        }
+        Ok(())
+    }
+
+    /// Sends Interested or NotInterested if our interest changed.
+    pub async fn set_interested(&mut self, interested: bool) -> Result<()> {
+        if interested != self.am_interested {
+            let message = if interested {
+                PeerMessage::Interested
+            } else {
+                PeerMessage::NotInterested
+            };
+            self.send(&message).await?;
+            self.am_interested = interested;
+        }
         Ok(())
     }
 
@@ -307,23 +336,6 @@ impl PeerConnection {
         let message = PeerMessage::decode(&payload)?;
         self.apply(&message)?;
         Ok(message)
-    }
-
-    /// Sends Interested and waits until the peer unchokes us.
-    pub async fn negotiate(&mut self) -> Result<()> {
-        self.send(&PeerMessage::Interested).await?;
-        self.wait_unchoke().await
-    }
-
-    pub async fn wait_unchoke(&mut self) -> Result<()> {
-        let deadline = Instant::now() + UNCHOKE_TIMEOUT;
-        while self.peer_choking {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            timeout(remaining, self.receive())
-                .await
-                .context("peer did not unchoke us")??;
-        }
-        Ok(())
     }
 
     async fn read_frame(&mut self) -> Result<Vec<u8>> {
@@ -454,5 +466,49 @@ mod tests {
         let mut bad = handshake;
         bad[5] = b'x';
         assert!(parse_handshake(&bad, &info_hash).is_err());
+    }
+
+    #[tokio::test]
+    async fn sends_interest_changes_and_keep_alives_only_when_needed() {
+        let info_hash = [5u8; 20];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let remote = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut handshake = [0u8; 68];
+            socket.read_exact(&mut handshake).await.unwrap();
+            let reply = handshake_bytes(&info_hash, &[1u8; 20]);
+            socket.write_all(&reply).await.unwrap();
+            let mut received = Vec::new();
+            while let Ok(len) = socket.read_u32().await {
+                let mut payload = vec![0u8; len as usize];
+                socket.read_exact(&mut payload).await.unwrap();
+                received.push(PeerMessage::decode(&payload).unwrap());
+            }
+            received
+        });
+
+        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1)
+            .await
+            .unwrap();
+        conn.keep_alive().await.unwrap();
+        conn.set_interested(false).await.unwrap();
+        conn.set_interested(true).await.unwrap();
+        conn.set_interested(true).await.unwrap();
+        conn.set_interested(false).await.unwrap();
+        conn.keep_alive().await.unwrap();
+        conn.last_sent = Instant::now().checked_sub(KEEPALIVE_INTERVAL).unwrap();
+        conn.keep_alive().await.unwrap();
+        conn.keep_alive().await.unwrap();
+        drop(conn);
+
+        assert_eq!(
+            remote.await.unwrap(),
+            [
+                PeerMessage::Interested,
+                PeerMessage::NotInterested,
+                PeerMessage::KeepAlive,
+            ]
+        );
     }
 }

@@ -24,8 +24,10 @@ const BLOCK_SIZE: u32 = 16 * 1024;
 const PIPELINE: usize = 16;
 /// Peers that send this many corrupt pieces are dropped.
 const MAX_HASH_FAILURES: u32 = 3;
-/// A peer with nothing useful to offer for this long is dropped.
+/// A peer that has no piece we need for this long is dropped.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// A peer that keeps us choked this long while we are interested is dropped.
+const UNCHOKE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How often an idle worker re-checks the queue.
 const IDLE_POLL: Duration = Duration::from_secs(2);
 /// How long finished workers get to wind down before being aborted.
@@ -256,20 +258,45 @@ async fn peer_worker(
         torrent.num_pieces(),
     )
     .await?;
-    conn.negotiate().await?;
-    debug!(%addr, "connected and unchoked");
+    debug!(%addr, "connected");
 
     let mut pieces = queue.register_peer();
     let mut hash_failures = 0;
     let mut last_useful = Instant::now();
+    // Set while we are interested but choked.
+    let mut unchoke_deadline = None;
     while !queue.is_done() {
         pieces.update(conn.peer_has());
-        let Some(claim) = queue.claim(&pieces) else {
-            if last_useful.elapsed() > IDLE_TIMEOUT {
+        // Interested only while the peer has a piece we still need, even if
+        // another peer is downloading it right now.
+        let wanted = queue.wants(&pieces);
+        conn.set_interested(wanted).await?;
+        let now = Instant::now();
+        if wanted {
+            last_useful = now;
+        }
+        unchoke_deadline = match unchoke_deadline {
+            _ if !wanted || !conn.is_choked() => None,
+            Some(deadline) => Some(deadline),
+            None => Some(now + UNCHOKE_TIMEOUT),
+        };
+
+        let claim = if conn.is_choked() {
+            None
+        } else {
+            queue.claim(&pieces)
+        };
+        let Some(claim) = claim else {
+            if unchoke_deadline.is_some_and(|deadline| now >= deadline) {
+                bail!("peer did not unchoke us");
+            }
+            if now - last_useful > IDLE_TIMEOUT {
                 bail!("peer has no pieces we need");
             }
-            // Wait for a piece to be returned or completed, or for the peer
-            // to announce a new piece. `receive_untimed` is cancel-safe.
+            conn.keep_alive().await?;
+            // Wait for an unchoke, for a piece to be returned or completed,
+            // or for the peer to announce a new piece. `receive_untimed` is
+            // cancel-safe.
             tokio::select! {
                 _ = queue.changed.notified() => {}
                 message = conn.receive_untimed() => { message?; }
@@ -277,7 +304,6 @@ async fn peer_worker(
             }
             continue;
         };
-        last_useful = Instant::now();
 
         let index = claim.index;
         let piece_len = torrent.piece_len(index)?;
@@ -299,11 +325,9 @@ async fn peer_worker(
             Err(PieceError::CompletedElsewhere) => {
                 debug!(%addr, index, "piece completed by another peer");
             }
-            Err(PieceError::Choked) => {
-                debug!(%addr, index, "choked mid-piece");
-                drop(claim);
-                conn.wait_unchoke().await?;
-            }
+            // The claim is dropped, returning the piece, and the next turn
+            // waits for an unchoke.
+            Err(PieceError::Choked) => debug!(%addr, index, "choked mid-piece"),
             Err(PieceError::HashMismatch) => {
                 hash_failures += 1;
                 warn!(%addr, index, "piece failed hash check");
@@ -358,6 +382,7 @@ async fn download_piece(
     let mut done = 0;
 
     while done < num_blocks {
+        conn.keep_alive().await?;
         let mut requests = Vec::new();
         while in_flight < PIPELINE && next_request < num_blocks {
             requests.push(PeerMessage::Request {
@@ -516,6 +541,14 @@ impl PieceQueue {
             index,
             completed: false,
         })
+    }
+
+    /// Whether the peer has a piece that is not yet completed, whether
+    /// pending or in flight.
+    fn wants(&self, peer: &PeerPieces<'_>) -> bool {
+        let state = self.lock();
+        let has = |i: &usize| peer.has.get(*i).copied().unwrap_or(false);
+        state.pending.iter().any(has) || state.in_flight.keys().any(has)
     }
 
     fn remaining(&self) -> usize {
@@ -752,6 +785,25 @@ mod tests {
         assert_eq!(availability(&queue), [0, 0, 1]);
         drop(a);
         assert_eq!(availability(&queue), [0, 0, 0]);
+    }
+
+    #[test]
+    fn wants_pieces_until_they_are_completed() {
+        let queue = PieceQueue::new(3);
+        let a = peer(&queue, &[true, true, false]);
+        let b = peer(&queue, &[false, true, false]);
+        assert!(!queue.wants(&peer(&queue, &[false; 3])));
+        assert!(queue.wants(&b));
+
+        // In flight with another peer still counts: endgame may need it.
+        let claim = queue.claim(&b).unwrap();
+        assert_eq!(claim.index, 1);
+        assert!(queue.wants(&b));
+        assert!(claim.complete());
+        assert!(!queue.wants(&b));
+        assert!(queue.wants(&a));
+        queue.claim(&a).unwrap().complete();
+        assert!(!queue.wants(&a));
     }
 
     #[test]

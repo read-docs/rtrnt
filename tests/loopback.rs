@@ -54,6 +54,17 @@ async fn accept_leecher(
     info_hash: [u8; 20],
     num_pieces: usize,
 ) -> TcpStream {
+    let all: Vec<usize> = (0..num_pieces).collect();
+    accept_partial(listener, info_hash, num_pieces, &all).await
+}
+
+/// Accepts one leecher, completes the handshake and advertises `has`.
+async fn accept_partial(
+    listener: &TcpListener,
+    info_hash: [u8; 20],
+    num_pieces: usize,
+    has: &[usize],
+) -> TcpStream {
     let (mut socket, _) = listener.accept().await.unwrap();
     let mut handshake = [0u8; 68];
     socket.read_exact(&mut handshake).await.unwrap();
@@ -64,7 +75,7 @@ async fn accept_leecher(
         .unwrap();
 
     let mut bitfield = vec![0u8; num_pieces.div_ceil(8)];
-    for i in 0..num_pieces {
+    for &i in has {
         bitfield[i / 8] |= 0x80 >> (i % 8);
     }
     send(&mut socket, PeerMessage::Bitfield { bitfield }).await;
@@ -354,6 +365,77 @@ async fn endgame_finishes_despite_a_stalled_peer() {
         .await
         .expect("stalled peer never got a Cancel")
         .unwrap();
+}
+
+/// A peer that only has piece 0 and never unchokes us is sent Interested, and
+/// NotInterested once another peer delivers piece 0. It is never asked for a
+/// block.
+#[tokio::test]
+async fn loses_interest_when_a_peer_has_nothing_left_we_need() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+    assert_eq!(num_pieces, 3);
+
+    let (choking_done, choking_done_rx) = oneshot::channel();
+    let choking = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let choking_addr = choking.local_addr().unwrap();
+    let choking_task = tokio::spawn(async move {
+        let mut socket = accept_partial(&choking, info_hash, num_pieces, &[0]).await;
+        let mut received = Vec::new();
+        let mut choking_done = Some(choking_done);
+        while let Some(message) = read_message(&mut socket).await {
+            received.push(message);
+            if received.last() == Some(&PeerMessage::NotInterested) {
+                choking_done.take().map(|tx| tx.send(()));
+            }
+        }
+        received
+    });
+
+    // Has pieces 0 and 1, so the choking peer's only piece gets downloaded.
+    let partial = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let partial_addr = partial.local_addr().unwrap();
+    let partial_data = Arc::clone(&data);
+    tokio::spawn(async move {
+        let mut socket = accept_partial(&partial, info_hash, num_pieces, &[0, 1]).await;
+        send(&mut socket, PeerMessage::Unchoke).await;
+        serve(socket, &partial_data).await;
+    });
+
+    // Piece 2 only becomes available once the choking peer lost interest, so
+    // the download is still running when that has to happen.
+    let last = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let last_addr = last.local_addr().unwrap();
+    let last_data = Arc::clone(&data);
+    tokio::spawn(async move {
+        choking_done_rx.await.unwrap();
+        let mut socket = accept_partial(&last, info_hash, num_pieces, &[2]).await;
+        send(&mut socket, PeerMessage::Unchoke).await;
+        serve(socket, &last_data).await;
+    });
+
+    let out = tempfile::tempdir().unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        download_from_peers(
+            session(torrent, info_hash, out.path()),
+            &[choking_addr, partial_addr, last_addr],
+            10,
+            None,
+        ),
+    )
+    .await
+    .expect("choking peer was never sent NotInterested")
+    .expect("download failed");
+    assert_files_match(out.path(), &data);
+
+    let received = choking_task.await.unwrap();
+    assert_eq!(
+        received,
+        [PeerMessage::Interested, PeerMessage::NotInterested]
+    );
 }
 
 /// A minimal HTTP tracker: answers every announce with `peers` and forwards
