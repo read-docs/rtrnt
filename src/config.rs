@@ -2,20 +2,35 @@
 //!
 //! Each setting comes from the command line if given there, else from the
 //! config file, else from its built-in default. Keys in the file are the
-//! long option names, so `--max-peers 50` is `max-peers = 50`.
+//! long option names, so `--max-peers 50` is `max-peers = 50`; the one
+//! exception is `--no-dht`, which is `dht = false` (and `--dht` overrides
+//! it from the command line).
 
 use crate::download::{DownloadConfig, SeedLimits};
 use crate::peer;
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Directory downloads are saved in unless told otherwise.
 pub const DEFAULT_OUTPUT_DIR: &str = ".";
 /// Peers downloaded from at once unless told otherwise.
 pub const DEFAULT_MAX_PEERS: usize = 30;
+/// Upload ratio to seed to once the download is complete: none, so the run
+/// ends at completion unless a seed time is set.
+pub const DEFAULT_SEED_RATIO: f64 = 0.0;
+/// Minutes to seed for once the download is complete: none.
+pub const DEFAULT_SEED_TIME: u64 = 0;
+/// Whether to look for peers in the DHT unless told otherwise.
+pub const DEFAULT_DHT: bool = true;
+/// Download limit in KiB/s: none.
+pub const DEFAULT_MAX_DOWNLOAD_RATE: u64 = 0;
+/// Upload limit in KiB/s: none.
+pub const DEFAULT_MAX_UPLOAD_RATE: u64 = 0;
 
 /// Settings that can come from the command line or the config file. A
 /// field left `None` is not set there and falls back to the next source.
@@ -28,6 +43,37 @@ pub struct Options {
     pub max_peers: Option<usize>,
     /// Port to listen on for incoming peers; 0 picks a free one.
     pub port: Option<u16>,
+    /// Once the download is complete, keep seeding until we have uploaded
+    /// this many times the torrent's size; 0 for no ratio limit.
+    #[serde(default, deserialize_with = "deserialize_ratio")]
+    pub seed_ratio: Option<f64>,
+    /// Once the download is complete, keep seeding for this many minutes; 0
+    /// for no time limit.
+    pub seed_time: Option<u64>,
+    /// Whether to look for peers in the DHT too (`--no-dht` is
+    /// `dht = false`).
+    pub dht: Option<bool>,
+    /// Most block data to download per second, in KiB; 0 for no limit.
+    pub max_download_rate: Option<u64>,
+    /// Most block data to upload per second, in KiB; 0 for no limit.
+    pub max_upload_rate: Option<u64>,
+}
+
+/// Whether `ratio` is a valid seed ratio: a finite number, 0 or more.
+pub fn is_valid_ratio(ratio: f64) -> bool {
+    ratio.is_finite() && ratio >= 0.0
+}
+
+/// Reads `seed-ratio`, which must be a valid ratio (see `is_valid_ratio`).
+/// An integer is fine too.
+fn deserialize_ratio<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<f64>, D::Error> {
+    let ratio = f64::deserialize(deserializer)?;
+    if !is_valid_ratio(ratio) {
+        return Err(D::Error::custom(format!(
+            "{ratio} is not a ratio of 0 or more"
+        )));
+    }
+    Ok(Some(ratio))
 }
 
 impl Options {
@@ -38,6 +84,11 @@ impl Options {
             output: self.output.or(fallback.output),
             max_peers: self.max_peers.or(fallback.max_peers),
             port: self.port.or(fallback.port),
+            seed_ratio: self.seed_ratio.or(fallback.seed_ratio),
+            seed_time: self.seed_time.or(fallback.seed_time),
+            dht: self.dht.or(fallback.dht),
+            max_download_rate: self.max_download_rate.or(fallback.max_download_rate),
+            max_upload_rate: self.max_upload_rate.or(fallback.max_upload_rate),
         }
     }
 
@@ -50,11 +101,20 @@ impl Options {
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_OUTPUT_DIR)),
             max_peers: self.max_peers.unwrap_or(DEFAULT_MAX_PEERS),
             listen_port: self.port.unwrap_or(peer::DEFAULT_LISTEN_PORT),
-            // Only set on the command line for now.
-            seed: SeedLimits::default(),
-            dht: true,
+            seed: SeedLimits {
+                ratio: self.seed_ratio.unwrap_or(DEFAULT_SEED_RATIO),
+                time: minutes(self.seed_time.unwrap_or(DEFAULT_SEED_TIME)),
+            },
+            dht: self.dht.unwrap_or(DEFAULT_DHT),
+            max_download_rate: self.max_download_rate.unwrap_or(DEFAULT_MAX_DOWNLOAD_RATE),
+            max_upload_rate: self.max_upload_rate.unwrap_or(DEFAULT_MAX_UPLOAD_RATE),
         }
     }
+}
+
+/// `minutes` as a duration, saturating rather than overflowing.
+fn minutes(minutes: u64) -> Duration {
+    Duration::from_secs(minutes.saturating_mul(60))
 }
 
 /// The effective download config: each setting from `cli` if given there,
@@ -166,6 +226,37 @@ pub fn describe(cli: &Options, file: &ConfigFile) -> String {
             config.listen_port.to_string(),
             source(cli.port.is_some(), file.options.port.is_some()),
         ),
+        (
+            "seed-ratio",
+            toml::Value::from(config.seed.ratio).to_string(),
+            source(cli.seed_ratio.is_some(), file.options.seed_ratio.is_some()),
+        ),
+        (
+            "seed-time",
+            (config.seed.time.as_secs() / 60).to_string(),
+            source(cli.seed_time.is_some(), file.options.seed_time.is_some()),
+        ),
+        (
+            "dht",
+            config.dht.to_string(),
+            source(cli.dht.is_some(), file.options.dht.is_some()),
+        ),
+        (
+            "max-download-rate",
+            config.max_download_rate.to_string(),
+            source(
+                cli.max_download_rate.is_some(),
+                file.options.max_download_rate.is_some(),
+            ),
+        ),
+        (
+            "max-upload-rate",
+            config.max_upload_rate.to_string(),
+            source(
+                cli.max_upload_rate.is_some(),
+                file.options.max_upload_rate.is_some(),
+            ),
+        ),
     ];
 
     let header = match &file.path {
@@ -188,6 +279,7 @@ mod tests {
             output: output.map(PathBuf::from),
             max_peers,
             port,
+            ..Options::default()
         }
     }
 
@@ -197,6 +289,11 @@ mod tests {
         assert_eq!(config.output_dir, PathBuf::from(DEFAULT_OUTPUT_DIR));
         assert_eq!(config.max_peers, DEFAULT_MAX_PEERS);
         assert_eq!(config.listen_port, peer::DEFAULT_LISTEN_PORT);
+        assert_eq!(config.seed, SeedLimits::default());
+        assert!(!config.seed.enabled());
+        assert!(config.dht);
+        assert_eq!(config.max_download_rate, 0);
+        assert_eq!(config.max_upload_rate, 0);
     }
 
     #[test]
@@ -227,6 +324,80 @@ mod tests {
             parsed,
             options(Some("/srv/torrents"), Some(50), Some(51413))
         );
+    }
+
+    #[test]
+    fn parses_seeding_dht_and_rate_keys() {
+        let text = "seed-ratio = 1.5\nseed-time = 90\ndht = false\n\
+                    max-download-rate = 500\nmax-upload-rate = 64\n";
+        let parsed = parse(text, None).unwrap();
+        assert_eq!(
+            parsed,
+            Options {
+                seed_ratio: Some(1.5),
+                seed_time: Some(90),
+                dht: Some(false),
+                max_download_rate: Some(500),
+                max_upload_rate: Some(64),
+                ..Options::default()
+            }
+        );
+        let config = resolve(Options::default(), parsed);
+        assert_eq!(
+            config.seed,
+            SeedLimits {
+                ratio: 1.5,
+                time: Duration::from_secs(90 * 60),
+            }
+        );
+        assert!(!config.dht);
+        assert_eq!(config.max_download_rate, 500);
+        assert_eq!(config.max_upload_rate, 64);
+        // A whole ratio needs no decimal point.
+        assert_eq!(
+            parse("seed-ratio = 2\n", None).unwrap().seed_ratio,
+            Some(2.0)
+        );
+    }
+
+    #[test]
+    fn invalid_values_of_the_new_keys_are_errors() {
+        for bad in ["-1.0", "-1", "nan", "inf", "\"2\""] {
+            let err = parse(&format!("seed-ratio = {bad}\n"), None).unwrap_err();
+            assert!(format!("{err:#}").contains("seed-ratio"), "{bad}: {err:#}");
+        }
+        assert!(parse("seed-time = -5\n", None).is_err());
+        assert!(parse("dht = \"no\"\n", None).is_err());
+        assert!(parse("max-upload-rate = 1.5\n", None).is_err());
+        assert!(parse("max-download-rate = -1\n", None).is_err());
+    }
+
+    #[test]
+    fn cli_overrides_file_for_seeding_dht_and_rates() {
+        let file = Options {
+            seed_ratio: Some(2.0),
+            seed_time: Some(30),
+            dht: Some(false),
+            max_download_rate: Some(100),
+            ..Options::default()
+        };
+        // Flags not given fall back to the file.
+        let config = resolve(Options::default(), file.clone());
+        assert!(!config.dht);
+        assert_eq!(config.seed.ratio, 2.0);
+        assert_eq!(config.max_download_rate, 100);
+        // Given ones win, even when they say "off" or "none".
+        let cli = Options {
+            seed_ratio: Some(0.0),
+            dht: Some(true),
+            max_download_rate: Some(0),
+            ..Options::default()
+        };
+        let config = resolve(cli, file);
+        assert!(config.dht);
+        assert_eq!(config.seed.ratio, 0.0);
+        assert_eq!(config.seed.time, Duration::from_secs(30 * 60));
+        assert_eq!(config.max_download_rate, 0);
     }
 
     #[test]
@@ -309,10 +480,18 @@ mod tests {
 
     #[test]
     fn describe_names_each_source() {
-        let cli = options(None, Some(5), None);
+        let cli = Options {
+            dht: Some(false),
+            max_upload_rate: Some(64),
+            ..options(None, Some(5), None)
+        };
         let file = ConfigFile {
             path: Some(PathBuf::from("/etc/rtrnt.toml")),
-            options: options(Some("/data"), Some(80), None),
+            options: Options {
+                seed_ratio: Some(1.5),
+                dht: Some(true),
+                ..options(Some("/data"), Some(80), None)
+            },
         };
         let text = describe(&cli, &file);
         assert_eq!(
@@ -320,10 +499,30 @@ mod tests {
             "# config file: /etc/rtrnt.toml\n\
              output = \"/data\"  # config file\n\
              max-peers = 5  # command line\n\
-             port = 6881  # default\n"
+             port = 6881  # default\n\
+             seed-ratio = 1.5  # config file\n\
+             seed-time = 0  # default\n\
+             dht = false  # command line\n\
+             max-download-rate = 0  # default\n\
+             max-upload-rate = 64  # command line\n"
         );
         // The settings part is valid TOML that parses to the same values.
         let reparsed = parse(&text, None).unwrap();
-        assert_eq!(reparsed, options(Some("/data"), Some(5), Some(6881)));
+        assert_eq!(
+            reparsed,
+            Options {
+                seed_ratio: Some(1.5),
+                seed_time: Some(0),
+                dht: Some(false),
+                max_download_rate: Some(0),
+                max_upload_rate: Some(64),
+                ..options(Some("/data"), Some(5), Some(6881))
+            }
+        );
+        // A whole ratio is written as a float, and still parses.
+        let text = describe(&Options::default(), &ConfigFile::default());
+        assert!(text.starts_with("# no config file\n"), "{text}");
+        assert!(text.contains("seed-ratio = 0.0  # default\n"), "{text}");
+        parse(&text, None).unwrap();
     }
 }

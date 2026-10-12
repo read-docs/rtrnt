@@ -4,6 +4,7 @@ use crate::dht::{Dht, DhtSearch};
 use crate::extension;
 use crate::peer::{self, PeerConnection, PeerMessage};
 use crate::peer_pool::PeerPool;
+use crate::rate_limit::{Allowance, RateLimits};
 use crate::storage::Storage;
 use crate::torrent::{self, TorrentFile};
 use crate::tracker::{AnnounceEvent, AnnounceRequest};
@@ -75,6 +76,12 @@ pub struct DownloadConfig {
     pub seed: SeedLimits,
     /// Whether to look for peers in the DHT too (never for private torrents).
     pub dht: bool,
+    /// Most block data to download per second, in KiB, across all peers;
+    /// 0 for no limit.
+    pub max_download_rate: u64,
+    /// Most block data to upload per second, in KiB, across all peers; 0
+    /// for no limit.
+    pub max_upload_rate: u64,
 }
 
 /// How long to keep seeding once every piece is done. Seeding stops at
@@ -116,6 +123,8 @@ pub struct Session {
     /// Our DHT node, if any: searched for peers, and told about peers' DHT
     /// nodes, whose ports they send us.
     pub dht: Option<Dht>,
+    /// How fast block data may move each way, shared by every peer.
+    pub rate_limits: RateLimits,
 }
 
 /// Downloads the torrent at `torrent_path` and seeds it for as long as
@@ -150,7 +159,15 @@ pub async fn download_file(
         storage,
         seed: config.seed,
         dht,
+        rate_limits: RateLimits::from_kib(config.max_download_rate, config.max_upload_rate),
     });
+    if config.max_download_rate > 0 || config.max_upload_rate > 0 {
+        info!(
+            download = config.max_download_rate,
+            upload = config.max_upload_rate,
+            "rate limits in KiB/s (0: unlimited)"
+        );
+    }
 
     let candidates = verify::candidates(&session.torrent, &session.storage)?;
     let have = hash_pieces(&session, candidates).await?;
@@ -288,6 +305,7 @@ pub async fn check_file(torrent_path: &Path, output_dir: &Path) -> Result<()> {
         storage,
         seed: SeedLimits::default(),
         dht: None,
+        rate_limits: RateLimits::default(),
     });
     let have = hash_pieces(&session, pieces).await?;
 
@@ -862,6 +880,10 @@ async fn peer_worker(
     // look for one found nothing waiting.
     let mut messages_since_block = 0;
     let mut drained = false;
+    // This peer's turns at the session's rate limits: for the blocks we ask
+    // it for, and for the blocks it asks us for.
+    let mut download_budget = session.rate_limits.download.allowance();
+    let mut upload_budget = session.rate_limits.upload.allowance();
     loop {
         // Registered before anything is checked, so that a change in the
         // queue from here on still wakes the idle wait below.
@@ -913,28 +935,49 @@ async fn peer_worker(
                 torrent,
                 &mut active,
                 &mut pipeline,
+                &mut download_budget,
             )
             .await?;
+        } else {
+            // Nothing to ask for until unchoked: the turn goes to others.
+            download_budget.release();
         }
 
         // Send the next block the peer asked for once the messages that had
         // already arrived are handled, so that a Cancel among them is
         // honored, or after `MAX_MESSAGES_PER_BLOCK` of them, so that a peer
-        // that keeps sending still gets its blocks.
+        // that keeps sending still gets its blocks. Under an upload limit,
+        // the block also waits for this peer's turn.
         if uploads.is_empty() {
             messages_since_block = 0;
-        } else if drained || messages_since_block >= MAX_MESSAGES_PER_BLOCK {
-            if let Some(request) = uploads.pop() {
-                serve_block(&mut conn, &session.storage, request).await?;
-                slot.uploaded(request.length.into());
-                progress.uploaded(request.length.into());
-            }
+            upload_budget.release();
+        } else if (drained || messages_since_block >= MAX_MESSAGES_PER_BLOCK)
+            && let Some(&request) = uploads.front()
+            && upload_budget.try_take(request.length.into(), Instant::now())
+        {
+            uploads.pop();
+            serve_block(&mut conn, &session.storage, request).await?;
+            slot.uploaded(request.length.into());
+            progress.uploaded(request.length.into());
             messages_since_block = 0;
         }
 
+        // When our next turn at a rate limit comes, if we are waiting for
+        // one. A turn that has come but is not used yet (say, the pipeline
+        // is full) is not waited for.
+        let waiting_since = Instant::now();
+        let next_turn = [&download_budget, &upload_budget]
+            .into_iter()
+            .filter(|budget| budget.is_waiting(waiting_since))
+            .filter_map(|budget| budget.ready_at())
+            .min();
+        // Set if the wait below ends because our turn came, rather than
+        // because nothing was left to read.
+        let mut turn_came = false;
+
         // `receive` and `receive_untimed` are cancel-safe, so losing a race
         // loses no data.
-        let message = if !uploads.is_empty() {
+        let message = if !uploads.is_empty() && !upload_budget.is_waiting(waiting_since) {
             // More blocks to send: only take a message that is already here.
             tokio::select! {
                 biased;
@@ -957,6 +1000,10 @@ async fn peer_worker(
                 message = conn.receive_untimed() => Some(message?),
                 () = slot.changed() => None,
                 _ = tokio::time::sleep(IDLE_POLL) => None,
+                () = sleep_until_some(next_turn) => {
+                    turn_came = true;
+                    None
+                }
             }
         } else {
             conn.keep_alive().await?;
@@ -966,13 +1013,30 @@ async fn peer_worker(
                     || queue.completed_count() > announced
                     || active.iter().any(|piece| piece.claim.is_completed())
             };
+            // With nothing in flight, we are waiting for our turn at the
+            // download limit, so the peer has nothing to send and its
+            // silence is no reason to drop it.
+            let in_flight: usize = active.iter().map(ActivePiece::in_flight).sum();
+            let receive = async {
+                if in_flight > 0 {
+                    conn.receive().await
+                } else {
+                    conn.receive_untimed().await
+                }
+            };
             tokio::select! {
-                message = conn.receive() => Some(message?),
+                message = receive => Some(message?),
                 () = queue.wait_for(woken) => None,
                 () = slot.changed() => None,
+                () = sleep_until_some(next_turn) => {
+                    turn_came = true;
+                    None
+                }
             }
         };
-        drained = message.is_none();
+        // Messages may have arrived while we waited for our turn, and are
+        // handled before the next block goes out.
+        drained = message.is_none() && !turn_came;
         let Some(message) = message else {
             continue;
         };
@@ -1160,6 +1224,11 @@ impl Uploads {
         self.0.pop_front()
     }
 
+    /// The request to answer next.
+    fn front(&self) -> Option<&BlockRequest> {
+        self.0.front()
+    }
+
     fn clear(&mut self) {
         self.0.clear();
     }
@@ -1171,6 +1240,11 @@ impl Uploads {
 
 /// Tops up the requests in flight to the pipeline depth, claiming another
 /// piece whenever every block of the held ones has been requested.
+///
+/// Under a download limit, each request also waits for this peer's turn in
+/// `budget`, so the data it asks for is paid for before it is sent and
+/// never arrives faster than the limit. A turn not yet come is kept for the
+/// next call, and given up if there is nothing left to claim.
 async fn request_blocks<'q>(
     conn: &mut PeerConnection,
     queue: &'q PieceQueue,
@@ -1178,6 +1252,7 @@ async fn request_blocks<'q>(
     torrent: &TorrentFile,
     active: &mut Vec<ActivePiece<'q>>,
     pipeline: &mut Pipeline,
+    budget: &mut Allowance<'_>,
 ) -> Result<()> {
     let in_flight: usize = active.iter().map(ActivePiece::in_flight).sum();
     if in_flight == 0 {
@@ -1197,6 +1272,7 @@ async fn request_blocks<'q>(
             None => {
                 let held: Vec<usize> = active.iter().map(|piece| piece.claim.index).collect();
                 let Some(claim) = queue.claim(pieces, &held) else {
+                    budget.release();
                     break;
                 };
                 let piece_len = torrent.piece_len(claim.index)?;
@@ -1205,6 +1281,9 @@ async fn request_blocks<'q>(
                 active.len() - 1
             }
         };
+        if !budget.try_take(active[pos].next_block_len().into(), Instant::now()) {
+            break;
+        }
         requests.push(active[pos].request_next());
     }
     if !requests.is_empty() {
@@ -1325,6 +1404,12 @@ impl<'a> ActivePiece<'a> {
 
     fn has_unrequested(&self) -> bool {
         self.next_request < self.received.len()
+    }
+
+    /// Length of the block `request_next` asks for. Call only if
+    /// `has_unrequested`.
+    fn next_block_len(&self) -> u32 {
+        self.block_len(self.next_request)
     }
 
     /// The request for the next block. Call only if `has_unrequested`.

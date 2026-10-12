@@ -1,10 +1,9 @@
 use anyhow::{Context, bail};
 use clap::Parser;
-use rtrnt::download::{self, Interrupted, SeedLimits};
+use rtrnt::download::{self, Interrupted};
 use rtrnt::{config, torrent, tracker};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -46,23 +45,48 @@ struct Args {
     #[arg(long, conflicts_with = "check")]
     scrape: bool,
     /// Once the download is complete, keep seeding until we have uploaded
-    /// this many times the torrent's size (0: no ratio limit)
-    #[arg(long, default_value_t = 0.0, value_name = "RATIO", value_parser = parse_ratio)]
-    seed_ratio: f64,
+    /// this many times the torrent's size (0: no ratio limit) [default: 0]
+    #[arg(long, value_name = "RATIO", value_parser = parse_ratio)]
+    seed_ratio: Option<f64>,
     /// Once the download is complete, keep seeding for this many minutes
     /// (0: no time limit). Seeding stops at whichever limit comes first, or
-    /// on Ctrl-C; with neither, the run ends at completion
-    #[arg(long, default_value_t = 0, value_name = "MINUTES")]
-    seed_time: u64,
-    /// Do not look for peers in the DHT, only ask the trackers
-    #[arg(long)]
+    /// on Ctrl-C; with neither, the run ends at completion [default: 0]
+    #[arg(long, value_name = "MINUTES")]
+    seed_time: Option<u64>,
+    /// Do not look for peers in the DHT, only ask the trackers (`dht =
+    /// false` in the config file)
+    #[arg(long, overrides_with = "dht")]
     no_dht: bool,
+    /// Look for peers in the DHT, as by default, even if the config file
+    /// says `dht = false`
+    #[arg(long, overrides_with = "no_dht")]
+    dht: bool,
+    /// Most piece data to download per second in KiB, across all peers
+    /// (0: unlimited) [default: 0]
+    #[arg(long, value_name = "KIB/S")]
+    max_download_rate: Option<u64>,
+    /// Most piece data to upload per second in KiB, across all peers (0:
+    /// unlimited) [default: 0]
+    #[arg(long, value_name = "KIB/S")]
+    max_upload_rate: Option<u64>,
+}
+
+impl Args {
+    /// Whether the DHT was turned on or off on the command line: by the last
+    /// of `--dht` and `--no-dht`, if either is given.
+    fn dht(&self) -> Option<bool> {
+        match (self.dht, self.no_dht) {
+            (_, true) => Some(false),
+            (true, false) => Some(true),
+            (false, false) => None,
+        }
+    }
 }
 
 /// Parses `--seed-ratio`, which must be a finite number, 0 or more.
 fn parse_ratio(arg: &str) -> Result<f64, String> {
     match arg.parse::<f64>() {
-        Ok(ratio) if ratio.is_finite() && ratio >= 0.0 => Ok(ratio),
+        Ok(ratio) if config::is_valid_ratio(ratio) => Ok(ratio),
         _ => Err(format!("{arg:?} is not a ratio of 0 or more")),
     }
 }
@@ -82,9 +106,14 @@ async fn main() -> anyhow::Result<ExitCode> {
     let args = Args::parse();
     let file = config::load(args.config.as_deref())?;
     let cli = config::Options {
+        dht: args.dht(),
         output: args.output,
         max_peers: args.max_peers,
         port: args.port,
+        seed_ratio: args.seed_ratio,
+        seed_time: args.seed_time,
+        max_download_rate: args.max_download_rate,
+        max_upload_rate: args.max_upload_rate,
     };
     if args.print_config {
         print!("{}", config::describe(&cli, &file));
@@ -93,12 +122,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     if let Some(path) = &file.path {
         info!(path = %path.display(), "loaded config file");
     }
-    let mut config = config::resolve(cli, file.options);
-    config.seed = SeedLimits {
-        ratio: args.seed_ratio,
-        time: Duration::from_secs(args.seed_time.saturating_mul(60)),
-    };
-    config.dht = !args.no_dht;
+    let config = config::resolve(cli, file.options);
     // clap requires the torrent unless --print-config is given.
     let torrent = args.torrent.context("no torrent given")?;
 
@@ -187,6 +211,16 @@ mod tests {
             ("output", config::DEFAULT_OUTPUT_DIR.to_string()),
             ("max_peers", config::DEFAULT_MAX_PEERS.to_string()),
             ("port", peer::DEFAULT_LISTEN_PORT.to_string()),
+            ("seed_ratio", config::DEFAULT_SEED_RATIO.to_string()),
+            ("seed_time", config::DEFAULT_SEED_TIME.to_string()),
+            (
+                "max_download_rate",
+                config::DEFAULT_MAX_DOWNLOAD_RATE.to_string(),
+            ),
+            (
+                "max_upload_rate",
+                config::DEFAULT_MAX_UPLOAD_RATE.to_string(),
+            ),
         ];
         for (id, default) in defaults {
             let help = command
@@ -200,5 +234,44 @@ mod tests {
                 "{id}: {help}"
             );
         }
+        // `--dht` says the DHT is on by default.
+        const { assert!(config::DEFAULT_DHT) };
+    }
+
+    /// Without `--dht` or `--no-dht` the config file decides; with both,
+    /// the last one wins.
+    #[test]
+    fn dht_flags_fall_back_to_the_file() {
+        let dht = |flags: &[&str]| {
+            let args = ["rtrnt", "x.torrent"].iter().chain(flags);
+            Args::try_parse_from(args).unwrap().dht()
+        };
+        assert_eq!(dht(&[]), None);
+        assert_eq!(dht(&["--no-dht"]), Some(false));
+        assert_eq!(dht(&["--dht"]), Some(true));
+        assert_eq!(dht(&["--dht", "--no-dht"]), Some(false));
+        assert_eq!(dht(&["--no-dht", "--dht"]), Some(true));
+    }
+
+    #[test]
+    fn seed_and_rate_flags_are_optional() {
+        let args = Args::try_parse_from(["rtrnt", "x.torrent"]).unwrap();
+        assert_eq!(args.seed_ratio, None);
+        assert_eq!(args.seed_time, None);
+        assert_eq!(args.max_download_rate, None);
+        assert_eq!(args.max_upload_rate, None);
+        let args = Args::try_parse_from([
+            "rtrnt",
+            "x.torrent",
+            "--seed-ratio",
+            "0",
+            "--max-upload-rate",
+            "0",
+        ])
+        .unwrap();
+        // An explicit 0 is a setting, which beats the config file.
+        assert_eq!(args.seed_ratio, Some(0.0));
+        assert_eq!(args.max_upload_rate, Some(0));
+        assert!(Args::try_parse_from(["rtrnt", "x.torrent", "--seed-ratio", "-1"]).is_err());
     }
 }
