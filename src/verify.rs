@@ -1,0 +1,185 @@
+//! Checks data already on disk against the torrent's piece hashes, so an
+//! interrupted download can resume where it left off.
+
+use crate::storage::Storage;
+use crate::torrent::TorrentFile;
+use anyhow::{Result, anyhow};
+use sha1::Digest;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Most threads hashing at once. Reading from disk is usually the limit, and
+/// each thread holds a whole piece in memory.
+const MAX_THREADS: usize = 4;
+
+/// Pieces that may hold data from an earlier run: those overlapping a file
+/// that `Storage::new` did not create empty.
+pub fn candidates(torrent: &TorrentFile, storage: &Storage) -> Result<Vec<usize>> {
+    let mut pieces = Vec::new();
+    for index in 0..torrent.num_pieces() {
+        let (offset, len) = piece_range(torrent, index)?;
+        if storage.may_hold_prior_data(offset, len) {
+            pieces.push(index);
+        }
+    }
+    Ok(pieces)
+}
+
+/// Hashes `pieces` on disk and returns, for every piece of the torrent,
+/// whether it is there and correct. Pieces not in `pieces` count as missing.
+///
+/// Blocks while reading; `on_checked` gets each piece's length once it has
+/// been hashed. An I/O error stops the check.
+pub fn verify(
+    torrent: &TorrentFile,
+    storage: &Storage,
+    pieces: &[usize],
+    on_checked: &(dyn Fn(u64) + Sync),
+) -> Result<Vec<bool>> {
+    let next = AtomicUsize::new(0);
+    let worker = || -> Result<Vec<usize>> {
+        let mut good = Vec::new();
+        while let Some(&index) = pieces.get(next.fetch_add(1, Ordering::Relaxed)) {
+            match check_piece(torrent, storage, index) {
+                Ok((true, len)) => {
+                    good.push(index);
+                    on_checked(len);
+                }
+                Ok((false, len)) => on_checked(len),
+                Err(e) => {
+                    // Stop the other threads at their next piece.
+                    next.store(pieces.len(), Ordering::Relaxed);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(good)
+    };
+
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(MAX_THREADS)
+        .min(pieces.len());
+    let results: Vec<Result<Vec<usize>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads).map(|_| scope.spawn(worker)).collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow!("hashing thread panicked")))
+            })
+            .collect()
+    });
+
+    let mut have = vec![false; torrent.num_pieces()];
+    for result in results {
+        for index in result? {
+            have[index] = true;
+        }
+    }
+    Ok(have)
+}
+
+/// Whether piece `index` on disk matches its hash, and the piece's length.
+fn check_piece(torrent: &TorrentFile, storage: &Storage, index: usize) -> Result<(bool, u64)> {
+    let (offset, len) = piece_range(torrent, index)?;
+    let data = storage.read_at(offset, len)?;
+    let actual: [u8; 20] = sha1::Sha1::digest(&data).into();
+    Ok((actual == torrent.piece_hash(index)?, len as u64))
+}
+
+/// Byte offset and length of piece `index` in the torrent's byte stream.
+fn piece_range(torrent: &TorrentFile, index: usize) -> Result<(u64, usize)> {
+    let len = usize::try_from(torrent.piece_len(index)?)?;
+    Ok((index as u64 * torrent.info.piece_length, len))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::torrent::{FileInfo, Info};
+    use serde_bytes::ByteBuf;
+    use std::sync::atomic::AtomicU64;
+
+    const PIECE_LENGTH: usize = 4;
+
+    /// A torrent of two files, "a" (6 bytes) and "b" (5 bytes), over `data`.
+    fn torrent(data: &[u8]) -> TorrentFile {
+        let pieces: Vec<u8> = data
+            .chunks(PIECE_LENGTH)
+            .flat_map(|chunk| sha1::Sha1::digest(chunk).to_vec())
+            .collect();
+        TorrentFile {
+            announce: None,
+            announce_list: None,
+            info: Info {
+                name: "root".into(),
+                piece_length: PIECE_LENGTH as u64,
+                pieces: ByteBuf::from(pieces),
+                length: None,
+                files: Some(vec![
+                    FileInfo {
+                        path: vec!["a".into()],
+                        length: 6,
+                    },
+                    FileInfo {
+                        path: vec!["b".into()],
+                        length: 5,
+                    },
+                ]),
+            },
+        }
+    }
+
+    #[test]
+    fn finds_intact_pieces_and_skips_fresh_files() {
+        let data = b"abcdefghijk";
+        let torrent = torrent(data);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        // "a" is complete from an earlier run except for a corrupt byte in
+        // piece 1, which spans both files; "b" does not exist yet.
+        std::fs::write(root.join("a"), b"abcdeX").unwrap();
+
+        let storage = Storage::new(&torrent.info, dir.path()).unwrap();
+        // Piece 2 lies entirely in the new, empty "b".
+        let candidates = candidates(&torrent, &storage).unwrap();
+        assert_eq!(candidates, [0, 1]);
+
+        let checked = AtomicU64::new(0);
+        let have = verify(&torrent, &storage, &candidates, &|len| {
+            checked.fetch_add(len, Ordering::Relaxed);
+        })
+        .unwrap();
+        assert_eq!(have, [true, false, false]);
+        assert_eq!(checked.load(Ordering::Relaxed), 8);
+    }
+
+    #[test]
+    fn complete_data_verifies_every_piece() {
+        let data = b"abcdefghijk";
+        let torrent = torrent(data);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a"), &data[..6]).unwrap();
+        std::fs::write(root.join("b"), &data[6..]).unwrap();
+
+        let storage = Storage::new(&torrent.info, dir.path()).unwrap();
+        let candidates = candidates(&torrent, &storage).unwrap();
+        assert_eq!(candidates, [0, 1, 2]);
+        let have = verify(&torrent, &storage, &candidates, &|_| {}).unwrap();
+        assert_eq!(have, [true, true, true]);
+    }
+
+    #[test]
+    fn nothing_to_check_in_a_new_download() {
+        let torrent = torrent(b"abcdefghijk");
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(&torrent.info, dir.path()).unwrap();
+        assert!(candidates(&torrent, &storage).unwrap().is_empty());
+        let have = verify(&torrent, &storage, &[], &|_| {}).unwrap();
+        assert_eq!(have, [false, false, false]);
+    }
+}

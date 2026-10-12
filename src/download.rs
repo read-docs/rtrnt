@@ -4,6 +4,7 @@ use crate::peer_pool::PeerPool;
 use crate::storage::Storage;
 use crate::torrent::{self, TorrentFile};
 use crate::tracker::{AnnounceEvent, AnnounceRequest};
+use crate::verify;
 use anyhow::{Result, anyhow, bail};
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
@@ -68,38 +69,88 @@ pub async fn download_file(torrent_path: &Path, config: &DownloadConfig) -> Resu
     // Before announcing, so a bad output directory does not leave the
     // tracker without a `stopped`.
     let storage = Arc::new(Storage::new(&torrent.info, &config.output_dir)?);
+    let session = Arc::new(Session {
+        torrent,
+        info_hash,
+        peer_id: peer::generate_peer_id(),
+        storage,
+    });
 
-    let peer_id = peer::generate_peer_id();
+    let have = check_existing(&session).await?;
+    let left = session.torrent.length() - verified_bytes(&session.torrent, &have)?;
+    if left == 0 {
+        info!(output = %config.output_dir.display(), "already complete");
+        return Ok(());
+    }
+
     let request = AnnounceRequest {
         info_hash,
-        peer_id,
+        peer_id: session.peer_id,
         port: peer::LISTEN_PORT,
         uploaded: 0,
         downloaded: 0,
-        left: torrent.length(),
+        left,
         event: AnnounceEvent::Started,
     };
-    let (announcer, peers) = Announcer::start(torrent.tracker_tiers(), request).await?;
+    let tiers = session.torrent.tracker_tiers();
+    let (announcer, peers) = Announcer::start(tiers, request).await?;
     if peers.is_empty() {
         announcer.stop(false, 0).await;
         bail!("no tracker returned any peers");
     }
     info!(peers = peers.len(), "tracker announce succeeded");
 
-    let session = Arc::new(Session {
-        torrent,
-        info_hash,
-        peer_id,
-        storage,
-    });
-    download_from_peers(session, &peers, config.max_peers, Some(announcer)).await?;
+    download_from_peers(session, &have, &peers, config.max_peers, Some(announcer)).await?;
     info!(output = %config.output_dir.display(), "download complete");
     Ok(())
 }
 
-/// Downloads every piece from `peers`, connected to at most `max_peers` at
-/// once. A peer that drops is replaced by the next one, and failed peers are
-/// retried with backoff (see `PeerPool`).
+/// Hashes data left on disk by an earlier run and returns which pieces are
+/// already done, showing progress for anything worth checking.
+async fn check_existing(session: &Arc<Session>) -> Result<Vec<bool>> {
+    let torrent = &session.torrent;
+    let candidates = verify::candidates(torrent, &session.storage)?;
+    if candidates.is_empty() {
+        return Ok(vec![false; torrent.num_pieces()]);
+    }
+    let total = candidates
+        .iter()
+        .map(|&index| torrent.piece_len(index))
+        .sum::<Result<u64>>()?;
+    let bar = ProgressBar::new(total);
+    if let Ok(style) =
+        ProgressStyle::with_template("checking {bar:40.cyan/blue} {bytes}/{total_bytes} eta {eta}")
+    {
+        bar.set_style(style);
+    }
+
+    let session = Arc::clone(session);
+    let check_bar = bar.clone();
+    let have = tokio::task::spawn_blocking(move || {
+        verify::verify(&session.torrent, &session.storage, &candidates, &|len| {
+            check_bar.inc(len)
+        })
+    })
+    .await??;
+    bar.finish_and_clear();
+
+    let done = have.iter().filter(|&&have| have).count();
+    info!(done, pieces = have.len(), "checked existing data");
+    Ok(have)
+}
+
+/// Total length of the pieces marked in `have`.
+fn verified_bytes(torrent: &TorrentFile, have: &[bool]) -> Result<u64> {
+    have.iter()
+        .enumerate()
+        .filter(|(_, have)| **have)
+        .map(|(index, _)| torrent.piece_len(index))
+        .sum()
+}
+
+/// Downloads every piece not marked in `have` from `peers`, connected to at
+/// most `max_peers` at once. A peer that drops is replaced by the next one,
+/// and failed peers are retried with backoff (see `PeerPool`).
 ///
 /// With an `announcer`, the tracker is re-announced to on its interval and
 /// the peers it returns join the pool. If we run out of peers, the tracker is
@@ -107,13 +158,21 @@ pub async fn download_file(torrent_path: &Path, config: &DownloadConfig) -> Resu
 /// `completed` (if the download finished) and `stopped`.
 pub async fn download_from_peers(
     session: Arc<Session>,
+    have: &[bool],
     peers: &[SocketAddr],
     max_peers: usize,
     mut announcer: Option<Announcer>,
 ) -> Result<()> {
-    let num_pieces = session.torrent.num_pieces();
-    let queue = Arc::new(PieceQueue::new(num_pieces));
-    let progress = Arc::new(Progress::new(session.torrent.length()));
+    let torrent = &session.torrent;
+    let num_pieces = torrent.num_pieces();
+    if have.len() != num_pieces {
+        bail!("have {} piece flags for {num_pieces} pieces", have.len());
+    }
+    let queue = Arc::new(PieceQueue::new(have));
+    let progress = Arc::new(Progress::new(
+        torrent.length(),
+        verified_bytes(torrent, have)?,
+    ));
     let mut pool = PeerPool::default();
     pool.add(peers.iter().copied());
 
@@ -226,11 +285,13 @@ impl std::error::Error for Misbehaved {}
 /// tracker.
 struct Progress {
     bar: ProgressBar,
+    /// Downloaded this session, not counting data already on disk.
     downloaded: AtomicU64,
 }
 
 impl Progress {
-    fn new(total: u64) -> Self {
+    /// A bar for `total` bytes, of which `done` were already on disk.
+    fn new(total: u64, done: u64) -> Self {
         let bar = ProgressBar::new(total);
         let style = ProgressStyle::with_template(
             "{bar:40.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec} eta {eta} {msg}",
@@ -238,6 +299,10 @@ impl Progress {
         if let Ok(style) = style {
             bar.set_style(style);
         }
+        // Moving the bar records `done` as a step, and resetting the ETA
+        // drops it again, so data from disk does not count towards the rate.
+        bar.set_position(done);
+        bar.reset_eta();
         Self {
             bar,
             downloaded: AtomicU64::new(0),
@@ -623,13 +688,15 @@ struct QueueState {
 }
 
 impl PieceQueue {
-    fn new(num_pieces: usize) -> Self {
+    /// A queue of every piece not marked in `have`.
+    fn new(have: &[bool]) -> Self {
+        let pending: BTreeSet<usize> = (0..have.len()).filter(|&i| !have[i]).collect();
         Self {
             state: Mutex::new(QueueState {
-                pending: (0..num_pieces).collect(),
+                remaining: pending.len(),
+                pending,
                 in_flight: BTreeMap::new(),
-                remaining: num_pieces,
-                availability: vec![0; num_pieces],
+                availability: vec![0; have.len()],
             }),
             changed: Notify::new(),
         }
@@ -876,7 +943,7 @@ mod tests {
 
     #[test]
     fn claims_only_pieces_the_peer_has() {
-        let queue = PieceQueue::new(3);
+        let queue = PieceQueue::new(&[false; 3]);
         assert!(queue.claim(&peer(&queue, &[false; 3]), &[]).is_none());
         let partial = peer(&queue, &[false, true, true]);
         let claim = queue.claim(&partial, &[]).unwrap();
@@ -895,7 +962,7 @@ mod tests {
 
     #[test]
     fn dropped_claim_returns_piece() {
-        let queue = PieceQueue::new(1);
+        let queue = PieceQueue::new(&[false; 1]);
         let seed = peer(&queue, &[true]);
         drop(queue.claim(&seed, &[]).unwrap());
         let claim = queue.claim(&seed, &[]).unwrap();
@@ -905,8 +972,22 @@ mod tests {
     }
 
     #[test]
+    fn pieces_already_on_disk_are_never_claimed() {
+        let queue = PieceQueue::new(&[true, false, true]);
+        assert_eq!(queue.remaining(), 1);
+        let seed = peer(&queue, &[true; 3]);
+        let claim = queue.claim(&seed, &[]).unwrap();
+        assert_eq!(claim.index, 1);
+        // Endgame only ever offers piece 1 again, never one we already have.
+        assert!(queue.claim(&seed, &[1]).is_none());
+        claim.complete();
+        assert!(queue.is_done());
+        assert!(!queue.wants(&seed));
+    }
+
+    #[test]
     fn claims_rarest_piece_first() {
-        let queue = PieceQueue::new(4);
+        let queue = PieceQueue::new(&[false; 4]);
         let _a = peer(&queue, &[true, true, false, true]);
         let _b = peer(&queue, &[true, false, false, true]);
         let seed = peer(&queue, &[true; 4]);
@@ -919,7 +1000,7 @@ mod tests {
 
     #[test]
     fn availability_follows_peer_updates_and_disconnects() {
-        let queue = PieceQueue::new(3);
+        let queue = PieceQueue::new(&[false; 3]);
         let mut a = peer(&queue, &[true, false, false]);
         let b = peer(&queue, &[true, true, false]);
         assert_eq!(availability(&queue), [2, 1, 0]);
@@ -936,7 +1017,7 @@ mod tests {
 
     #[test]
     fn wants_pieces_until_they_are_completed() {
-        let queue = PieceQueue::new(3);
+        let queue = PieceQueue::new(&[false; 3]);
         let a = peer(&queue, &[true, true, false]);
         let b = peer(&queue, &[false, true, false]);
         assert!(!queue.wants(&peer(&queue, &[false; 3])));
@@ -985,7 +1066,7 @@ mod tests {
 
     #[test]
     fn endgame_duplicates_in_flight_pieces() {
-        let queue = PieceQueue::new(2);
+        let queue = PieceQueue::new(&[false; 2]);
         let seed = peer(&queue, &[true; 2]);
         let a = queue.claim(&seed, &[]).unwrap();
         let b = queue.claim(&seed, &[]).unwrap();
@@ -1008,7 +1089,7 @@ mod tests {
 
     #[test]
     fn endgame_piece_is_requeued_only_when_every_claim_is_dropped() {
-        let queue = PieceQueue::new(1);
+        let queue = PieceQueue::new(&[false; 1]);
         let seed = peer(&queue, &[true]);
         let a = queue.claim(&seed, &[]).unwrap();
         let b = queue.claim(&seed, &[]).unwrap();
@@ -1024,7 +1105,7 @@ mod tests {
 
     #[test]
     fn dropping_a_duplicate_after_completion_changes_nothing() {
-        let queue = PieceQueue::new(1);
+        let queue = PieceQueue::new(&[false; 1]);
         let seed = peer(&queue, &[true]);
         let a = queue.claim(&seed, &[]).unwrap();
         let b = queue.claim(&seed, &[]).unwrap();
@@ -1052,7 +1133,7 @@ mod tests {
 
     #[test]
     fn active_piece_requests_blocks_in_order_and_assembles_them() {
-        let queue = PieceQueue::new(1);
+        let queue = PieceQueue::new(&[false; 1]);
         let seed = peer(&queue, &[true]);
         let (data, mut piece) = active(&queue, &seed);
         let mut lengths = Vec::new();
@@ -1090,7 +1171,7 @@ mod tests {
 
     #[test]
     fn active_piece_ignores_duplicate_and_unrequested_blocks() {
-        let queue = PieceQueue::new(1);
+        let queue = PieceQueue::new(&[false; 1]);
         let seed = peer(&queue, &[true]);
         let (data, mut piece) = active(&queue, &seed);
         piece.request_next();
@@ -1106,7 +1187,7 @@ mod tests {
 
     #[test]
     fn active_piece_rejects_invalid_blocks() {
-        let queue = PieceQueue::new(1);
+        let queue = PieceQueue::new(&[false; 1]);
         let seed = peer(&queue, &[true]);
         let (data, mut piece) = active(&queue, &seed);
         while piece.has_unrequested() {
@@ -1126,7 +1207,7 @@ mod tests {
 
     #[test]
     fn active_piece_cancels_only_outstanding_requests() {
-        let queue = PieceQueue::new(1);
+        let queue = PieceQueue::new(&[false; 1]);
         let seed = peer(&queue, &[true]);
         let (data, mut piece) = active(&queue, &seed);
         piece.request_next();
@@ -1145,7 +1226,7 @@ mod tests {
 
     #[test]
     fn corrupt_piece_fails_verification_and_is_returned() {
-        let queue = PieceQueue::new(1);
+        let queue = PieceQueue::new(&[false; 1]);
         let seed = peer(&queue, &[true]);
         let (mut data, mut piece) = active(&queue, &seed);
         data[0] ^= 0xff;
@@ -1161,7 +1242,7 @@ mod tests {
 
     #[test]
     fn endgame_never_duplicates_a_piece_the_worker_holds() {
-        let queue = PieceQueue::new(2);
+        let queue = PieceQueue::new(&[false; 2]);
         let seed = peer(&queue, &[true; 2]);
         let a = queue.claim(&seed, &[]).unwrap();
         let b = queue.claim(&seed, &[]).unwrap();
@@ -1213,7 +1294,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_wakes_on_completion() {
-        let queue = PieceQueue::new(1);
+        let queue = PieceQueue::new(&[false; 1]);
         let seed = peer(&queue, &[true]);
         let a = queue.claim(&seed, &[]).unwrap();
         let b = queue.claim(&seed, &[]).unwrap();

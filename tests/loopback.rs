@@ -6,6 +6,7 @@ use rtrnt::peer::{PeerMessage, generate_peer_id, handshake_bytes, parse_handshak
 use rtrnt::storage::Storage;
 use rtrnt::torrent::{FileInfo, Info, TorrentFile};
 use rtrnt::tracker::{AnnounceEvent, AnnounceRequest};
+use rtrnt::verify;
 use serde_bytes::ByteBuf;
 use sha1::Digest;
 use std::net::{IpAddr, SocketAddr};
@@ -215,6 +216,7 @@ async fn downloads_multi_file_torrent_from_mock_seeder() {
         Duration::from_secs(30),
         download_from_peers(
             session(torrent, info_hash, out.path()),
+            &vec![false; num_pieces],
             &[dead_addr, seeder_addr],
             10,
             None,
@@ -290,6 +292,7 @@ async fn replaces_peers_that_fail() {
         Duration::from_secs(20),
         download_from_peers(
             session(torrent, info_hash, out.path()),
+            &vec![false; num_pieces],
             &[dead_addr, flaky_addr, healthy_addr],
             1,
             None,
@@ -351,6 +354,7 @@ async fn endgame_finishes_despite_a_stalled_peer() {
         Duration::from_secs(10),
         download_from_peers(
             session(torrent, info_hash, out.path()),
+            &vec![false; num_pieces],
             &[stalled_addr, healthy_addr],
             10,
             None,
@@ -421,6 +425,7 @@ async fn loses_interest_when_a_peer_has_nothing_left_we_need() {
         Duration::from_secs(10),
         download_from_peers(
             session(torrent, info_hash, out.path()),
+            &vec![false; num_pieces],
             &[choking_addr, partial_addr, last_addr],
             10,
             None,
@@ -490,6 +495,7 @@ async fn pipelines_requests_across_pieces() {
         Duration::from_secs(10),
         download_from_peers(
             session(torrent, info_hash, out.path()),
+            &vec![false; num_pieces],
             &[seeder_addr],
             10,
             None,
@@ -508,6 +514,86 @@ async fn pipelines_requests_across_pieces() {
 
 /// A minimal HTTP tracker: answers every announce with `peers` and forwards
 /// each request's query string.
+/// Data left by an interrupted run is hashed at startup: intact pieces are
+/// kept, and only the corrupt one is downloaded again.
+#[tokio::test]
+async fn resumes_from_data_on_disk() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+
+    // Every file is in place, but piece 1 (which spans a.bin and b.bin) has
+    // a corrupt byte in b.bin.
+    let out = tempfile::tempdir().unwrap();
+    let dir = out.path().join("multi/dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut offset = 0;
+    for (name, len) in FILES {
+        let mut contents = data[offset..offset + len].to_vec();
+        if *name == "b.bin" {
+            contents[0] ^= 0xff;
+        }
+        std::fs::write(dir.join(name), contents).unwrap();
+        offset += len;
+    }
+
+    let session = session(torrent, info_hash, out.path());
+    let candidates = verify::candidates(&session.torrent, &session.storage).unwrap();
+    let have = verify::verify(&session.torrent, &session.storage, &candidates, &|_| {}).unwrap();
+    assert_eq!(have, [true, false, true]);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seeder_addr = listener.local_addr().unwrap();
+    let seeder_data = Arc::clone(&data);
+    let (requested_tx, mut requested) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut socket = accept_leecher(&listener, info_hash, num_pieces).await;
+        send(&mut socket, PeerMessage::Unchoke).await;
+        while let Some(message) = read_message(&mut socket).await {
+            let PeerMessage::Request {
+                index,
+                begin,
+                length,
+            } = message
+            else {
+                continue;
+            };
+            requested_tx.send(index).unwrap();
+            let start = index as usize * PIECE_LENGTH as usize + begin as usize;
+            let block = seeder_data[start..start + length as usize].to_vec();
+            send(
+                &mut socket,
+                PeerMessage::Piece {
+                    index,
+                    begin,
+                    block,
+                },
+            )
+            .await;
+        }
+    });
+
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        download_from_peers(session, &have, &[seeder_addr], 10, None),
+    )
+    .await
+    .expect("download timed out")
+    .expect("download failed");
+    assert_files_match(out.path(), &data);
+
+    let mut pieces = Vec::new();
+    while let Ok(index) = requested.try_recv() {
+        pieces.push(index);
+    }
+    assert!(!pieces.is_empty());
+    assert!(
+        pieces.iter().all(|&index| index == 1),
+        "requested {pieces:?}"
+    );
+}
+
 async fn mock_tracker(peers: Vec<SocketAddr>) -> (String, mpsc::UnboundedReceiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/announce", listener.local_addr().unwrap());
@@ -596,6 +682,7 @@ async fn reports_events_and_progress_to_the_tracker() {
         Duration::from_secs(30),
         download_from_peers(
             session(torrent, info_hash, out.path()),
+            &vec![false; num_pieces],
             &peers,
             10,
             Some(announcer),

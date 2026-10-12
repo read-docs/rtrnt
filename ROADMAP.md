@@ -33,7 +33,7 @@ Faster, steadier downloads in real swarms.
 
 ## Phase 3: Persistence
 
-- [ ] **Resume**: at startup, hash existing file data and mark verified pieces done. `Storage` already preserves existing contents.
+- [x] **Resume**: at startup, pieces that overlap a file that already had data are hashed (on up to 4 threads, with a progress bar), and those that match are marked done. Pieces lying entirely in newly created files are skipped, so a new download starts at once. The tracker hears the real `left`, the progress bar starts at the data already on disk, and a download that is already complete exits without contacting the tracker. (There is no resume file, so an interrupted run's zero-filled pieces are hashed too.)
 - [ ] **`--check` mode**: verify a finished download against the torrent.
 - [ ] **Graceful shutdown**: on Ctrl-C, finish in-flight writes and send `stopped` to the tracker.
 

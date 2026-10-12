@@ -16,6 +16,9 @@ struct FileSpan {
     /// Offset of the file's first byte in the torrent's byte stream.
     offset: u64,
     length: u64,
+    /// Created empty by `Storage::new`, so it holds nothing from an earlier
+    /// run.
+    fresh: bool,
 }
 
 /// Maps the torrent's byte stream onto files on disk.
@@ -73,6 +76,7 @@ impl Storage {
                 path: root,
                 offset: 0,
                 length: *length,
+                fresh: true,
             }),
             (None, Some(entries)) => {
                 for entry in entries {
@@ -88,6 +92,7 @@ impl Storage {
                         path,
                         offset,
                         length: entry.length,
+                        fresh: true,
                     });
                     offset += entry.length;
                 }
@@ -95,18 +100,19 @@ impl Storage {
             _ => bail!("torrent must have exactly one of `length` or `files`"),
         }
 
-        for file in &files {
+        for file in &mut files {
             if let Some(parent) = file.path.parent() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("failed to create {}", parent.display()))?;
             }
-            // Keep existing contents so a future resume can reuse them.
+            // Keep existing contents so a resume can reuse them.
             let handle = OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(false)
                 .open(&file.path)
                 .with_context(|| format!("failed to create {}", file.path.display()))?;
+            file.fresh = handle.metadata()?.len() == 0;
             handle.set_len(file.length)?;
         }
 
@@ -147,6 +153,14 @@ impl Storage {
                 .with_context(|| format!("failed to read {}", path.display()))?;
         }
         Ok(data)
+    }
+
+    /// Whether `offset..offset + len` overlaps a file that existed with data
+    /// before `new`. Ranges that do not are all zeros, never a finished piece
+    /// from an earlier run.
+    pub fn may_hold_prior_data(&self, offset: u64, len: usize) -> bool {
+        self.segments(offset, len)
+            .any(|(index, _, _)| !self.files[index].fresh)
     }
 
     fn handle(&self, index: usize) -> Result<Arc<File>> {
