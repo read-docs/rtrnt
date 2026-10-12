@@ -27,6 +27,9 @@ struct Args {
     /// downloading; exits with an error unless every piece is intact
     #[arg(long)]
     check: bool,
+    /// Do not look for peers in the DHT, only ask the trackers
+    #[arg(long)]
+    no_dht: bool,
 }
 
 /// Exit code for a run stopped by Ctrl-C (128 + SIGINT).
@@ -50,6 +53,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         output_dir: args.output,
         max_peers: args.max_peers,
         listen_port: args.port,
+        dht: !args.no_dht,
     };
     match download::download_file(&args.torrent, &config, ctrl_c()).await {
         Ok(()) => Ok(ExitCode::SUCCESS),

@@ -322,6 +322,7 @@ mod tests {
             name: "root".into(),
             piece_length: 4,
             pieces: ByteBuf::new(),
+            private: None,
             length: None,
             files: Some(
                 files

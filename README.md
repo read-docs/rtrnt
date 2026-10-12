@@ -22,7 +22,7 @@ A terminal-based BitTorrent client written in Rust.
 cargo run --release -- path/to/file.torrent -o ~/Downloads
 ```
 
-Options: `-o, --output <DIR>` (default `.`), `--max-peers <N>` (default 30), `-p, --port <PORT>` to listen on for incoming peers (default 6881) and `--check` to verify a finished download. Set `RUST_LOG=debug` for per-peer logs.
+Options: `-o, --output <DIR>` (default `.`), `--max-peers <N>` (default 30), `-p, --port <PORT>` to listen on for incoming peers (default 6881), `--no-dht` to find peers through trackers only, and `--check` to verify a finished download. Without `--no-dht`, peers are also looked up in the BitTorrent DHT (on UDP, same port), so torrents without trackers download too. Set `RUST_LOG=debug` for per-peer logs.
 
 Run the tests with `cargo test`. They include a loopback integration test against a mock seeder.
 
@@ -46,6 +46,14 @@ src/
 ├── lib.rs       # Library root
 ├── announcer.rs # Re-announces and completed/stopped events
 ├── bencode.rs   # Raw bencode scanning (info-hash span)
+├── dht/         # Trackerless peer discovery (BEP 5)
+│   ├── mod.rs     # DHT node: UDP socket, queries and answers, lookups
+│   ├── krpc.rs    # KRPC messages, bencode values, compact node/peer info
+│   ├── routing.rs # Node ids, XOR distance, k-bucket routing table
+│   ├── lookup.rs  # Iterative lookup state machine
+│   ├── token.rs   # get_peers tokens with rotating secrets
+│   ├── store.rs   # Peers announced to us
+│   └── search.rs  # Periodic lookups for the torrent being downloaded
 ├── download.rs  # Piece queue, peer workers, block pipelining
 ├── peer.rs      # Peer wire protocol: handshake, message encode/decode
 ├── peer_pool.rs # Known peers, retry backoff and bans
@@ -53,13 +61,14 @@ src/
 ├── torrent.rs   # Torrent file parsing and validation
 └── tracker.rs   # Tracker communication (UDP/HTTP)
 tests/
-└── loopback.rs  # End-to-end downloads from mock seeders and a mock tracker
+├── dht.rs       # DHT nodes on loopback: bootstrap, announce, lookup
+└── loopback.rs  # End-to-end downloads from mock seeders, a mock tracker and the DHT
 ```
 
 ## How It Works
 
 1. **Torrent Parsing** - Reads and parses .torrent files, extracting metadata and calculating info hash
-2. **Tracker Announce** - Contacts trackers to discover peers in the swarm
+2. **Tracker Announce and DHT** - Contacts trackers and searches the DHT to discover peers in the swarm
 3. **Peer Handshake** - Establishes connections with peers using the BitTorrent protocol
 4. **Piece Download** - Downloads file pieces in 16KB blocks from multiple peers concurrently
 5. **Verification** - Validates each piece against its SHA-1 hash before assembly

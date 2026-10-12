@@ -1,6 +1,7 @@
 //! End-to-end downloads from mock seeders (and a mock tracker) over loopback.
 
 use rtrnt::announcer::Announcer;
+use rtrnt::dht::Dht;
 use rtrnt::download::{Interrupted, Session, download_from_peers};
 use rtrnt::peer::{PeerMessage, generate_peer_id, handshake_bytes, parse_handshake};
 use rtrnt::storage::Storage;
@@ -15,7 +16,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
 
 const PIECE_LENGTH: u64 = 32 * 1024;
@@ -30,6 +31,7 @@ fn make_torrent(data: &[u8]) -> (TorrentFile, [u8; 20]) {
         name: "multi".into(),
         piece_length: PIECE_LENGTH,
         pieces: ByteBuf::from(pieces),
+        private: None,
         length: None,
         files: Some(
             FILES
@@ -200,6 +202,7 @@ fn session(torrent: TorrentFile, info_hash: [u8; 20], out: &Path) -> Arc<Session
         info_hash,
         peer_id: generate_peer_id(),
         storage,
+        dht: None,
     })
 }
 
@@ -658,6 +661,65 @@ async fn downloads_from_a_peer_that_connects_to_us() {
             &[empty_addr, our_addr],
             10,
             Some(listener),
+            None,
+            pending(),
+        ),
+    )
+    .await
+    .expect("download timed out")
+    .expect("download failed");
+    assert_files_match(out.path(), &data);
+}
+
+/// No tracker and no peer list: the only seeder announced itself in the
+/// DHT, and the download finds it there. The DHT runs over loopback: a hub
+/// to bootstrap from and one node to hold the announce.
+#[tokio::test]
+async fn downloads_from_a_peer_found_in_the_dht() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+
+    let seeder = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seeder_port = seeder.local_addr().unwrap().port();
+    let seeder_data = Arc::clone(&data);
+    tokio::spawn(async move {
+        let mut socket = accept_leecher(&seeder, info_hash, num_pieces).await;
+        send(&mut socket, PeerMessage::Unchoke).await;
+        // Its first message is our DHT port, which `serve` ignores.
+        serve(socket, &seeder_data).await;
+    });
+
+    let dht_node = |routers: Vec<String>| async move {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        Dht::start(socket, routers).unwrap()
+    };
+    let hub = dht_node(Vec::new()).await;
+    let routers = vec![hub.local_addr().to_string()];
+    let holder = dht_node(routers.clone()).await;
+    holder.bootstrap().await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while hub.node_count() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the hub never added the holder");
+    let seeder_dht = dht_node(routers.clone()).await;
+    seeder_dht.get_peers(info_hash, Some(seeder_port)).await;
+
+    let out = tempfile::tempdir().unwrap();
+    let mut session = session(torrent, info_hash, out.path());
+    Arc::get_mut(&mut session).unwrap().dht = Some(dht_node(routers).await);
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        download_from_peers(
+            session,
+            &vec![false; num_pieces],
+            &[],
+            10,
+            None,
             None,
             pending(),
         ),

@@ -2,6 +2,7 @@
 
 pub mod announcer;
 pub mod bencode;
+pub mod dht;
 pub mod download;
 pub mod peer;
 mod peer_pool;

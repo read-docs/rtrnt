@@ -18,6 +18,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(90);
 const PROTOCOL: &[u8; 19] = b"BitTorrent protocol";
 const PEER_ID_PREFIX: &[u8; 8] = b"-RT0100-";
+/// Reserved handshake bit saying we run a DHT node (BEP 5): the last bit of
+/// the last reserved byte.
+const RESERVED_DHT: u8 = 0x01;
 
 /// Azureus-style peer id: client prefix plus 12 random alphanumerics.
 pub fn generate_peer_id() -> [u8; 20] {
@@ -208,7 +211,8 @@ pub fn handshake_bytes(info_hash: &[u8; 20], peer_id: &[u8; 20]) -> [u8; 68] {
     let mut handshake = [0u8; 68];
     handshake[0] = PROTOCOL.len() as u8;
     handshake[1..20].copy_from_slice(PROTOCOL);
-    // bytes 20..28 are reserved extension bits, all zero
+    // bytes 20..28 are reserved extension bits
+    handshake[27] |= RESERVED_DHT;
     handshake[28..48].copy_from_slice(info_hash);
     handshake[48..68].copy_from_slice(peer_id);
     handshake
@@ -232,6 +236,8 @@ pub struct PeerConnection {
     read_buf: BytesMut,
     pub addr: SocketAddr,
     pub peer_id: [u8; 20],
+    /// The reserved bytes of the peer's handshake.
+    reserved: [u8; 8],
     peer_choking: bool,
     peer_has: Vec<bool>,
     am_interested: bool,
@@ -261,7 +267,9 @@ impl PeerConnection {
         .await
         .context("handshake timed out")??;
         let remote_id = parse_handshake(&response, &info_hash)?;
-        Ok(Self::new(socket, addr, remote_id, num_pieces))
+        let mut conn = Self::new(socket, addr, remote_id, num_pieces);
+        conn.reserved.copy_from_slice(&response[20..28]);
+        Ok(conn)
     }
 
     /// Performs the handshake on a connection that the peer at `addr` opened
@@ -274,8 +282,8 @@ impl PeerConnection {
         peer_id: [u8; 20],
         num_pieces: usize,
     ) -> Result<Self> {
+        let mut handshake = [0u8; 68];
         let remote_id = timeout(HANDSHAKE_TIMEOUT, async {
-            let mut handshake = [0u8; 68];
             socket.read_exact(&mut handshake).await?;
             let remote_id = parse_handshake(&handshake, &info_hash)?;
             socket
@@ -290,7 +298,9 @@ impl PeerConnection {
         if remote_id == peer_id {
             bail!("connected to ourselves");
         }
-        Ok(Self::new(socket, addr, remote_id, num_pieces))
+        let mut conn = Self::new(socket, addr, remote_id, num_pieces);
+        conn.reserved.copy_from_slice(&handshake[20..28]);
+        Ok(conn)
     }
 
     fn new(socket: TcpStream, addr: SocketAddr, peer_id: [u8; 20], num_pieces: usize) -> Self {
@@ -299,11 +309,17 @@ impl PeerConnection {
             read_buf: BytesMut::with_capacity(32 * 1024),
             addr,
             peer_id,
+            reserved: [0; 8],
             peer_choking: true,
             peer_has: vec![false; num_pieces],
             am_interested: false,
             last_sent: Instant::now(),
         }
+    }
+
+    /// Whether the peer runs a DHT node, and so wants our `Port` message.
+    pub fn supports_dht(&self) -> bool {
+        self.reserved[7] & RESERVED_DHT != 0
     }
 
     pub fn is_choked(&self) -> bool {
@@ -492,6 +508,7 @@ mod tests {
         assert!(peer_id[8..].iter().all(u8::is_ascii_alphanumeric));
 
         let handshake = handshake_bytes(&info_hash, &peer_id);
+        assert_eq!(handshake[27] & RESERVED_DHT, RESERVED_DHT);
         assert_eq!(parse_handshake(&handshake, &info_hash).unwrap(), peer_id);
         assert!(parse_handshake(&handshake, &[4u8; 20]).is_err());
 
@@ -523,6 +540,7 @@ mod tests {
         let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1)
             .await
             .unwrap();
+        assert!(conn.supports_dht());
         conn.keep_alive().await.unwrap();
         conn.set_interested(false).await.unwrap();
         conn.set_interested(true).await.unwrap();
@@ -571,6 +589,7 @@ mod tests {
             if let Ok(conn) = &result {
                 assert_eq!(conn.peer_id, theirs);
                 assert_eq!(conn.addr, from);
+                assert!(conn.supports_dht());
             }
             drop(result);
             let reply = remote.await.unwrap();

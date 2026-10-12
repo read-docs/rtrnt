@@ -1,4 +1,5 @@
 use crate::announcer::Announcer;
+use crate::dht::{Dht, DhtSearch};
 use crate::peer::{self, PeerConnection, PeerMessage};
 use crate::peer_pool::PeerPool;
 use crate::storage::Storage;
@@ -47,12 +48,17 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// How long to wait before accepting again after an error, such as running
 /// out of file descriptors.
 const ACCEPT_RETRY: Duration = Duration::from_secs(1);
+/// DHT lookups awaited once we run out of peers, before giving up. One may
+/// have started before we ran out.
+const DHT_LOOKUPS_WHEN_OUT: u8 = 2;
 
 pub struct DownloadConfig {
     pub output_dir: PathBuf,
     pub max_peers: usize,
     /// Port to listen on for incoming peers; 0 picks a free one.
     pub listen_port: u16,
+    /// Whether to look for peers in the DHT too (never for private torrents).
+    pub dht: bool,
 }
 
 /// Everything a peer worker needs to know about the torrent.
@@ -61,6 +67,9 @@ pub struct Session {
     pub info_hash: [u8; 20],
     pub peer_id: [u8; 20],
     pub storage: Arc<Storage>,
+    /// Our DHT node, if any: searched for peers, and told about peers' DHT
+    /// nodes, whose ports they send us.
+    pub dht: Option<Dht>,
 }
 
 /// Downloads the torrent at `torrent_path`, stopping early (see
@@ -84,11 +93,13 @@ pub async fn download_file(
     // Before announcing, so a bad output directory does not leave the
     // tracker without a `stopped`.
     let storage = Arc::new(Storage::new(&torrent.info, &config.output_dir)?);
+    let dht = start_dht(&torrent, config).await;
     let session = Arc::new(Session {
         torrent,
         info_hash,
         peer_id: peer::generate_peer_id(),
         storage,
+        dht,
     });
 
     let candidates = verify::candidates(&session.torrent, &session.storage)?;
@@ -117,12 +128,24 @@ pub async fn download_file(
         event: AnnounceEvent::Started,
     };
     let tiers = session.torrent.tracker_tiers();
-    let (announcer, peers) = Announcer::start(tiers, request).await?;
-    if peers.is_empty() {
-        announcer.stop(false, 0).await;
+    let (announcer, peers) = match Announcer::start(tiers, request).await {
+        Ok((announcer, peers)) => (Some(announcer), peers),
+        // No trackers, or none answered: the DHT may still find peers.
+        Err(e) if session.dht.is_some() => {
+            info!("{e:#}; looking for peers in the DHT only");
+            (None, Vec::new())
+        }
+        Err(e) => return Err(e),
+    };
+    if peers.is_empty() && session.dht.is_none() {
+        if let Some(announcer) = announcer {
+            announcer.stop(false, 0).await;
+        }
         bail!("no tracker returned any peers");
     }
-    info!(peers = peers.len(), "tracker announce succeeded");
+    if announcer.is_some() {
+        info!(peers = peers.len(), "tracker announce succeeded");
+    }
 
     download_from_peers(
         session,
@@ -130,12 +153,29 @@ pub async fn download_file(
         &peers,
         config.max_peers,
         listener,
-        Some(announcer),
+        announcer,
         shutdown,
     )
     .await?;
     info!(output = %config.output_dir.display(), "download complete");
     Ok(())
+}
+
+/// Starts our DHT node, unless disabled or the torrent is private. It tries
+/// the TCP listening port for UDP too, and bootstraps once the download
+/// looks for peers, or within a minute.
+async fn start_dht(torrent: &TorrentFile, config: &DownloadConfig) -> Option<Dht> {
+    if !config.dht {
+        return None;
+    }
+    if torrent.is_private() {
+        info!("private torrent: not using the DHT");
+        return None;
+    }
+    Dht::bind(config.listen_port)
+        .await
+        .inspect_err(|e| warn!("cannot start the DHT: {e:#}"))
+        .ok()
 }
 
 /// Listens for incoming peers on `port`, or on a free port if that one is
@@ -167,6 +207,7 @@ pub async fn check_file(torrent_path: &Path, output_dir: &Path) -> Result<()> {
         info_hash,
         peer_id: peer::generate_peer_id(),
         storage,
+        dht: None,
     });
     let have = hash_pieces(&session, pieces).await?;
 
@@ -233,6 +274,12 @@ fn verified_bytes(torrent: &TorrentFile, have: &[bool]) -> Result<u64> {
 /// asked for more once before giving up. At the end the tracker is sent
 /// `completed` (if the download finished) and `stopped`.
 ///
+/// With a DHT node in the session, the DHT is searched for peers at once
+/// and then every few minutes (see `DhtSearch`), announcing our listening
+/// port, and the peers found join the pool. When we run out of peers, the
+/// DHT gets two more lookups (the first may have started earlier) before we
+/// give up.
+///
 /// When `shutdown` resolves, no more blocks are requested and workers exit,
 /// each finishing any piece write it has started. The tracker is still sent
 /// `stopped`, and the result is an `Interrupted` error unless every piece
@@ -291,9 +338,17 @@ pub async fn download_from_peers(
             }
         });
     };
-    // Set once we ran out of peers and asked the tracker for more; cleared
-    // when a new connection is started.
-    let mut asked_for_peers = false;
+    let announce_port = listener
+        .as_ref()
+        .and_then(|listener| listener.local_addr().ok())
+        .map(|addr| addr.port());
+    let mut dht = session
+        .dht
+        .clone()
+        .map(|dht| DhtSearch::new(dht, session.info_hash, announce_port));
+    // Set once we ran out of peers and asked for more, counting the answers
+    // still awaited; cleared when a new connection is started.
+    let mut asked: Option<Asked> = None;
     let mut shutdown = std::pin::pin!(shutdown);
     let mut interrupted = false;
     while !queue.is_done() {
@@ -301,18 +356,31 @@ pub async fn download_from_peers(
             let Some(addr) = pool.next(Instant::now()) else {
                 break;
             };
-            asked_for_peers = false;
+            asked = None;
             spawn(&mut workers, addr, None);
         }
 
         let retry_at = pool.next_retry().filter(|_| workers.len() < max_peers);
         if workers.is_empty() && retry_at.is_none() {
-            match &mut announcer {
-                Some(announcer) if !asked_for_peers => {
-                    info!("out of peers, asking the tracker for more");
-                    announcer.hurry();
-                    asked_for_peers = true;
+            match &asked {
+                None if announcer.is_some() || dht.is_some() => {
+                    info!("out of peers, asking for more");
+                    if let Some(announcer) = &mut announcer {
+                        announcer.hurry();
+                    }
+                    if let Some(dht) = &mut dht {
+                        dht.hurry();
+                    }
+                    asked = Some(Asked {
+                        tracker: announcer.is_some(),
+                        dht_lookups: if dht.is_some() {
+                            DHT_LOOKUPS_WHEN_OUT
+                        } else {
+                            0
+                        },
+                    });
                 }
+                Some(asked) if asked.tracker || asked.dht_lookups > 0 => {}
                 _ => break,
             }
         }
@@ -351,12 +419,23 @@ pub async fn download_from_peers(
                 } else if banned_ips.contains(&addr.ip()) {
                     debug!(%addr, "turning away banned peer");
                 } else {
-                    asked_for_peers = false;
+                    asked = None;
                     spawn(&mut workers, addr, Some(socket));
                 }
             }
             () = sleep_until_some(retry_at) => {}
-            peers = reannounce(&mut announcer, &progress.downloaded) => pool.add(peers),
+            peers = reannounce(&mut announcer, &progress.downloaded) => {
+                pool.add(peers);
+                if let Some(asked) = &mut asked {
+                    asked.tracker = false;
+                }
+            }
+            peers = dht_lookup(&mut dht) => {
+                pool.add(peers);
+                if let Some(asked) = &mut asked {
+                    asked.dht_lookups = asked.dht_lookups.saturating_sub(1);
+                }
+            }
             () = &mut shutdown => {
                 info!("interrupted, stopping");
                 interrupted = true;
@@ -473,6 +552,22 @@ async fn reannounce(announcer: &mut Option<Announcer>, downloaded: &AtomicU64) -
     }
 }
 
+/// Runs the next DHT lookup and returns its peers, or waits forever without
+/// a DHT. Cancel-safe.
+async fn dht_lookup(search: &mut Option<DhtSearch>) -> Vec<SocketAddr> {
+    match search {
+        Some(search) => search.poll().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Answers still awaited from the peer sources asked for more peers once we
+/// ran out.
+struct Asked {
+    tracker: bool,
+    dht_lookups: u8,
+}
+
 /// A peer that broke the protocol or sent bad data, or turned out to be us.
 /// It is never retried.
 #[derive(Debug)]
@@ -573,6 +668,12 @@ async fn peer_worker(
         bail!("already connected to this peer");
     };
     debug!(%addr, inbound, "connected");
+    // BEP 5: tell a peer that runs a DHT node where ours listens.
+    if let Some(dht) = &session.dht
+        && conn.supports_dht()
+    {
+        conn.send(&PeerMessage::Port { port: dht.port() }).await?;
+    }
 
     let mut pieces = queue.register_peer();
     // Pieces we hold a claim on, with requests spread over all of them so the
@@ -650,6 +751,11 @@ async fn peer_worker(
 
         match message {
             PeerMessage::Have { .. } | PeerMessage::Bitfield { .. } => has_changed = true,
+            PeerMessage::Port { port } => {
+                if let Some(dht) = &session.dht {
+                    dht.add_node(SocketAddr::new(addr.ip(), port));
+                }
+            }
             // Dropping the claims returns the pieces; the next turn waits for
             // an unchoke.
             PeerMessage::Choke if !active.is_empty() => {
