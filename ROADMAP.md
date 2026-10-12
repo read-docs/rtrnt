@@ -41,7 +41,7 @@ Faster, steadier downloads in real swarms.
 
 Give back to the swarm.
 
-- [ ] **Listen for incoming peers** on `LISTEN_PORT` (configurable; currently only reported to trackers).
+- [x] **Listen for incoming peers** on `--port` (default 6881, IPv4). If the port is taken, a free one is used instead, and trackers are told the port actually bound. Peers that connect to us and ask for our torrent are downloaded from like any other, while there is room under `--max-peers`. A peer is used over one connection at a time, so one we connect to that also connects to us is only downloaded from once. Our own address, which trackers list, is recognized by our peer id and never connected to again. An incoming peer that misbehaves is banned by IP. (We never unchoke anyone yet, so nothing is uploaded.)
 - [ ] **Serve requests**: answer `Request` from `Storage::read_at`, send our `Bitfield` after the handshake and `Have` after each completed piece.
 - [ ] **Choking algorithm**: tit-for-tat with 4 unchoke slots, plus an optimistic unchoke every 30 s.
 - [ ] **Upload stats** reported to trackers; a seed-ratio or seed-time limit.

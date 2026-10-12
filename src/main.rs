@@ -1,5 +1,6 @@
 use clap::Parser;
 use rtrnt::download::{self, DownloadConfig, Interrupted};
+use rtrnt::peer;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use tokio::sync::oneshot;
@@ -18,6 +19,10 @@ struct Args {
     /// Maximum number of peers to download from at once
     #[arg(long, default_value_t = 30)]
     max_peers: usize,
+    /// Port to listen on for incoming peers (0 picks a free one; so does a
+    /// port that is taken)
+    #[arg(short, long, default_value_t = peer::DEFAULT_LISTEN_PORT)]
+    port: u16,
     /// Verify an existing download against the torrent instead of
     /// downloading; exits with an error unless every piece is intact
     #[arg(long)]
@@ -44,6 +49,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     let config = DownloadConfig {
         output_dir: args.output,
         max_peers: args.max_peers,
+        listen_port: args.port,
     };
     match download::download_file(&args.torrent, &config, ctrl_c()).await {
         Ok(()) => Ok(ExitCode::SUCCESS),

@@ -6,8 +6,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, Instant, timeout};
 
-/// Port we report to trackers. Nothing listens on it until seeding exists.
-pub const LISTEN_PORT: u16 = 6881;
+/// Port we listen on for incoming peers unless told otherwise.
+pub const DEFAULT_LISTEN_PORT: u16 = 6881;
 /// Largest frame we accept: room for a 16 KiB block or a bitfield of 8M pieces.
 pub const MAX_FRAME: usize = 1 << 20;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -261,17 +261,49 @@ impl PeerConnection {
         .await
         .context("handshake timed out")??;
         let remote_id = parse_handshake(&response, &info_hash)?;
+        Ok(Self::new(socket, addr, remote_id, num_pieces))
+    }
 
-        Ok(Self {
+    /// Performs the handshake on a connection that the peer at `addr` opened
+    /// to us. The peer speaks first, and we answer only if it asks for our
+    /// torrent.
+    pub async fn accept(
+        mut socket: TcpStream,
+        addr: SocketAddr,
+        info_hash: [u8; 20],
+        peer_id: [u8; 20],
+        num_pieces: usize,
+    ) -> Result<Self> {
+        let remote_id = timeout(HANDSHAKE_TIMEOUT, async {
+            let mut handshake = [0u8; 68];
+            socket.read_exact(&mut handshake).await?;
+            let remote_id = parse_handshake(&handshake, &info_hash)?;
+            socket
+                .write_all(&handshake_bytes(&info_hash, &peer_id))
+                .await?;
+            anyhow::Ok(remote_id)
+        })
+        .await
+        .context("handshake timed out")??;
+        // Our own outgoing connection, to an address a tracker listed. Having
+        // answered, the other end sees our id too and gives up on it.
+        if remote_id == peer_id {
+            bail!("connected to ourselves");
+        }
+        Ok(Self::new(socket, addr, remote_id, num_pieces))
+    }
+
+    fn new(socket: TcpStream, addr: SocketAddr, peer_id: [u8; 20], num_pieces: usize) -> Self {
+        Self {
             socket,
             read_buf: BytesMut::with_capacity(32 * 1024),
             addr,
-            peer_id: remote_id,
+            peer_id,
             peer_choking: true,
             peer_has: vec![false; num_pieces],
             am_interested: false,
             last_sent: Instant::now(),
-        })
+        }
     }
 
     pub fn is_choked(&self) -> bool {
@@ -510,5 +542,42 @@ mod tests {
                 PeerMessage::KeepAlive,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn accept_answers_only_handshakes_for_our_torrent_from_others() {
+        let info_hash = [5u8; 20];
+        let ours = [2u8; 20];
+        let theirs = [1u8; 20];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // (their info hash, their peer id, accepted, answered)
+        let cases = [
+            (info_hash, theirs, true, true),
+            ([6u8; 20], theirs, false, false),
+            (info_hash, ours, false, true),
+        ];
+        for (their_hash, their_id, accepted, answered) in cases {
+            let remote = tokio::spawn(async move {
+                let mut socket = TcpStream::connect(addr).await.unwrap();
+                let handshake = handshake_bytes(&their_hash, &their_id);
+                socket.write_all(&handshake).await.unwrap();
+                let mut reply = [0u8; 68];
+                socket.read_exact(&mut reply).await.ok().map(|_| reply)
+            });
+            let (socket, from) = listener.accept().await.unwrap();
+            let result = PeerConnection::accept(socket, from, info_hash, ours, 1).await;
+            assert_eq!(result.is_ok(), accepted, "{:?}", result.as_ref().err());
+            if let Ok(conn) = &result {
+                assert_eq!(conn.peer_id, theirs);
+                assert_eq!(conn.addr, from);
+            }
+            drop(result);
+            let reply = remote.await.unwrap();
+            assert_eq!(reply.is_some(), answered);
+            if let Some(reply) = reply {
+                assert_eq!(reply, handshake_bytes(&info_hash, &ours));
+            }
+        }
     }
 }

@@ -9,12 +9,13 @@ use anyhow::{Result, anyhow, bail};
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
 use sha1::Digest;
-use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -43,10 +44,15 @@ const IDLE_POLL: Duration = Duration::from_secs(2);
 /// How long workers get to wind down, once the download is complete or
 /// interrupted, before being aborted.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// How long to wait before accepting again after an error, such as running
+/// out of file descriptors.
+const ACCEPT_RETRY: Duration = Duration::from_secs(1);
 
 pub struct DownloadConfig {
     pub output_dir: PathBuf,
     pub max_peers: usize,
+    /// Port to listen on for incoming peers; 0 picks a free one.
+    pub listen_port: u16,
 }
 
 /// Everything a peer worker needs to know about the torrent.
@@ -93,10 +99,18 @@ pub async fn download_file(
         return Ok(());
     }
 
+    let listener = listen(config.listen_port).await;
+    let port = match listener.as_ref().map(TcpListener::local_addr) {
+        Some(Ok(addr)) => {
+            info!(port = addr.port(), "listening for peers");
+            addr.port()
+        }
+        _ => config.listen_port,
+    };
     let request = AnnounceRequest {
         info_hash,
         peer_id: session.peer_id,
-        port: peer::LISTEN_PORT,
+        port,
         uploaded: 0,
         downloaded: 0,
         left,
@@ -115,12 +129,30 @@ pub async fn download_file(
         &have,
         &peers,
         config.max_peers,
+        listener,
         Some(announcer),
         shutdown,
     )
     .await?;
     info!(output = %config.output_dir.display(), "download complete");
     Ok(())
+}
+
+/// Listens for incoming peers on `port`, or on a free port if that one is
+/// taken (say, by another download). Without a listener we still download,
+/// over the connections we open ourselves.
+async fn listen(port: u16) -> Option<TcpListener> {
+    let bind = |port| TcpListener::bind((Ipv4Addr::UNSPECIFIED, port));
+    let result = match bind(port).await {
+        Err(e) if port != 0 => {
+            warn!(port, "cannot listen on port: {e}; using a free one instead");
+            bind(0).await
+        }
+        result => result,
+    };
+    result
+        .inspect_err(|e| warn!("cannot listen for peers: {e}"))
+        .ok()
 }
 
 /// Verifies a download against its torrent without changing anything on
@@ -192,6 +224,10 @@ fn verified_bytes(torrent: &TorrentFile, have: &[bool]) -> Result<u64> {
 /// most `max_peers` at once. A peer that drops is replaced by the next one,
 /// and failed peers are retried with backoff (see `PeerPool`).
 ///
+/// With a `listener`, peers that connect to us are downloaded from too, while
+/// there is room under `max_peers`. One that misbehaves is turned away by IP
+/// address from then on.
+///
 /// With an `announcer`, the tracker is re-announced to on its interval and
 /// the peers it returns join the pool. If we run out of peers, the tracker is
 /// asked for more once before giving up. At the end the tracker is sent
@@ -206,6 +242,7 @@ pub async fn download_from_peers(
     have: &[bool],
     peers: &[SocketAddr],
     max_peers: usize,
+    listener: Option<TcpListener>,
     mut announcer: Option<Announcer>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
@@ -219,10 +256,41 @@ pub async fn download_from_peers(
         torrent.length(),
         verified_bytes(torrent, have)?,
     ));
+    let connected = Arc::new(ConnectedPeers::default());
     let mut pool = PeerPool::default();
     pool.add(peers.iter().copied());
+    // Incoming peers have no address we could ban in the pool.
+    let mut banned_ips = HashSet::new();
 
     let mut workers = JoinSet::new();
+    // Starts a worker that connects to `addr`, or, given the socket the peer
+    // connected to us on, answers its handshake.
+    let spawn = |workers: &mut JoinSet<WorkerExit>, addr, socket: Option<TcpStream>| {
+        let session = Arc::clone(&session);
+        let queue = Arc::clone(&queue);
+        let progress = Arc::clone(&progress);
+        let connected = Arc::clone(&connected);
+        let inbound = socket.is_some();
+        workers.spawn(async move {
+            let mut pieces = 0;
+            let result = peer_worker(
+                &session,
+                &queue,
+                &progress,
+                &connected,
+                addr,
+                socket,
+                &mut pieces,
+            )
+            .await;
+            WorkerExit {
+                addr,
+                inbound,
+                pieces,
+                result,
+            }
+        });
+    };
     // Set once we ran out of peers and asked the tracker for more; cleared
     // when a new connection is started.
     let mut asked_for_peers = false;
@@ -234,14 +302,7 @@ pub async fn download_from_peers(
                 break;
             };
             asked_for_peers = false;
-            let session = Arc::clone(&session);
-            let queue = Arc::clone(&queue);
-            let progress = Arc::clone(&progress);
-            workers.spawn(async move {
-                let mut pieces = 0;
-                let result = peer_worker(&session, &queue, &progress, addr, &mut pieces).await;
-                (addr, pieces, result)
-            });
+            spawn(&mut workers, addr, None);
         }
 
         let retry_at = pool.next_retry().filter(|_| workers.len() < max_peers);
@@ -257,7 +318,7 @@ pub async fn download_from_peers(
         }
         tokio::select! {
             Some(joined) = workers.join_next() => {
-                let (addr, pieces, result) = match joined {
+                let WorkerExit { addr, inbound, pieces, result } = match joined {
                     Ok(exit) => exit,
                     Err(e) => {
                         warn!("peer task failed: {e}");
@@ -268,12 +329,30 @@ pub async fn download_from_peers(
                     Ok(()) => debug!(%addr, "peer finished"),
                     Err(e) if e.is::<Misbehaved>() => {
                         warn!(%addr, "banning peer: {e:#}");
-                        pool.ban(addr);
+                        if inbound {
+                            banned_ips.insert(addr.ip());
+                        } else {
+                            pool.ban(addr);
+                        }
                     }
                     Err(e) => {
                         debug!(%addr, pieces, "peer dropped: {e:#}");
-                        pool.failed(addr, pieces > 0, Instant::now());
+                        // We cannot connect back to the port an incoming
+                        // peer came from.
+                        if !inbound {
+                            pool.failed(addr, pieces > 0, Instant::now());
+                        }
                     }
+                }
+            }
+            (socket, addr) = accept(listener.as_ref()) => {
+                if workers.len() >= max_peers {
+                    debug!(%addr, "turning away incoming peer: too many peers");
+                } else if banned_ips.contains(&addr.ip()) {
+                    debug!(%addr, "turning away banned peer");
+                } else {
+                    asked_for_peers = false;
+                    spawn(&mut workers, addr, Some(socket));
                 }
             }
             () = sleep_until_some(retry_at) => {}
@@ -290,7 +369,8 @@ pub async fn download_from_peers(
     // exit (sending Cancel for duplicate endgame requests); ones still
     // connecting are cut short. A worker writing a piece finishes the write
     // first, and even if aborted, the write runs on to the end on the
-    // blocking pool.
+    // blocking pool. New peers are refused meanwhile.
+    drop(listener);
     queue.close();
     let drain = async { while workers.join_next().await.is_some() {} };
     if tokio::time::timeout(SHUTDOWN_GRACE, drain).await.is_err() {
@@ -328,6 +408,62 @@ async fn sleep_until_some(at: Option<Instant>) {
     }
 }
 
+/// Accepts the next incoming connection, or waits forever without a
+/// listener. Cancel-safe.
+async fn accept(listener: Option<&TcpListener>) -> (TcpStream, SocketAddr) {
+    let Some(listener) = listener else {
+        return std::future::pending().await;
+    };
+    loop {
+        match listener.accept().await {
+            Ok(incoming) => return incoming,
+            Err(e) => {
+                warn!("cannot accept a peer: {e}");
+                tokio::time::sleep(ACCEPT_RETRY).await;
+            }
+        }
+    }
+}
+
+/// How a peer worker ended.
+struct WorkerExit {
+    addr: SocketAddr,
+    /// Whether the peer connected to us.
+    inbound: bool,
+    /// Pieces the peer delivered first.
+    pieces: usize,
+    result: Result<()>,
+}
+
+/// Ids of the peers we are connected to, so that a peer we connect to and
+/// that also connects to us is only downloaded from once.
+#[derive(Default)]
+struct ConnectedPeers(Mutex<HashSet<[u8; 20]>>);
+
+impl ConnectedPeers {
+    fn lock(&self) -> MutexGuard<'_, HashSet<[u8; 20]>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Records a connection to the peer with id `id` until the returned
+    /// handle is dropped, or returns `None` if there already is one.
+    fn register(&self, id: [u8; 20]) -> Option<Connected<'_>> {
+        let new = self.lock().insert(id);
+        new.then_some(Connected { peers: self, id })
+    }
+}
+
+struct Connected<'a> {
+    peers: &'a ConnectedPeers,
+    id: [u8; 20],
+}
+
+impl Drop for Connected<'_> {
+    fn drop(&mut self) {
+        self.peers.lock().remove(&self.id);
+    }
+}
+
 /// Runs the next re-announce and returns its peers, or waits forever
 /// without a tracker. Cancel-safe.
 async fn reannounce(announcer: &mut Option<Announcer>, downloaded: &AtomicU64) -> Vec<SocketAddr> {
@@ -337,7 +473,8 @@ async fn reannounce(announcer: &mut Option<Announcer>, downloaded: &AtomicU64) -
     }
 }
 
-/// A peer that broke the protocol or sent bad data. It is never retried.
+/// A peer that broke the protocol or sent bad data, or turned out to be us.
+/// It is never retried.
 #[derive(Debug)]
 struct Misbehaved(&'static str);
 
@@ -406,24 +543,36 @@ impl Progress {
 }
 
 /// Downloads from one peer until the torrent is complete, the queue is
-/// closed or the peer fails. `pieces_done` counts the pieces this peer
-/// delivered first, even on error.
+/// closed or the peer fails. Connects to `addr`, or with a `socket` the peer
+/// connected to us on, answers its handshake. `pieces_done` counts the
+/// pieces this peer delivered first, even on error.
 async fn peer_worker(
     session: &Session,
     queue: &PieceQueue,
     progress: &Progress,
+    connected: &ConnectedPeers,
     addr: SocketAddr,
+    socket: Option<TcpStream>,
     pieces_done: &mut usize,
 ) -> Result<()> {
     let torrent = &session.torrent;
-    let mut conn = PeerConnection::connect(
-        addr,
-        session.info_hash,
-        session.peer_id,
-        torrent.num_pieces(),
-    )
-    .await?;
-    debug!(%addr, "connected");
+    let (info_hash, peer_id, num_pieces) =
+        (session.info_hash, session.peer_id, torrent.num_pieces());
+    let inbound = socket.is_some();
+    let mut conn = match socket {
+        Some(socket) => {
+            PeerConnection::accept(socket, addr, info_hash, peer_id, num_pieces).await?
+        }
+        None => PeerConnection::connect(addr, info_hash, peer_id, num_pieces).await?,
+    };
+    if conn.peer_id == peer_id {
+        // A tracker listed our own address.
+        bail!(Misbehaved("connected to ourselves"));
+    }
+    let Some(_connected) = connected.register(conn.peer_id) else {
+        bail!("already connected to this peer");
+    };
+    debug!(%addr, inbound, "connected");
 
     let mut pieces = queue.register_peer();
     // Pieces we hold a claim on, with requests spread over all of them so the
@@ -1432,6 +1581,16 @@ mod tests {
         pipeline.restart(resumed);
         pipeline.received(20 * block, resumed + RATE_WINDOW);
         assert_eq!(pipeline.depth(), 60);
+    }
+
+    #[test]
+    fn a_peer_is_connected_to_once_at_a_time() {
+        let peers = ConnectedPeers::default();
+        let a = peers.register([1; 20]).unwrap();
+        assert!(peers.register([1; 20]).is_none());
+        let _b = peers.register([2; 20]).unwrap();
+        drop(a);
+        assert!(peers.register([1; 20]).is_some());
     }
 
     #[tokio::test]
