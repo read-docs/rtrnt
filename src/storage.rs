@@ -1,9 +1,13 @@
 use crate::torrent::Info;
 use anyhow::{Context, Result, bail};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+
+/// Most files kept open at once. A torrent can have thousands of files, and
+/// macOS's default soft limit is 256 descriptors shared with peer sockets.
+const MAX_OPEN_FILES: usize = 64;
 
 /// One file of the torrent, placed in the concatenated byte stream.
 #[derive(Debug)]
@@ -20,6 +24,39 @@ pub struct Storage {
     files: Vec<FileSpan>,
     piece_length: u64,
     total_length: u64,
+    handles: Mutex<HandleCache>,
+}
+
+/// Open read-write handles by index into `Storage::files`, least recently
+/// used first. I/O goes through positional reads and writes, so a handle is
+/// shared without a cursor and the lock is held only to look it up.
+#[derive(Debug, Default)]
+struct HandleCache {
+    open: Vec<(usize, Arc<File>)>,
+}
+
+impl HandleCache {
+    fn get(&mut self, index: usize, path: &Path) -> Result<Arc<File>> {
+        if let Some(pos) = self.open.iter().position(|(i, _)| *i == index) {
+            let entry = self.open.remove(pos);
+            let handle = Arc::clone(&entry.1);
+            self.open.push(entry);
+            return Ok(handle);
+        }
+        let handle = Arc::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .with_context(|| format!("failed to open {}", path.display()))?,
+        );
+        if self.open.len() >= MAX_OPEN_FILES {
+            // A handle still in use elsewhere closes when that I/O finishes.
+            self.open.remove(0);
+        }
+        self.open.push((index, Arc::clone(&handle)));
+        Ok(handle)
+    }
 }
 
 impl Storage {
@@ -78,6 +115,7 @@ impl Storage {
             files,
             piece_length: info.piece_length,
             total_length,
+            handles: Mutex::default(),
         })
     }
 
@@ -90,12 +128,11 @@ impl Storage {
 
     pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
         self.check_range(offset, data.len())?;
-        for (file, file_offset, range) in self.segments(offset, data.len()) {
-            let mut handle = OpenOptions::new().write(true).open(&file.path)?;
-            handle.seek(SeekFrom::Start(file_offset))?;
-            handle
-                .write_all(&data[range])
-                .with_context(|| format!("failed to write {}", file.path.display()))?;
+        for (index, file_offset, range) in self.segments(offset, data.len()) {
+            let path = &self.files[index].path;
+            let handle = self.handle(index)?;
+            write_all_at(&handle, &data[range], file_offset)
+                .with_context(|| format!("failed to write {}", path.display()))?;
         }
         Ok(())
     }
@@ -103,12 +140,20 @@ impl Storage {
     pub fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
         self.check_range(offset, len)?;
         let mut data = vec![0u8; len];
-        for (file, file_offset, range) in self.segments(offset, len) {
-            let mut handle = File::open(&file.path)?;
-            handle.seek(SeekFrom::Start(file_offset))?;
-            handle.read_exact(&mut data[range])?;
+        for (index, file_offset, range) in self.segments(offset, len) {
+            let path = &self.files[index].path;
+            let handle = self.handle(index)?;
+            read_exact_at(&handle, &mut data[range], file_offset)
+                .with_context(|| format!("failed to read {}", path.display()))?;
         }
         Ok(data)
+    }
+
+    fn handle(&self, index: usize) -> Result<Arc<File>> {
+        self.handles
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(index, &self.files[index].path)
     }
 
     fn check_range(&self, offset: u64, len: usize) -> Result<()> {
@@ -121,24 +166,72 @@ impl Storage {
         Ok(())
     }
 
-    /// Splits `offset..offset + len` into per-file pieces: the file, the
-    /// position within that file, and the matching range of the buffer.
+    /// Splits `offset..offset + len` into per-file pieces: the file's index,
+    /// the position within that file, and the matching range of the buffer.
     fn segments(
         &self,
         offset: u64,
         len: usize,
-    ) -> impl Iterator<Item = (&FileSpan, u64, std::ops::Range<usize>)> {
+    ) -> impl Iterator<Item = (usize, u64, std::ops::Range<usize>)> {
         let end = offset + len as u64;
-        self.files.iter().filter_map(move |file| {
-            let start = offset.max(file.offset);
-            let stop = end.min(file.offset + file.length);
-            (start < stop).then(|| {
-                let buf_start = (start - offset) as usize;
-                let buf_end = (stop - offset) as usize;
-                (file, start - file.offset, buf_start..buf_end)
+        self.files
+            .iter()
+            .enumerate()
+            .filter_map(move |(index, file)| {
+                let start = offset.max(file.offset);
+                let stop = end.min(file.offset + file.length);
+                (start < stop).then(|| {
+                    let buf_start = (start - offset) as usize;
+                    let buf_end = (stop - offset) as usize;
+                    (index, start - file.offset, buf_start..buf_end)
+                })
             })
-        })
     }
+}
+
+#[cfg(unix)]
+fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, buf, offset)
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+}
+
+// `seek_write`/`seek_read` also move the cursor, which nothing here relies on.
+#[cfg(windows)]
+fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_write(buf, offset) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                buf = &buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_read(buf, offset) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Rejects path components that could escape the output directory.
@@ -191,6 +284,41 @@ mod tests {
         assert_eq!(storage.read_at(2, 5).unwrap(), b"cdefg");
         assert!(storage.write_at(8, b"jk").is_err());
         assert!(storage.read_at(u64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn caches_handles_up_to_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let count = MAX_OPEN_FILES + 2;
+        let names: Vec<String> = (0..count).map(|i| format!("f{i}")).collect();
+        let paths: Vec<[&str; 1]> = names.iter().map(|n| [n.as_str()]).collect();
+        let files: Vec<(&[&str], u64)> = paths.iter().map(|p| (&p[..], 1)).collect();
+        let storage = Storage::new(&multi_file_info(&files), dir.path()).unwrap();
+        let cached = |storage: &Storage| -> Vec<usize> {
+            let cache = storage.handles.lock().unwrap();
+            cache.open.iter().map(|(i, _)| *i).collect()
+        };
+
+        // Fill the cache, then touch file 0 again so file 1 is the oldest.
+        storage.write_at(0, &[0; MAX_OPEN_FILES]).unwrap();
+        let first = Arc::clone(&storage.handles.lock().unwrap().open[0].1);
+        storage.write_at(0, &[0]).unwrap();
+        let reused = Arc::clone(&storage.handles.lock().unwrap().open.last().unwrap().1);
+        assert!(Arc::ptr_eq(&first, &reused));
+
+        storage.write_at(MAX_OPEN_FILES as u64, &[1]).unwrap();
+        let open = cached(&storage);
+        assert_eq!(open.len(), MAX_OPEN_FILES);
+        assert!(!open.contains(&1));
+        assert!(open.contains(&0));
+
+        // Evicted files are reopened on demand.
+        let data: Vec<u8> = (0..count as u8).collect();
+        storage.write_at(0, &data).unwrap();
+        assert_eq!(storage.read_at(0, count).unwrap(), data);
+        assert_eq!(cached(&storage).len(), MAX_OPEN_FILES);
+        let root = dir.path().join("root");
+        assert_eq!(std::fs::read(root.join("f1")).unwrap(), [1]);
     }
 
     #[test]
