@@ -276,10 +276,16 @@ async fn download_piece(
             } if index == piece_index => {
                 let block_index = (begin / BLOCK_SIZE) as usize;
                 if begin % BLOCK_SIZE != 0
-                    || block_index >= next_request
+                    || block_index >= num_blocks
                     || block.len() != block_len(block_index) as usize
                 {
-                    return Err(anyhow!("peer sent a block we did not request").into());
+                    return Err(anyhow!("peer sent an invalid block").into());
+                }
+                // A late reply to a request abandoned on a choke, for a block
+                // we have not asked for again yet. Ignore it rather than
+                // dropping an honest peer.
+                if block_index >= next_request {
+                    continue;
                 }
                 // Saturating: after a choke, late replies to the abandoned
                 // requests can arrive alongside replies to the new ones.
@@ -552,6 +558,8 @@ mod tests {
 
     use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn peer<'a>(queue: &'a PieceQueue, has: &[bool]) -> PeerPieces<'a> {
         let mut peer = queue.register_peer();
@@ -703,6 +711,61 @@ mod tests {
         assert!(queue.is_done());
         assert!(queue.lock().pending.is_empty());
         assert!(queue.claim(&seed).is_none());
+    }
+
+    #[tokio::test]
+    async fn ignores_late_block_not_yet_requested_again() {
+        // More blocks than fit in the pipeline, so the last one is not
+        // requested in the first batch.
+        const BLOCKS: u32 = PIPELINE as u32 + 4;
+        let piece: Vec<u8> = (0..BLOCKS * BLOCK_SIZE).map(|i| (i % 251) as u8).collect();
+        let hash: [u8; 20] = sha1::Sha1::digest(&piece).into();
+        let info_hash = [7u8; 20];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seed_piece = piece.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut handshake = [0u8; 68];
+            socket.read_exact(&mut handshake).await.unwrap();
+            let reply = peer::handshake_bytes(&info_hash, &[1u8; 20]);
+            socket.write_all(&reply).await.unwrap();
+            let block = |b: u32| {
+                let start = (b * BLOCK_SIZE) as usize;
+                PeerMessage::Piece {
+                    index: 0,
+                    begin: b * BLOCK_SIZE,
+                    block: seed_piece[start..start + BLOCK_SIZE as usize].to_vec(),
+                }
+            };
+            // Still in transit from a request made before a choke.
+            socket.write_all(&block(BLOCKS - 1).encode()).await.unwrap();
+            loop {
+                let Ok(len) = socket.read_u32().await else {
+                    return;
+                };
+                let mut payload = vec![0u8; len as usize];
+                if socket.read_exact(&mut payload).await.is_err() {
+                    return;
+                }
+                if let Ok(PeerMessage::Request { begin, .. }) = PeerMessage::decode(&payload) {
+                    let reply = block(begin / BLOCK_SIZE).encode();
+                    socket.write_all(&reply).await.unwrap();
+                }
+            }
+        });
+
+        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1)
+            .await
+            .unwrap();
+        let queue = PieceQueue::new(1);
+        let seed = peer(&queue, &[true]);
+        let claim = queue.claim(&seed).unwrap();
+        let data = download_piece(&mut conn, &claim, piece.len() as u64, &hash)
+            .await
+            .expect("late block dropped the peer");
+        assert_eq!(data, piece);
     }
 
     #[tokio::test]
