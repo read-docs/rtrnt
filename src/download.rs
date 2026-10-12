@@ -4,6 +4,7 @@ use crate::dht::{Dht, DhtSearch};
 use crate::extension;
 use crate::peer::{self, PeerConnection, PeerMessage};
 use crate::peer_pool::PeerPool;
+use crate::pex::{self, PeerExchange};
 use crate::storage::Storage;
 use crate::torrent::{self, TorrentFile};
 use crate::tracker::{AnnounceEvent, AnnounceRequest};
@@ -66,6 +67,10 @@ const SEED_CHECK: Duration = Duration::from_secs(1);
 /// DHT lookups awaited once we run out of peers, before giving up. One may
 /// have started before we ran out.
 const DHT_LOOKUPS_WHEN_OUT: u8 = 2;
+/// Peers learned through peer exchange join the pool only while fewer than
+/// this many wait there, so peers that flood us with addresses cannot grow
+/// it without bound.
+const MAX_PEX_BACKLOG: usize = 500;
 
 pub struct DownloadConfig {
     pub output_dir: PathBuf,
@@ -370,6 +375,10 @@ fn verified_bytes(torrent: &TorrentFile, have: &[bool]) -> Result<u64> {
 /// DHT gets two more lookups (the first may have started earlier) before we
 /// give up.
 ///
+/// Peers that support peer exchange (BEP 11) are told which peers we are
+/// connected to, and the peers they tell us about join the pool (see
+/// `pex`), unless the torrent is private.
+///
 /// When `shutdown` resolves, no more blocks are requested and workers exit,
 /// each finishing any piece write it has started. The tracker is still sent
 /// `stopped`, and the result is an `Interrupted` error unless every piece
@@ -389,11 +398,14 @@ pub async fn download_from_peers(
         bail!("have {} piece flags for {num_pieces} pieces", have.len());
     }
     let seed = session.seed;
+    // Private torrents (BEP 27) get their peers from trackers only.
+    let (pex, mut pex_peers) = PeerExchange::new(!torrent.is_private());
     let swarm = Arc::new(Swarm {
         queue: PieceQueue::new(have).seeding(seed.enabled()),
         progress: Progress::new(torrent.length(), verified_bytes(torrent, have)?),
         connected: ConnectedPeers::default(),
         choker: Choker::default(),
+        pex,
     });
     let Swarm {
         queue,
@@ -555,6 +567,11 @@ pub async fn download_from_peers(
                     asked.dht_lookups = asked.dht_lookups.saturating_sub(1);
                 }
             }
+            Some(peers) = pex_peers.recv() => {
+                if pool.ready_len() < MAX_PEX_BACKLOG {
+                    pool.add(peers);
+                }
+            }
             () = &mut choking => {}
             () = queue.wait_for(|| queue.is_done()), if seeding_since.is_none() => {}
             () = tokio::time::sleep(SEED_CHECK), if seeding_since.is_some() => {}
@@ -645,6 +662,8 @@ struct Swarm {
     connected: ConnectedPeers,
     /// Decides which peers may download from us.
     choker: Choker,
+    /// Tells peers about each other (BEP 11).
+    pex: PeerExchange,
 }
 
 /// How a peer worker ended.
@@ -811,17 +830,30 @@ async fn peer_worker(
         progress,
         connected,
         choker,
+        pex,
     } = swarm;
     let torrent = &session.torrent;
     let (info_hash, peer_id, num_pieces) =
         (session.info_hash, session.peer_id, torrent.num_pieces());
+    let private = torrent.is_private();
     let inbound = socket.is_some();
     let mut conn = match socket {
         Some(socket) => {
-            PeerConnection::accept(socket, addr, info_hash, peer_id, num_pieces, listen_port)
+            PeerConnection::accept(
+                socket,
+                addr,
+                info_hash,
+                peer_id,
+                num_pieces,
+                listen_port,
+                private,
+            )
+            .await?
+        }
+        None => {
+            PeerConnection::connect(addr, info_hash, peer_id, num_pieces, listen_port, private)
                 .await?
         }
-        None => PeerConnection::connect(addr, info_hash, peer_id, num_pieces, listen_port).await?,
     };
     if conn.peer_id == peer_id {
         // A tracker listed our own address.
@@ -831,6 +863,7 @@ async fn peer_worker(
         bail!("already connected to this peer");
     };
     debug!(%addr, inbound, "connected");
+    let mut pex = pex.join(conn.peer_id, addr, !inbound);
     // BEP 5: tell a peer that runs a DHT node where ours listens.
     if let Some(dht) = &session.dht
         && conn.supports_dht()
@@ -875,8 +908,10 @@ async fn peer_worker(
         }
         if has_changed {
             pieces.update(conn.peer_has());
+            pex.set_seed(conn.peer_has().iter().all(|&has| has));
             has_changed = false;
         }
+        pex.tick(&mut conn, Instant::now()).await?;
         if queue.is_done() && conn.peer_has().iter().all(|&has| has) {
             debug!(%addr, "both seeding, letting go");
             return Ok(());
@@ -985,6 +1020,10 @@ async fn peer_worker(
                     dht.add_node(SocketAddr::new(addr.ip(), port));
                 }
             }
+            PeerMessage::Extended {
+                id: pex::ID,
+                payload,
+            } => pex.received(&payload, Instant::now(), queue.is_done())?,
             // Dropping the claims returns the pieces; the next turn waits for
             // an unchoke.
             PeerMessage::Choke if !active.is_empty() => {

@@ -330,13 +330,16 @@ pub struct PeerConnection {
 impl PeerConnection {
     /// Connects to `addr` and performs the handshake, followed by the
     /// extension handshake if the peer supports it. `listen_port` is the
-    /// port we accept incoming peers on, if any.
+    /// port we accept incoming peers on, if any. A `private` torrent's
+    /// extension handshake leaves out the extensions such torrents must not
+    /// use (see `extension::PUBLIC_ONLY`).
     pub async fn connect(
         addr: SocketAddr,
         info_hash: [u8; 20],
         peer_id: [u8; 20],
         num_pieces: usize,
         listen_port: Option<u16>,
+        private: bool,
     ) -> Result<Self> {
         let mut socket = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
@@ -354,7 +357,7 @@ impl PeerConnection {
         .context("handshake timed out")??;
         let handshake = parse_handshake(&response, &info_hash)?;
         let mut conn = Self::new(socket, addr, handshake, num_pieces);
-        conn.send_extension_handshake(listen_port).await?;
+        conn.send_extension_handshake(listen_port, private).await?;
         Ok(conn)
     }
 
@@ -368,6 +371,7 @@ impl PeerConnection {
         peer_id: [u8; 20],
         num_pieces: usize,
         listen_port: Option<u16>,
+        private: bool,
     ) -> Result<Self> {
         let handshake = timeout(HANDSHAKE_TIMEOUT, async {
             let mut handshake = [0u8; 68];
@@ -386,7 +390,7 @@ impl PeerConnection {
             bail!("connected to ourselves");
         }
         let mut conn = Self::new(socket, addr, handshake, num_pieces);
-        conn.send_extension_handshake(listen_port).await?;
+        conn.send_extension_handshake(listen_port, private).await?;
         Ok(conn)
     }
 
@@ -411,11 +415,15 @@ impl PeerConnection {
 
     /// Sends our extension handshake if the peer supports the extension
     /// protocol. It goes out right after the handshake, before anything else.
-    async fn send_extension_handshake(&mut self, listen_port: Option<u16>) -> Result<()> {
+    async fn send_extension_handshake(
+        &mut self,
+        listen_port: Option<u16>,
+        private: bool,
+    ) -> Result<()> {
         if !self.extensions {
             return Ok(());
         }
-        let payload = ExtendedHandshake::ours(listen_port, self.addr.ip()).encode()?;
+        let payload = ExtendedHandshake::ours(listen_port, self.addr.ip(), private).encode()?;
         self.send(&PeerMessage::Extended {
             id: extension::HANDSHAKE_ID,
             payload,
@@ -751,7 +759,7 @@ mod tests {
             received
         });
 
-        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1, Some(6881))
+        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1, Some(6881), false)
             .await
             .unwrap();
         assert!(!conn.supports_extensions());
@@ -815,7 +823,7 @@ mod tests {
             }
             received
         });
-        let conn = PeerConnection::connect(addr, info_hash, [2u8; 20], num_pieces, None)
+        let conn = PeerConnection::connect(addr, info_hash, [2u8; 20], num_pieces, None, false)
             .await
             .unwrap();
         (conn, remote)
@@ -875,7 +883,8 @@ mod tests {
                 socket.read_exact(&mut reply).await.ok().map(|_| reply)
             });
             let (socket, from) = listener.accept().await.unwrap();
-            let result = PeerConnection::accept(socket, from, info_hash, ours, 1, None).await;
+            let result =
+                PeerConnection::accept(socket, from, info_hash, ours, 1, None, false).await;
             assert_eq!(result.is_ok(), accepted, "{:?}", result.as_ref().err());
             if let Ok(conn) = &result {
                 assert_eq!(conn.peer_id, theirs);
@@ -934,7 +943,7 @@ mod tests {
             (ours, read_message(&mut socket).await)
         });
 
-        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1, Some(6881))
+        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1, Some(6881), false)
             .await
             .unwrap();
         assert!(conn.supports_extensions());
@@ -955,7 +964,7 @@ mod tests {
 
         let (ours, next) = remote.await.unwrap();
         let localhost = "127.0.0.1".parse().unwrap();
-        assert_eq!(ours, ExtendedHandshake::ours(Some(6881), localhost));
+        assert_eq!(ours, ExtendedHandshake::ours(Some(6881), localhost, false));
         assert_eq!(
             next,
             PeerMessage::Extended {
@@ -985,7 +994,7 @@ mod tests {
             socket.read_to_end(&mut Vec::new()).await.unwrap();
         });
 
-        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1, None)
+        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1, None, false)
             .await
             .unwrap();
         let err = conn.receive().await.unwrap_err();

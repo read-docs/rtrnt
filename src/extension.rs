@@ -7,7 +7,7 @@
 //! receive that extension's messages under, plus a few facts about itself.
 //! Any other id is one the receiver picked in its own handshake.
 
-use crate::bencode;
+use crate::{bencode, pex};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_bencode::value::Value;
@@ -29,9 +29,10 @@ pub const CLIENT: &str = concat!("rtrnt ", env!("CARGO_PKG_VERSION"));
 pub const MAX_QUEUED_REQUESTS: u32 = 500;
 /// The extensions we implement, each with the extended message id peers
 /// must send its messages to us with. Advertised in our handshake as `m`.
-/// None yet; `ut_metadata` (BEP 9) and `ut_pex` (BEP 11) go here once they
-/// are implemented.
-pub const EXTENSIONS: &[(&str, u8)] = &[];
+pub const EXTENSIONS: &[(&str, u8)] = &[(pex::NAME, pex::ID)];
+/// Extensions that private torrents (BEP 27) must not use, which are left
+/// out of `m` for them.
+pub const PUBLIC_ONLY: &[&str] = &[pex::NAME];
 
 /// An extension handshake. Every field is optional on the wire.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -65,11 +66,13 @@ struct Wire<'a> {
 
 impl ExtendedHandshake {
     /// Our handshake for the peer at `peer_ip`. `listen_port` is the port we
-    /// accept incoming peers on, if any.
-    pub fn ours(listen_port: Option<u16>, peer_ip: IpAddr) -> Self {
+    /// accept incoming peers on, if any. For a `private` torrent, the
+    /// extensions in `PUBLIC_ONLY` are not offered.
+    pub fn ours(listen_port: Option<u16>, peer_ip: IpAddr, private: bool) -> Self {
         Self {
             extensions: EXTENSIONS
                 .iter()
+                .filter(|(name, _)| !(private && PUBLIC_ONLY.contains(name)))
                 .map(|&(name, id)| (name.to_string(), id))
                 .collect(),
             client: Some(CLIENT.to_string()),
@@ -177,8 +180,8 @@ mod tests {
     #[test]
     fn our_handshake_roundtrips() {
         let ip: IpAddr = "10.1.2.3".parse().unwrap();
-        let ours = ExtendedHandshake::ours(Some(6881), ip);
-        assert!(ours.extensions.is_empty());
+        let ours = ExtendedHandshake::ours(Some(6881), ip, false);
+        assert_eq!(ours.id(pex::NAME), Some(pex::ID));
         assert_eq!(ours.client.as_deref(), Some(CLIENT));
         assert!(CLIENT.starts_with("rtrnt "));
 
@@ -186,7 +189,7 @@ mod tests {
         assert_eq!(
             payload,
             format!(
-                "d1:mde1:pi6881e4:reqqi500e1:v{}:{}6:yourip4:\x0a\x01\x02\x03e",
+                "d1:md6:ut_pexi1ee1:pi6881e4:reqqi500e1:v{}:{}6:yourip4:\x0a\x01\x02\x03e",
                 CLIENT.len(),
                 CLIENT
             )
@@ -212,9 +215,21 @@ mod tests {
     }
 
     #[test]
+    fn private_torrents_do_not_offer_peer_exchange() {
+        let ip: IpAddr = "10.1.2.3".parse().unwrap();
+        let ours = ExtendedHandshake::ours(None, ip, true);
+        assert_eq!(ours.id(pex::NAME), None);
+        let public = ExtendedHandshake::ours(None, ip, false);
+        assert_eq!(
+            ours.extensions.len(),
+            public.extensions.len() - PUBLIC_ONLY.len()
+        );
+    }
+
+    #[test]
     fn ipv4_mapped_addresses_are_sent_as_ipv4() {
         let ip: IpAddr = "::ffff:10.1.2.3".parse().unwrap();
-        let payload = ExtendedHandshake::ours(None, ip).encode().unwrap();
+        let payload = ExtendedHandshake::ours(None, ip, false).encode().unwrap();
         let decoded = ExtendedHandshake::decode(&payload).unwrap();
         assert_eq!(decoded.your_ip, Some("10.1.2.3".parse().unwrap()));
         assert_eq!(decoded.listen_port, None);

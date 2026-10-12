@@ -234,7 +234,9 @@ fn parse_peer_dict(value: &Value) -> Option<SocketAddr> {
     Some(SocketAddr::new(ip, port))
 }
 
-fn parse_compact_v4(bytes: &[u8]) -> Vec<SocketAddr> {
+/// Peers in compact form: 4-byte IPv4 address and 2-byte port each, in
+/// network order. A partial entry at the end is ignored.
+pub(crate) fn parse_compact_v4(bytes: &[u8]) -> Vec<SocketAddr> {
     let (chunks, _) = bytes.as_chunks::<6>();
     chunks
         .iter()
@@ -247,7 +249,9 @@ fn parse_compact_v4(bytes: &[u8]) -> Vec<SocketAddr> {
         .collect()
 }
 
-fn parse_compact_v6(bytes: &[u8]) -> Vec<SocketAddr> {
+/// Peers in compact form: 16-byte IPv6 address and 2-byte port each, in
+/// network order. A partial entry at the end is ignored.
+pub(crate) fn parse_compact_v6(bytes: &[u8]) -> Vec<SocketAddr> {
     let (chunks, _) = bytes.as_chunks::<18>();
     chunks
         .iter()
