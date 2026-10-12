@@ -57,7 +57,7 @@ Give back to the swarm.
 
 ## Phase 6: User experience
 
-- [ ] Config file (download dir, ports, peer limits).
+- [x] **Config file**: settings are read from the TOML file given with `--config`, or else from `$XDG_CONFIG_HOME/rtrnt/config.toml` (`~/.config/rtrnt/config.toml` when that is unset), on macOS too. The keys are the long option names: `output`, `max-peers` and `port`. A command-line flag beats the file, and the file beats the built-in default; `--print-config` prints the effective settings and where each came from. A leading `~` in `output` is expanded. An unknown key or a value of the wrong type is an error that names the file and line, and so is a missing `--config` file, while a missing default file just means the defaults. (Only these three settings can be set so far, and a relative `output` is taken from the current directory, not the config file's.)
 - [ ] Upload and download rate limits.
 - [ ] Several torrents in one session.
 - [ ] TUI (e.g. `ratatui`): per-peer stats, piece map, swarm health.
