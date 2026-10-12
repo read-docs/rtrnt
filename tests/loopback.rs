@@ -14,7 +14,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
@@ -111,7 +111,7 @@ async fn send_bitfield(socket: &mut TcpStream, num_pieces: usize, has: &[usize])
 }
 
 /// Reads the next message, or `None` once the leecher disconnects.
-async fn read_message(socket: &mut TcpStream) -> Option<PeerMessage> {
+async fn read_message(socket: &mut (impl AsyncRead + Unpin)) -> Option<PeerMessage> {
     let len = socket.read_u32().await.ok()?;
     let mut payload = vec![0u8; len as usize];
     socket.read_exact(&mut payload).await.ok()?;
@@ -879,6 +879,96 @@ async fn drops_a_peer_that_requests_a_piece_we_do_not_have() {
     .expect("download timed out")
     .expect("download failed");
     leecher.await.unwrap();
+}
+
+/// Six peers that want to download from us compete for four regular unchoke
+/// slots and an optimistic one: five are unchoked, and the sixth waits with
+/// no churn among the others. When an unchoked peer loses interest, it is
+/// choked and the waiting one gets the slot at once, not at the next 10 s
+/// round.
+#[tokio::test]
+async fn unchokes_four_peers_and_an_optimistic_one() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+    let out = tempfile::tempdir().unwrap();
+    write_files(out.path(), &data);
+
+    let (release, release_rx) = oneshot::channel();
+    let seeder_addr = gated_seeder(Arc::clone(&data), info_hash, num_pieces, release_rx).await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let our_addr = listener.local_addr().unwrap();
+    let leechers = tokio::spawn(async move {
+        // Every leecher's choke changes, tagged with its number.
+        let (events, mut events_rx) = mpsc::unbounded_channel();
+        let mut writers = Vec::new();
+        for i in 0..6 {
+            let socket = connect_to(our_addr, info_hash).await;
+            let (mut reader, writer) = socket.into_split();
+            let events = events.clone();
+            tokio::spawn(async move {
+                while let Some(message) = read_message(&mut reader).await {
+                    if matches!(message, PeerMessage::Choke | PeerMessage::Unchoke) {
+                        let _ = events.send((i, message));
+                    }
+                }
+            });
+            writers.push(writer);
+        }
+        for writer in &mut writers {
+            let interested = PeerMessage::Interested.encode();
+            writer.write_all(&interested).await.unwrap();
+        }
+        let mut next_event = async || {
+            tokio::time::timeout(Duration::from_secs(5), events_rx.recv())
+                .await
+                .expect("no choke change")
+                .unwrap()
+        };
+
+        let mut unchoked = Vec::new();
+        while unchoked.len() < 5 {
+            let (i, message) = next_event().await;
+            assert_eq!(message, PeerMessage::Unchoke, "leecher {i}");
+            unchoked.push(i);
+        }
+        let quiet = tokio::time::timeout(Duration::from_millis(500), next_event()).await;
+        assert!(quiet.is_err(), "unexpected {:?}", quiet.unwrap());
+        let waiting = (0..6).find(|i| !unchoked.contains(i)).unwrap();
+
+        let leaving = unchoked[0];
+        let not_interested = PeerMessage::NotInterested.encode();
+        writers[leaving].write_all(&not_interested).await.unwrap();
+        let mut changes = vec![next_event().await, next_event().await];
+        changes.sort_by_key(|(i, _)| *i);
+        let mut expected = vec![
+            (leaving, PeerMessage::Choke),
+            (waiting, PeerMessage::Unchoke),
+        ];
+        expected.sort_by_key(|(i, _)| *i);
+        assert_eq!(changes, expected);
+        release.send(()).unwrap();
+        writers
+    });
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        download_from_peers(
+            session(torrent, info_hash, out.path()),
+            &[true, false, true],
+            &[seeder_addr],
+            10,
+            Some(listener),
+            None,
+            pending(),
+        ),
+    )
+    .await
+    .expect("download timed out")
+    .expect("download failed");
+    leechers.await.unwrap();
 }
 
 /// A minimal HTTP tracker: answers every announce with `peers` and forwards

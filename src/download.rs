@@ -1,4 +1,5 @@
 use crate::announcer::Announcer;
+use crate::choker::Choker;
 use crate::peer::{self, PeerConnection, PeerMessage};
 use crate::peer_pool::PeerPool;
 use crate::storage::Storage;
@@ -238,6 +239,9 @@ fn verified_bytes(torrent: &TorrentFile, have: &[bool]) -> Result<u64> {
 /// there is room under `max_peers`. One that misbehaves is turned away by IP
 /// address from then on.
 ///
+/// Every connected peer may download the pieces we have, as far as the
+/// choker (see `choker`) unchokes it.
+///
 /// With an `announcer`, the tracker is re-announced to on its interval and
 /// the peers it returns join the pool. If we run out of peers, the tracker is
 /// asked for more once before giving up. At the end the tracker is sent
@@ -261,12 +265,18 @@ pub async fn download_from_peers(
     if have.len() != num_pieces {
         bail!("have {} piece flags for {num_pieces} pieces", have.len());
     }
-    let queue = Arc::new(PieceQueue::new(have));
-    let progress = Arc::new(Progress::new(
-        torrent.length(),
-        verified_bytes(torrent, have)?,
-    ));
-    let connected = Arc::new(ConnectedPeers::default());
+    let swarm = Arc::new(Swarm {
+        queue: PieceQueue::new(have),
+        progress: Progress::new(torrent.length(), verified_bytes(torrent, have)?),
+        connected: ConnectedPeers::default(),
+        choker: Choker::default(),
+    });
+    let Swarm {
+        queue,
+        progress,
+        choker,
+        ..
+    } = &*swarm;
     let mut pool = PeerPool::default();
     pool.add(peers.iter().copied());
     // Incoming peers have no address we could ban in the pool.
@@ -277,22 +287,11 @@ pub async fn download_from_peers(
     // connected to us on, answers its handshake.
     let spawn = |workers: &mut JoinSet<WorkerExit>, addr, socket: Option<TcpStream>| {
         let session = Arc::clone(&session);
-        let queue = Arc::clone(&queue);
-        let progress = Arc::clone(&progress);
-        let connected = Arc::clone(&connected);
+        let swarm = Arc::clone(&swarm);
         let inbound = socket.is_some();
         workers.spawn(async move {
             let mut pieces = 0;
-            let result = peer_worker(
-                &session,
-                &queue,
-                &progress,
-                &connected,
-                addr,
-                socket,
-                &mut pieces,
-            )
-            .await;
+            let result = peer_worker(&session, &swarm, addr, socket, &mut pieces).await;
             WorkerExit {
                 addr,
                 inbound,
@@ -304,6 +303,8 @@ pub async fn download_from_peers(
     // Set once we ran out of peers and asked the tracker for more; cleared
     // when a new connection is started.
     let mut asked_for_peers = false;
+    // Upload slots go by download rate, and by upload rate once we seed.
+    let mut choking = std::pin::pin!(choker.run(|| queue.is_done()));
     let mut shutdown = std::pin::pin!(shutdown);
     let mut interrupted = false;
     while !queue.is_done() {
@@ -367,6 +368,7 @@ pub async fn download_from_peers(
             }
             () = sleep_until_some(retry_at) => {}
             peers = reannounce(&mut announcer, &progress.downloaded) => pool.add(peers),
+            () = &mut choking => {}
             () = &mut shutdown => {
                 info!("interrupted, stopping");
                 interrupted = true;
@@ -433,6 +435,15 @@ async fn accept(listener: Option<&TcpListener>) -> (TcpStream, SocketAddr) {
             }
         }
     }
+}
+
+/// What the peer workers of a download share.
+struct Swarm {
+    queue: PieceQueue,
+    progress: Progress,
+    connected: ConnectedPeers,
+    /// Decides which peers may download from us.
+    choker: Choker,
 }
 
 /// How a peer worker ended.
@@ -552,19 +563,24 @@ impl Progress {
     }
 }
 
-/// Downloads from one peer until the torrent is complete, the queue is
-/// closed or the peer fails. Connects to `addr`, or with a `socket` the peer
-/// connected to us on, answers its handshake. `pieces_done` counts the
-/// pieces this peer delivered first, even on error.
+/// Downloads from one peer, and uploads to it while the choker unchokes it,
+/// until the torrent is complete, the queue is closed or the peer fails.
+/// Connects to `addr`, or with a `socket` the peer connected to us on,
+/// answers its handshake. `pieces_done` counts the pieces this peer
+/// delivered first, even on error.
 async fn peer_worker(
     session: &Session,
-    queue: &PieceQueue,
-    progress: &Progress,
-    connected: &ConnectedPeers,
+    swarm: &Swarm,
     addr: SocketAddr,
     socket: Option<TcpStream>,
     pieces_done: &mut usize,
 ) -> Result<()> {
+    let Swarm {
+        queue,
+        progress,
+        connected,
+        choker,
+    } = swarm;
     let torrent = &session.torrent;
     let (info_hash, peer_id, num_pieces) =
         (session.info_hash, session.peer_id, torrent.num_pieces());
@@ -592,6 +608,7 @@ async fn peer_worker(
     }
 
     let mut pieces = queue.register_peer();
+    let mut slot = choker.register();
     // Pieces we hold a claim on, with requests spread over all of them so the
     // pipeline does not drain at every piece boundary.
     let mut active: Vec<ActivePiece<'_>> = Vec::new();
@@ -626,8 +643,10 @@ async fn peer_worker(
         // another peer is downloading it right now. Any piece we hold counts.
         let wanted = !active.is_empty() || queue.wants(&pieces);
         conn.set_interested(wanted).await?;
-        // For now, any peer that wants to download from us may.
-        let choking = !conn.peer_interested();
+        // The choker hears of interest changes at once, and its answer
+        // wakes the waits below.
+        slot.set_interested(conn.peer_interested());
+        let choking = !slot.is_unchoked();
         conn.set_choking(choking).await?;
         if choking {
             // A choke drops the peer's requests; without the fast extension
@@ -665,6 +684,7 @@ async fn peer_worker(
         } else if drained || messages_since_block >= MAX_MESSAGES_PER_BLOCK {
             if let Some(request) = uploads.pop() {
                 serve_block(&mut conn, &session.storage, request).await?;
+                slot.uploaded(request.length.into());
             }
             messages_since_block = 0;
         }
@@ -687,11 +707,12 @@ async fn peer_worker(
             }
             conn.keep_alive().await?;
             // Wait for an unchoke, for a piece to be returned or completed,
-            // for the queue to close, or for the peer to announce a new
-            // piece or ask for one of ours.
+            // for the queue to close, for the peer to announce a new piece or
+            // ask for one of ours, or for the choker to (un)choke it.
             tokio::select! {
                 () = &mut changed => None,
                 message = conn.receive_untimed() => Some(message?),
+                () = slot.changed() => None,
                 _ = tokio::time::sleep(IDLE_POLL) => None,
             }
         } else {
@@ -705,6 +726,7 @@ async fn peer_worker(
             tokio::select! {
                 message = conn.receive() => Some(message?),
                 () = queue.wait_for(woken) => None,
+                () = slot.changed() => None,
             }
         };
         drained = message.is_none();
@@ -735,6 +757,7 @@ async fn peer_worker(
                     continue;
                 }
                 pipeline.received(block.len() as u64, Instant::now());
+                slot.downloaded(block.len() as u64);
                 if !active[pos].is_complete() {
                     continue;
                 }
