@@ -1,8 +1,9 @@
 use anyhow::{Context, bail};
 use clap::Parser;
 use rtrnt::download::{self, Interrupted, SeedLimits};
+use rtrnt::magnet::{self, FetchInterrupted, MagnetLink};
 use rtrnt::{config, torrent, tracker};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -13,9 +14,10 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
-    /// Path to the .torrent file
-    #[arg(required_unless_present = "print_config")]
-    torrent: Option<PathBuf>,
+    /// Path to the .torrent file, or a magnet link
+    /// (magnet:?xt=urn:btih:...)
+    #[arg(required_unless_present = "print_config", value_parser = parse_source)]
+    torrent: Option<Source>,
     // Settings that the config file can also set have no clap default, so
     // an unset flag falls back to the file. The defaults live in
     // `rtrnt::config` and are spelled out in the help (checked by a test).
@@ -57,6 +59,25 @@ struct Args {
     /// Do not look for peers in the DHT, only ask the trackers
     #[arg(long)]
     no_dht: bool,
+}
+
+/// What to download.
+#[derive(Clone)]
+enum Source {
+    File(PathBuf),
+    Magnet(Box<MagnetLink>),
+}
+
+/// Parses the torrent argument: a magnet link if it starts with `magnet:`,
+/// otherwise the path of a .torrent file.
+fn parse_source(arg: &str) -> Result<Source, String> {
+    if magnet::is_magnet(arg) {
+        MagnetLink::parse(arg)
+            .map(|link| Source::Magnet(Box::new(link)))
+            .map_err(|e| format!("{e:#}"))
+    } else {
+        Ok(Source::File(arg.into()))
+    }
 }
 
 /// Parses `--seed-ratio`, which must be a finite number, 0 or more.
@@ -103,16 +124,39 @@ async fn main() -> anyhow::Result<ExitCode> {
     let torrent = args.torrent.context("no torrent given")?;
 
     if args.check {
-        download::check_file(&torrent, &config.output_dir).await?;
+        let path = match &torrent {
+            Source::File(path) => path.clone(),
+            // The metadata saved when the magnet link was downloaded.
+            Source::Magnet(link) => match magnet::saved_torrent(link, &config.output_dir).await {
+                Some(path) => path,
+                None => bail!(
+                    "--check needs the torrent's metadata, and {} was not saved by a download \
+                     of this magnet link; download it first, or pass the .torrent file",
+                    link.saved_torrent_path(&config.output_dir).display()
+                ),
+            },
+        };
+        download::check_file(&path, &config.output_dir).await?;
         return Ok(ExitCode::SUCCESS);
     }
     if args.scrape {
-        scrape(&torrent).await?;
+        let (tiers, info_hash) = match &torrent {
+            Source::File(path) => {
+                let (torrent, info_hash) = torrent::load_file(path).await?;
+                (torrent.tracker_tiers(), info_hash)
+            }
+            Source::Magnet(link) => (link.tracker_tiers(), link.info_hash),
+        };
+        scrape(&tiers, info_hash).await?;
         return Ok(ExitCode::SUCCESS);
     }
-    match download::download_file(&torrent, &config, ctrl_c()).await {
+    let result = match &torrent {
+        Source::File(path) => download::download_file(path, &config, ctrl_c()).await,
+        Source::Magnet(link) => magnet::download_magnet(link, &config, ctrl_c()).await,
+    };
+    match result {
         Ok(()) => Ok(ExitCode::SUCCESS),
-        Err(e) if e.is::<Interrupted>() => {
+        Err(e) if e.is::<Interrupted>() || e.is::<FetchInterrupted>() => {
             warn!("{e}; run again to resume");
             Ok(ExitCode::from(EXIT_INTERRUPTED))
         }
@@ -120,18 +164,17 @@ async fn main() -> anyhow::Result<ExitCode> {
     }
 }
 
-/// Scrapes every tracker of the torrent at `path` and prints what each one
-/// knows of the swarm, tier by tier. Trackers in different tiers often keep
-/// separate swarms, so each one is asked rather than only the first to
-/// answer; they are asked all at once, so a dead one costs its timeout only
-/// once. Fails if no tracker answered.
-async fn scrape(path: &Path) -> anyhow::Result<()> {
-    let (torrent, info_hash) = torrent::load_file(path).await?;
-    let tiers = torrent.tracker_tiers();
+/// Scrapes every tracker in `tiers` (a torrent's, or a magnet link's `tr`
+/// list) for `info_hash` and prints what each one knows of the swarm, tier
+/// by tier. Trackers in different tiers often keep separate swarms, so each
+/// one is asked rather than only the first to answer; they are asked all at
+/// once, so a dead one costs its timeout only once. Fails if no tracker
+/// answered.
+async fn scrape(tiers: &[Vec<String>], info_hash: [u8; 20]) -> anyhow::Result<()> {
     if tiers.is_empty() {
         bail!("torrent has no trackers");
     }
-    let scrapes = tracker::scrape_tiers(&tiers, info_hash).await;
+    let scrapes = tracker::scrape_tiers(tiers, info_hash).await;
     for scrape in &scrapes {
         println!("{scrape}");
     }
@@ -172,10 +215,31 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
     use rtrnt::peer;
+    use std::path::Path;
 
     #[test]
     fn cli_is_valid() {
         Args::command().debug_assert();
+    }
+
+    #[test]
+    fn takes_a_torrent_file_or_a_magnet_link() {
+        let hash = "c12fe1c06bba254a9dc9f519b335aa7c1367a88a";
+        let args = Args::try_parse_from(["rtrnt", "file.torrent"]).unwrap();
+        assert!(
+            matches!(args.torrent, Some(Source::File(path)) if path == Path::new("file.torrent"))
+        );
+        let link = format!("magnet:?xt=urn:btih:{hash}&tr=udp%3A%2F%2Ft%3A1");
+        let args = Args::try_parse_from(["rtrnt", &link, "--scrape"]).unwrap();
+        let Some(Source::Magnet(link)) = args.torrent else {
+            panic!("not parsed as a magnet link");
+        };
+        assert_eq!(link.trackers, ["udp://t:1"]);
+        let err = Args::try_parse_from(["rtrnt", "magnet:?dn=x"])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("no info hash"), "{err}");
     }
 
     /// The defaults are written into the help by hand, since clap does not

@@ -20,7 +20,10 @@ A terminal-based BitTorrent client written in Rust.
 
 ```sh
 cargo run --release -- path/to/file.torrent -o ~/Downloads
+cargo run --release -- 'magnet:?xt=urn:btih:...&tr=udp://tracker.example:1337' -o ~/Downloads
 ```
+
+A magnet link works wherever a .torrent file does. The torrent's metadata is fetched from peers found through the link's trackers (`tr`), its peers (`x.pe`) and the DHT, then the download carries on with the same peers. The metadata is saved as `<info hash>.torrent` in the output directory, so running the same link again resumes without fetching it, and `--check` uses that file (it fails without it). `--scrape` asks the link's trackers.
 
 Options: `-o, --output <DIR>` (default `.`), `--max-peers <N>` (default 30), `-p, --port <PORT>` to listen on for incoming peers over IPv4 and IPv6 (default 6881), `--no-dht` to find peers through trackers only, `--check` to verify a finished download, `--scrape` to print each tracker's seeder, leecher and completed counts without downloading, and `--seed-ratio <RATIO>` and `--seed-time <MINUTES>` to keep seeding once the download is complete, until we have uploaded that many times the torrent's size or for that long, whichever comes first (both default to 0, which exits at completion). Without `--no-dht`, peers are also looked up in the BitTorrent DHT (on UDP, same port), so torrents without trackers download too. Set `RUST_LOG=debug` for per-peer logs.
 
@@ -71,6 +74,8 @@ src/
 │   └── search.rs  # Periodic lookups for the torrent being downloaded
 ├── download.rs  # Piece queue, peer workers, block pipelining, seeding
 ├── extension.rs # Extension protocol (BEP 10) handshake
+├── magnet.rs    # Magnet links (BEP 9): parsing, metadata fetch, then download
+├── metadata.rs  # ut_metadata messages, assembling and serving the info dict
 ├── peer.rs      # Peer wire protocol: handshake, message encode/decode
 ├── peer_pool.rs # Known peers, retry backoff and bans
 ├── storage.rs   # Maps pieces onto files on disk (single and multi-file)
@@ -78,12 +83,12 @@ src/
 └── tracker.rs   # Tracker communication (UDP/HTTP)
 tests/
 ├── dht.rs       # DHT nodes on loopback: bootstrap, announce, lookup
-└── loopback.rs  # End-to-end downloads from mock seeders, a mock tracker and the DHT
+└── loopback.rs  # End-to-end downloads from mock seeders, a mock tracker, the DHT and magnet links
 ```
 
 ## How It Works
 
-1. **Torrent Parsing** - Reads and parses .torrent files, extracting metadata and calculating info hash
+1. **Torrent Parsing** - Reads and parses .torrent files, extracting metadata and calculating info hash, or for a magnet link fetches the metadata from peers
 2. **Tracker Announce and DHT** - Contacts trackers and searches the DHT to discover peers in the swarm
 3. **Peer Handshake** - Establishes connections with peers using the BitTorrent protocol
 4. **Piece Download** - Downloads file pieces in 16KB blocks from multiple peers concurrently

@@ -7,6 +7,8 @@ pub mod config;
 pub mod dht;
 pub mod download;
 pub mod extension;
+pub mod magnet;
+pub mod metadata;
 pub mod peer;
 mod peer_pool;
 pub mod storage;

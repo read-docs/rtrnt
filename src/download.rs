@@ -2,6 +2,7 @@ use crate::announcer::{Announcer, Transferred};
 use crate::choker::Choker;
 use crate::dht::{Dht, DhtSearch};
 use crate::extension;
+use crate::metadata;
 use crate::peer::{self, PeerConnection, PeerMessage};
 use crate::peer_pool::PeerPool;
 use crate::storage::Storage;
@@ -13,7 +14,7 @@ use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use rand::Rng;
 use sha1::Digest;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -116,6 +117,9 @@ pub struct Session {
     /// Our DHT node, if any: searched for peers, and told about peers' DHT
     /// nodes, whose ports they send us.
     pub dht: Option<Dht>,
+    /// The torrent's info dictionary exactly as encoded, if we have it, for
+    /// peers that fetch it by magnet link (BEP 9).
+    pub metadata: Option<Vec<u8>>,
 }
 
 /// Downloads the torrent at `torrent_path` and seeds it for as long as
@@ -130,7 +134,11 @@ pub async fn download_file(
     config: &DownloadConfig,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
-    let (torrent, info_hash) = torrent::load_file(torrent_path).await?;
+    let torrent::Metainfo {
+        torrent,
+        info_hash,
+        info_bytes,
+    } = torrent::load_metainfo(torrent_path).await?;
     info!(
         name = %torrent.info.name,
         size = torrent.length(),
@@ -150,6 +158,7 @@ pub async fn download_file(
         storage,
         seed: config.seed,
         dht,
+        metadata: Some(info_bytes),
     });
 
     let candidates = verify::candidates(&session.torrent, &session.storage)?;
@@ -288,6 +297,7 @@ pub async fn check_file(torrent_path: &Path, output_dir: &Path) -> Result<()> {
         storage,
         seed: SeedLimits::default(),
         dht: None,
+        metadata: None,
     });
     let have = hash_pieces(&session, pieces).await?;
 
@@ -301,7 +311,7 @@ pub async fn check_file(torrent_path: &Path, output_dir: &Path) -> Result<()> {
 
 /// Hashes `pieces` on disk, showing progress, and returns which pieces of
 /// the torrent are there and intact.
-async fn hash_pieces(session: &Arc<Session>, pieces: Vec<usize>) -> Result<Vec<bool>> {
+pub(crate) async fn hash_pieces(session: &Arc<Session>, pieces: Vec<usize>) -> Result<Vec<bool>> {
     let torrent = &session.torrent;
     if pieces.is_empty() {
         return Ok(vec![false; torrent.num_pieces()]);
@@ -333,7 +343,7 @@ async fn hash_pieces(session: &Arc<Session>, pieces: Vec<usize>) -> Result<Vec<b
 }
 
 /// Total length of the pieces marked in `have`.
-fn verified_bytes(torrent: &TorrentFile, have: &[bool]) -> Result<u64> {
+pub(crate) fn verified_bytes(torrent: &TorrentFile, have: &[bool]) -> Result<u64> {
     have.iter()
         .enumerate()
         .filter(|(_, have)| **have)
@@ -380,6 +390,37 @@ pub async fn download_from_peers(
     peers: &[SocketAddr],
     max_peers: usize,
     listeners: Vec<TcpListener>,
+    announcer: Option<Announcer>,
+    shutdown: impl Future<Output = ()>,
+) -> Result<()> {
+    let mut start = StartPeers::default();
+    start.pool.add(peers.iter().copied());
+    download_with(
+        session, have, start, max_peers, listeners, announcer, shutdown,
+    )
+    .await
+}
+
+/// The peers a download starts with.
+#[derive(Default)]
+pub(crate) struct StartPeers {
+    /// Peers to connect to, with those already connected or banned marked.
+    pub(crate) pool: PeerPool,
+    /// Addresses of incoming peers that misbehaved.
+    pub(crate) banned_ips: HashSet<IpAddr>,
+    /// Connections already open, such as those the metadata of a magnet
+    /// link came over, each with whether the peer connected to us.
+    pub(crate) connections: Vec<(PeerConnection, bool)>,
+}
+
+/// `download_from_peers`, starting with the peers in `start`, some of them
+/// perhaps already connected.
+pub(crate) async fn download_with(
+    session: Arc<Session>,
+    have: &[bool],
+    start: StartPeers,
+    max_peers: usize,
+    listeners: Vec<TcpListener>,
     mut announcer: Option<Announcer>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
@@ -401,10 +442,12 @@ pub async fn download_from_peers(
         choker,
         ..
     } = &*swarm;
-    let mut pool = PeerPool::default();
-    pool.add(peers.iter().copied());
     // Incoming peers have no address we could ban in the pool.
-    let mut banned_ips = HashSet::new();
+    let StartPeers {
+        mut pool,
+        mut banned_ips,
+        connections,
+    } = start;
 
     // Told to peers in the extension handshake.
     let listen_port = listeners
@@ -414,15 +457,15 @@ pub async fn download_from_peers(
 
     let mut workers = JoinSet::new();
     // Starts a worker that connects to `addr`, or, given the socket the peer
-    // connected to us on, answers its handshake.
-    let spawn = |workers: &mut JoinSet<WorkerExit>, addr, socket: Option<TcpStream>| {
+    // connected to us on, answers its handshake, or carries on over a
+    // connection already open.
+    let spawn = |workers: &mut JoinSet<WorkerExit>, addr, link: Link| {
         let session = Arc::clone(&session);
         let swarm = Arc::clone(&swarm);
-        let inbound = socket.is_some();
+        let inbound = link.is_inbound();
         workers.spawn(async move {
             let mut pieces = 0;
-            let result =
-                peer_worker(&session, &swarm, addr, socket, listen_port, &mut pieces).await;
+            let result = peer_worker(&session, &swarm, addr, link, listen_port, &mut pieces).await;
             WorkerExit {
                 addr,
                 inbound,
@@ -431,6 +474,16 @@ pub async fn download_from_peers(
             }
         });
     };
+    for (conn, inbound) in connections {
+        spawn(
+            &mut workers,
+            conn.addr,
+            Link::Open {
+                conn: Box::new(conn),
+                inbound,
+            },
+        );
+    }
     let mut dht = session
         .dht
         .clone()
@@ -476,7 +529,7 @@ pub async fn download_from_peers(
                 break;
             };
             asked = None;
-            spawn(&mut workers, addr, None);
+            spawn(&mut workers, addr, Link::Connect);
         }
 
         let retry_at = pool.next_retry().filter(|_| workers.len() < max_peers);
@@ -539,7 +592,7 @@ pub async fn download_from_peers(
                     debug!(%addr, "turning away banned peer");
                 } else {
                     asked = None;
-                    spawn(&mut workers, addr, Some(socket));
+                    spawn(&mut workers, addr, Link::Accepted(socket));
                 }
             }
             () = sleep_until_some(retry_at) => {}
@@ -600,8 +653,34 @@ pub async fn download_from_peers(
     Ok(())
 }
 
+/// How a peer worker reaches its peer.
+enum Link {
+    /// By connecting to it.
+    Connect,
+    /// Over a socket it connected to us on, before the handshake.
+    Accepted(TcpStream),
+    /// Over a connection already open, such as one the metadata of a magnet
+    /// link came over.
+    Open {
+        conn: Box<PeerConnection>,
+        /// Whether the peer connected to us.
+        inbound: bool,
+    },
+}
+
+impl Link {
+    /// Whether the peer connected to us, so we cannot connect back.
+    fn is_inbound(&self) -> bool {
+        match self {
+            Link::Connect => false,
+            Link::Accepted(_) => true,
+            Link::Open { inbound, .. } => *inbound,
+        }
+    }
+}
+
 /// Sleeps until `at`, or forever if it is `None`.
-async fn sleep_until_some(at: Option<Instant>) {
+pub(crate) async fn sleep_until_some(at: Option<Instant>) {
     match at {
         Some(at) => tokio::time::sleep_until(at).await,
         None => std::future::pending().await,
@@ -610,7 +689,7 @@ async fn sleep_until_some(at: Option<Instant>) {
 
 /// Accepts the next incoming connection on any of `listeners`, or waits
 /// forever without one. Cancel-safe.
-async fn accept(listeners: &[TcpListener]) -> (TcpStream, SocketAddr) {
+pub(crate) async fn accept(listeners: &[TcpListener]) -> (TcpStream, SocketAddr) {
     let next = || {
         // Start at a random listener, so a busy one cannot starve the rest.
         let start = rand::rng().random_range(0..listeners.len().max(1));
@@ -660,7 +739,7 @@ struct WorkerExit {
 /// Ids of the peers we are connected to, so that a peer we connect to and
 /// that also connects to us is only downloaded from once.
 #[derive(Default)]
-struct ConnectedPeers(Mutex<HashSet<[u8; 20]>>);
+pub(crate) struct ConnectedPeers(Mutex<HashSet<[u8; 20]>>);
 
 impl ConnectedPeers {
     fn lock(&self) -> MutexGuard<'_, HashSet<[u8; 20]>> {
@@ -669,13 +748,13 @@ impl ConnectedPeers {
 
     /// Records a connection to the peer with id `id` until the returned
     /// handle is dropped, or returns `None` if there already is one.
-    fn register(&self, id: [u8; 20]) -> Option<Connected<'_>> {
+    pub(crate) fn register(&self, id: [u8; 20]) -> Option<Connected<'_>> {
         let new = self.lock().insert(id);
         new.then_some(Connected { peers: self, id })
     }
 }
 
-struct Connected<'a> {
+pub(crate) struct Connected<'a> {
     peers: &'a ConnectedPeers,
     id: [u8; 20],
 }
@@ -688,7 +767,7 @@ impl Drop for Connected<'_> {
 
 /// Runs the next re-announce and returns its peers, or waits forever
 /// without a tracker. Cancel-safe.
-async fn reannounce(
+pub(crate) async fn reannounce(
     announcer: &mut Option<Announcer>,
     transferred: &Transferred,
 ) -> Vec<SocketAddr> {
@@ -700,7 +779,7 @@ async fn reannounce(
 
 /// Runs the next DHT lookup and returns its peers, or waits forever without
 /// a DHT. Cancel-safe.
-async fn dht_lookup(search: &mut Option<DhtSearch>) -> Vec<SocketAddr> {
+pub(crate) async fn dht_lookup(search: &mut Option<DhtSearch>) -> Vec<SocketAddr> {
     match search {
         Some(search) => search.poll().await,
         None => std::future::pending().await,
@@ -717,7 +796,7 @@ struct Asked {
 /// A peer that broke the protocol or sent bad data, or turned out to be us.
 /// It is never retried.
 #[derive(Debug)]
-struct Misbehaved(&'static str);
+pub(crate) struct Misbehaved(pub(crate) &'static str);
 
 impl std::fmt::Display for Misbehaved {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -794,15 +873,14 @@ impl Progress {
 
 /// Downloads from one peer, and uploads to it while the choker unchokes it,
 /// until the torrent is complete, the queue is closed or the peer fails.
-/// Connects to `addr`, or with a `socket` the peer connected to us on,
-/// answers its handshake. `listen_port` is where we accept peers, if
-/// anywhere. `pieces_done` counts the pieces this peer delivered first, even
-/// on error.
+/// Reaches the peer at `addr` over `link`. `listen_port` is where we accept
+/// peers, if anywhere. `pieces_done` counts the pieces this peer delivered
+/// first, even on error.
 async fn peer_worker(
     session: &Session,
     swarm: &Swarm,
     addr: SocketAddr,
-    socket: Option<TcpStream>,
+    link: Link,
     listen_port: Option<u16>,
     pieces_done: &mut usize,
 ) -> Result<()> {
@@ -815,13 +893,36 @@ async fn peer_worker(
     let torrent = &session.torrent;
     let (info_hash, peer_id, num_pieces) =
         (session.info_hash, session.peer_id, torrent.num_pieces());
-    let inbound = socket.is_some();
-    let mut conn = match socket {
-        Some(socket) => {
-            PeerConnection::accept(socket, addr, info_hash, peer_id, num_pieces, listen_port)
-                .await?
+    let inbound = link.is_inbound();
+    let metadata_size = session
+        .metadata
+        .as_ref()
+        .and_then(|metadata| u32::try_from(metadata.len()).ok());
+    let mut conn = match link {
+        Link::Accepted(socket) => {
+            PeerConnection::accept(
+                socket,
+                addr,
+                info_hash,
+                peer_id,
+                num_pieces,
+                listen_port,
+                metadata_size,
+            )
+            .await?
         }
-        None => PeerConnection::connect(addr, info_hash, peer_id, num_pieces, listen_port).await?,
+        Link::Connect => {
+            PeerConnection::connect(
+                addr,
+                info_hash,
+                peer_id,
+                num_pieces,
+                listen_port,
+                metadata_size,
+            )
+            .await?
+        }
+        Link::Open { conn, .. } => *conn,
     };
     if conn.peer_id == peer_id {
         // A tracker listed our own address.
@@ -1063,6 +1164,10 @@ async fn peer_worker(
                 begin,
                 length,
             }),
+            PeerMessage::Extended {
+                id: extension::UT_METADATA_ID,
+                payload,
+            } => metadata::serve(&mut conn, session.metadata.as_deref(), &payload).await?,
             _ => {}
         }
     }

@@ -3,12 +3,15 @@
 use rtrnt::announcer::Announcer;
 use rtrnt::dht::Dht;
 use rtrnt::download::{
-    DownloadConfig, Interrupted, SeedLimits, Session, download_file, download_from_peers, listen,
+    DownloadConfig, Interrupted, SeedLimits, Session, check_file, download_file,
+    download_from_peers, listen,
 };
-use rtrnt::extension::ExtendedHandshake;
+use rtrnt::extension::{ExtendedHandshake, UT_METADATA, UT_METADATA_ID};
+use rtrnt::magnet::{self, MagnetLink, download_magnet};
+use rtrnt::metadata::{self, Message};
 use rtrnt::peer::{PeerMessage, generate_peer_id, handshake_bytes, parse_handshake};
 use rtrnt::storage::Storage;
-use rtrnt::torrent::{FileInfo, Info, TorrentFile};
+use rtrnt::torrent::{self, FileInfo, Info, TorrentFile};
 use rtrnt::tracker::{AnnounceEvent, AnnounceRequest, ScrapeStats, scrape, scrape_tiers};
 use rtrnt::verify;
 use serde_bytes::ByteBuf;
@@ -17,6 +20,7 @@ use std::future::pending;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -269,6 +273,8 @@ fn seeding_session(
     seed: SeedLimits,
 ) -> Arc<Session> {
     let storage = Arc::new(Storage::new(&torrent.info, out).unwrap());
+    // What `make_torrent` hashed.
+    let metadata = serde_bencode::to_bytes(&torrent.info).unwrap();
     Arc::new(Session {
         torrent,
         info_hash,
@@ -276,6 +282,7 @@ fn seeding_session(
         storage,
         seed,
         dht: None,
+        metadata: Some(metadata),
     })
 }
 
@@ -1919,4 +1926,347 @@ async fn downloads_from_peers_that_connect_over_ipv4_and_ipv6() {
     .expect("download timed out")
     .expect("download failed");
     assert_files_match(out.path(), &data);
+}
+
+/// The test torrent's info dict with an extra key we do not model, padded
+/// so that it takes two metadata pieces, and its info hash.
+fn padded_info(torrent: &TorrentFile) -> (Vec<u8>, [u8; 20]) {
+    let mut info = serde_bencode::to_bytes(&torrent.info).unwrap();
+    info.pop();
+    info.extend_from_slice(b"8:zpadding20000:");
+    info.extend(std::iter::repeat_n(b'x', 20_000));
+    info.push(b'e');
+    assert!(info.len() > METADATA_PIECE_LEN);
+    let hash = sha1::Sha1::digest(&info).into();
+    (info, hash)
+}
+
+const METADATA_PIECE_LEN: usize = metadata::PIECE_LEN;
+/// The id a mock peer asks us to send its `ut_metadata` messages with.
+const MOCK_UT_METADATA: u8 = 3;
+
+/// A peer with the whole torrent and its metadata, for magnet links: it
+/// accepts leechers one after the other, sends `metadata` through
+/// `ut_metadata` (each piece with a byte flipped if `corrupt`), and blocks
+/// of `data`. Counts the connections it takes and the blocks it is asked
+/// for.
+fn magnet_seeder(
+    listener: TcpListener,
+    info_hash: [u8; 20],
+    metadata: Vec<u8>,
+    data: Arc<Vec<u8>>,
+    corrupt: bool,
+) -> (Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let connections = Arc::new(AtomicUsize::new(0));
+    let blocks = Arc::new(AtomicUsize::new(0));
+    let counters = (Arc::clone(&connections), Arc::clone(&blocks));
+    let num_pieces = data.len().div_ceil(PIECE_LENGTH as usize);
+    let all: Vec<usize> = (0..num_pieces).collect();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            connections.fetch_add(1, Ordering::SeqCst);
+            let mut handshake = [0u8; 68];
+            socket.read_exact(&mut handshake).await.unwrap();
+            let handshake = parse_handshake(&handshake, &info_hash).unwrap();
+            assert!(handshake.supports_extensions());
+            socket
+                .write_all(&handshake_bytes(&info_hash, &generate_peer_id()))
+                .await
+                .unwrap();
+            let theirs = ExtendedHandshake {
+                extensions: [(UT_METADATA.to_string(), MOCK_UT_METADATA)].into(),
+                metadata_size: Some(metadata.len() as u32),
+                ..Default::default()
+            };
+            let payload = theirs.encode().unwrap();
+            send(&mut socket, PeerMessage::Extended { id: 0, payload }).await;
+            send_bitfield(&mut socket, num_pieces, &all).await;
+            send(&mut socket, PeerMessage::Unchoke).await;
+            while let Some(message) = read_message(&mut socket).await {
+                match message {
+                    PeerMessage::Extended {
+                        id: MOCK_UT_METADATA,
+                        payload,
+                    } => {
+                        let Some(Message::Request { piece }) = Message::decode(&payload).unwrap()
+                        else {
+                            panic!("unexpected ut_metadata message");
+                        };
+                        let mut reply = metadata::answer(Some(&metadata), piece);
+                        if let Message::Data { data, .. } = &mut reply
+                            && corrupt
+                        {
+                            data[0] ^= 0xff;
+                        }
+                        let payload = reply.encode();
+                        let id = UT_METADATA_ID;
+                        send(&mut socket, PeerMessage::Extended { id, payload }).await;
+                    }
+                    PeerMessage::Request {
+                        index,
+                        begin,
+                        length,
+                    } => {
+                        blocks.fetch_add(1, Ordering::SeqCst);
+                        send(&mut socket, piece(&data, index, begin, length)).await;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+    counters
+}
+
+/// A magnet link names a lying peer (`x.pe`) and a tracker that knows an
+/// honest one. With room for one peer, the liar is asked first, sends
+/// metadata that fails the hash check and is banned; the honest peer's
+/// metadata passes, and the download carries on over the same connection.
+/// The metadata is saved, so a second run neither fetches it again nor
+/// contacts the tracker, and `--check` can use it.
+#[tokio::test]
+async fn downloads_a_magnet_link_banning_a_peer_with_bad_metadata() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, _) = make_torrent(&data);
+    let (info, info_hash) = padded_info(&torrent);
+    let total = data.len() as u64;
+
+    let liar = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let liar_addr = liar.local_addr().unwrap();
+    let (liar_connections, liar_blocks) =
+        magnet_seeder(liar, info_hash, info.clone(), Arc::clone(&data), true);
+    let honest = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let honest_addr = honest.local_addr().unwrap();
+    let (honest_connections, honest_blocks) =
+        magnet_seeder(honest, info_hash, info.clone(), Arc::clone(&data), false);
+    let (tracker_url, mut queries) = mock_tracker(vec![honest_addr]).await;
+
+    let hex: String = info_hash.iter().map(|b| format!("{b:02x}")).collect();
+    let uri = format!("magnet:?xt=urn:btih:{hex}&dn=multi&tr={tracker_url}&x.pe={liar_addr}");
+    let link = MagnetLink::parse(&uri).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let config = DownloadConfig {
+        output_dir: out.path().to_path_buf(),
+        max_peers: 1,
+        listen_port: 0,
+        seed: SeedLimits::default(),
+        // Tests stay off the real internet.
+        dht: false,
+    };
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        download_magnet(&link, &config, pending()),
+    )
+    .await
+    .expect("download timed out")
+    .expect("download failed");
+    assert_files_match(out.path(), &data);
+
+    assert_eq!(liar_connections.load(Ordering::SeqCst), 1, "liar retried");
+    assert_eq!(liar_blocks.load(Ordering::SeqCst), 0);
+    assert_eq!(honest_connections.load(Ordering::SeqCst), 1, "reconnected");
+    assert!(honest_blocks.load(Ordering::SeqCst) > 0);
+
+    let mut seen = Vec::new();
+    while let Ok(query) = queries.try_recv() {
+        seen.push(query);
+    }
+    let (total, zero) = (total.to_string(), "0".to_string());
+    assert_eq!(
+        announces(&seen),
+        [
+            ["started".into(), zero.clone(), zero.clone(), "16384".into()],
+            [
+                "completed".into(),
+                total.clone(),
+                zero.clone(),
+                zero.clone()
+            ],
+            ["stopped".into(), total, zero.clone(), zero],
+        ]
+    );
+
+    // Saved with the info dict byte for byte, and the trackers.
+    let saved = out.path().join(format!("{hex}.torrent"));
+    let metainfo = torrent::load_metainfo(&saved).await.unwrap();
+    assert_eq!(metainfo.info_hash, info_hash);
+    assert_eq!(metainfo.info_bytes, info);
+    assert_eq!(metainfo.torrent.tracker_tiers(), [[tracker_url]]);
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        download_magnet(&link, &config, pending()),
+    )
+    .await
+    .expect("second run timed out")
+    .expect("second run failed");
+    assert!(queries.try_recv().is_err(), "second run asked the tracker");
+    assert_eq!(honest_connections.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        magnet::saved_torrent(&link, out.path()).await,
+        Some(saved.clone())
+    );
+    check_file(&saved, out.path()).await.unwrap();
+}
+
+/// A peer that only has the magnet link connects to us while we seed and
+/// fetches the metadata: our extension handshake gives its size, every
+/// piece comes back, and a piece past the end is rejected.
+#[tokio::test]
+async fn serves_metadata_to_a_magnet_client() {
+    init_tracing();
+    let data = test_data();
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+    let info = serde_bencode::to_bytes(&torrent.info).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    write_files(out.path(), &data);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let our_addr = listener.local_addr().unwrap();
+    let (done, done_rx) = oneshot::channel();
+    let client = tokio::spawn(async move {
+        let mut socket = connect_to(our_addr, info_hash).await;
+        let theirs = ExtendedHandshake {
+            extensions: [(UT_METADATA.to_string(), MOCK_UT_METADATA)].into(),
+            ..Default::default()
+        };
+        let payload = theirs.encode().unwrap();
+        send(&mut socket, PeerMessage::Extended { id: 0, payload }).await;
+        let ours = loop {
+            if let Some(PeerMessage::Extended { id: 0, payload }) = next_extended(&mut socket).await
+            {
+                break ExtendedHandshake::decode(&payload).unwrap();
+            }
+        };
+        let size = ours.metadata_size.expect("no metadata_size") as usize;
+        let id = ours.id(UT_METADATA).expect("no ut_metadata");
+        let pieces = size.div_ceil(METADATA_PIECE_LEN) as u32;
+        let requests: Vec<PeerMessage> = (0..=pieces)
+            .map(|piece| PeerMessage::Extended {
+                id,
+                payload: Message::Request { piece }.encode(),
+            })
+            .collect();
+        send_batch(&mut socket, &requests).await;
+        let mut metadata = Vec::new();
+        for _ in 0..=pieces {
+            let Some(PeerMessage::Extended {
+                id: MOCK_UT_METADATA,
+                payload,
+            }) = next_extended(&mut socket).await
+            else {
+                panic!("no ut_metadata reply");
+            };
+            match Message::decode(&payload).unwrap().unwrap() {
+                Message::Data {
+                    piece,
+                    total_size,
+                    data,
+                } => {
+                    assert_eq!(piece as usize * METADATA_PIECE_LEN, metadata.len());
+                    assert_eq!(total_size, Some(size as u64));
+                    metadata.extend(data);
+                }
+                Message::Reject { piece } => assert_eq!(piece, pieces),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        done.send(()).unwrap();
+        metadata
+    });
+
+    let forever = SeedLimits {
+        ratio: 1000.0,
+        time: Duration::ZERO,
+    };
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        download_from_peers(
+            seeding_session(torrent, info_hash, out.path(), forever),
+            &vec![true; num_pieces],
+            &[],
+            10,
+            vec![listener],
+            None,
+            async {
+                done_rx.await.ok();
+            },
+        ),
+    )
+    .await
+    .expect("seeding did not stop")
+    .expect("seeding failed");
+    let metadata = client.await.unwrap();
+    assert_eq!(metadata, info);
+    assert_eq!(<[u8; 20]>::from(sha1::Sha1::digest(&metadata)), info_hash);
+}
+
+/// Reads the next extended message, skipping everything else, or `None`
+/// once the client disconnects. Fails if nothing comes for 5 s.
+async fn next_extended(socket: &mut TcpStream) -> Option<PeerMessage> {
+    let next = async {
+        loop {
+            match read_message(socket).await {
+                Some(message @ PeerMessage::Extended { .. }) => return Some(message),
+                Some(_) => {}
+                None => return None,
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), next)
+        .await
+        .expect("client went silent")
+}
+
+/// One rtrnt seeds a torrent, another downloads it from a magnet link that
+/// names only the first one's address: the metadata and then the data come
+/// over the same connection.
+#[tokio::test]
+async fn downloads_a_magnet_link_from_another_rtrnt() {
+    init_tracing();
+    let data = test_data();
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+    let seed_dir = tempfile::tempdir().unwrap();
+    write_files(seed_dir.path(), &data);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seeder_addr = listener.local_addr().unwrap();
+    let (done, done_rx) = oneshot::channel::<()>();
+    let forever = SeedLimits {
+        ratio: 1000.0,
+        time: Duration::ZERO,
+    };
+    let session = seeding_session(torrent, info_hash, seed_dir.path(), forever);
+    let seeder = tokio::spawn(async move {
+        let stop = async {
+            done_rx.await.ok();
+        };
+        let have = vec![true; num_pieces];
+        download_from_peers(session, &have, &[], 10, vec![listener], None, stop).await
+    });
+
+    let hex: String = info_hash.iter().map(|b| format!("{b:02x}")).collect();
+    let link = MagnetLink::parse(&format!("magnet:?xt=urn:btih:{hex}&x.pe={seeder_addr}")).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let config = DownloadConfig {
+        output_dir: out.path().to_path_buf(),
+        max_peers: 10,
+        listen_port: 0,
+        seed: SeedLimits::default(),
+        dht: false,
+    };
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        download_magnet(&link, &config, pending()),
+    )
+    .await
+    .expect("download timed out")
+    .expect("download failed");
+    assert_files_match(out.path(), &data);
+    assert!(out.path().join(format!("{hex}.torrent")).exists());
+    done.send(()).unwrap();
+    seeder.await.unwrap().unwrap();
 }

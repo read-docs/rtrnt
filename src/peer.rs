@@ -23,6 +23,9 @@ const PEER_ID_PREFIX: &[u8; 8] = b"-RT0100-";
 /// Reserved handshake bit saying we run a DHT node (BEP 5): the last bit of
 /// the last reserved byte.
 const RESERVED_DHT: u8 = 0x01;
+/// Have messages kept from a peer while the number of pieces is unknown
+/// (see `PeerConnection::defer_pieces`); more are dropped.
+const MAX_DEFERRED_HAVES: usize = 1 << 16;
 
 /// Azureus-style peer id: client prefix plus 12 random alphanumerics.
 pub fn generate_peer_id() -> [u8; 20] {
@@ -325,18 +328,30 @@ pub struct PeerConnection {
     extensions: bool,
     /// The peer's extension handshake, once it has sent one.
     peer_extensions: Option<ExtendedHandshake>,
+    /// Set while the number of pieces is unknown, because the torrent's
+    /// metadata is still being fetched (BEP 9).
+    deferred: Option<DeferredPieces>,
+}
+
+/// What a peer said about its pieces before we knew how many there are.
+#[derive(Debug, Default)]
+struct DeferredPieces {
+    bitfield: Option<Vec<u8>>,
+    haves: Vec<u32>,
 }
 
 impl PeerConnection {
     /// Connects to `addr` and performs the handshake, followed by the
     /// extension handshake if the peer supports it. `listen_port` is the
-    /// port we accept incoming peers on, if any.
+    /// port we accept incoming peers on, if any, and `metadata_size` the
+    /// length of the info dictionary, if we can send it (BEP 9).
     pub async fn connect(
         addr: SocketAddr,
         info_hash: [u8; 20],
         peer_id: [u8; 20],
         num_pieces: usize,
         listen_port: Option<u16>,
+        metadata_size: Option<u32>,
     ) -> Result<Self> {
         let mut socket = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
@@ -354,7 +369,8 @@ impl PeerConnection {
         .context("handshake timed out")??;
         let handshake = parse_handshake(&response, &info_hash)?;
         let mut conn = Self::new(socket, addr, handshake, num_pieces);
-        conn.send_extension_handshake(listen_port).await?;
+        conn.send_extension_handshake(listen_port, metadata_size)
+            .await?;
         Ok(conn)
     }
 
@@ -368,6 +384,7 @@ impl PeerConnection {
         peer_id: [u8; 20],
         num_pieces: usize,
         listen_port: Option<u16>,
+        metadata_size: Option<u32>,
     ) -> Result<Self> {
         let handshake = timeout(HANDSHAKE_TIMEOUT, async {
             let mut handshake = [0u8; 68];
@@ -386,7 +403,8 @@ impl PeerConnection {
             bail!("connected to ourselves");
         }
         let mut conn = Self::new(socket, addr, handshake, num_pieces);
-        conn.send_extension_handshake(listen_port).await?;
+        conn.send_extension_handshake(listen_port, metadata_size)
+            .await?;
         Ok(conn)
     }
 
@@ -406,16 +424,24 @@ impl PeerConnection {
             // We always set the bit ourselves.
             extensions: handshake.supports_extensions(),
             peer_extensions: None,
+            deferred: None,
         }
     }
 
     /// Sends our extension handshake if the peer supports the extension
-    /// protocol. It goes out right after the handshake, before anything else.
-    async fn send_extension_handshake(&mut self, listen_port: Option<u16>) -> Result<()> {
+    /// protocol. It goes out right after the handshake, before anything else,
+    /// and may be sent again later to change what it says, such as once we
+    /// have the metadata to send (`metadata_size`).
+    pub async fn send_extension_handshake(
+        &mut self,
+        listen_port: Option<u16>,
+        metadata_size: Option<u32>,
+    ) -> Result<()> {
         if !self.extensions {
             return Ok(());
         }
-        let payload = ExtendedHandshake::ours(listen_port, self.addr.ip()).encode()?;
+        let payload =
+            ExtendedHandshake::ours(listen_port, metadata_size, self.addr.ip()).encode()?;
         self.send(&PeerMessage::Extended {
             id: extension::HANDSHAKE_ID,
             payload,
@@ -452,6 +478,29 @@ impl PeerConnection {
             .and_then(|handshake| handshake.id(name))
             .ok_or_else(|| anyhow!("peer does not support the {name} extension"))?;
         self.send(&PeerMessage::Extended { id, payload }).await
+    }
+
+    /// For a torrent whose metadata is still being fetched (BEP 9), so that
+    /// the number of pieces is unknown: the peer's Bitfield and Have
+    /// messages are kept aside until `set_piece_count`. Call before
+    /// receiving anything.
+    pub fn defer_pieces(&mut self) {
+        self.deferred = Some(DeferredPieces::default());
+    }
+
+    /// Sets the number of pieces, once the metadata is known, and applies
+    /// the Bitfield and Have messages kept aside since `defer_pieces`. Fails
+    /// if the bitfield does not fit that many pieces.
+    pub fn set_piece_count(&mut self, num_pieces: usize) -> Result<()> {
+        let deferred = self.deferred.take().unwrap_or_default();
+        self.peer_has = vec![false; num_pieces];
+        if let Some(bitfield) = deferred.bitfield {
+            self.apply(&PeerMessage::Bitfield { bitfield })?;
+        }
+        for piece_index in deferred.haves {
+            self.apply(&PeerMessage::Have { piece_index })?;
+        }
+        Ok(())
     }
 
     /// Whether the peer runs a DHT node, and so wants our `Port` message.
@@ -574,6 +623,21 @@ impl PeerConnection {
     }
 
     fn apply(&mut self, message: &PeerMessage) -> Result<()> {
+        if let Some(deferred) = &mut self.deferred {
+            match message {
+                PeerMessage::Bitfield { bitfield } => {
+                    deferred.bitfield = Some(bitfield.clone());
+                    return Ok(());
+                }
+                PeerMessage::Have { piece_index } => {
+                    if deferred.haves.len() < MAX_DEFERRED_HAVES {
+                        deferred.haves.push(*piece_index);
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
         match message {
             PeerMessage::Choke => self.peer_choking = true,
             PeerMessage::Unchoke => self.peer_choking = false,
@@ -751,7 +815,7 @@ mod tests {
             received
         });
 
-        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1, Some(6881))
+        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1, Some(6881), None)
             .await
             .unwrap();
         assert!(!conn.supports_extensions());
@@ -815,7 +879,7 @@ mod tests {
             }
             received
         });
-        let conn = PeerConnection::connect(addr, info_hash, [2u8; 20], num_pieces, None)
+        let conn = PeerConnection::connect(addr, info_hash, [2u8; 20], num_pieces, None, None)
             .await
             .unwrap();
         (conn, remote)
@@ -854,6 +918,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn defers_pieces_until_their_number_is_known() {
+        let mut has = [false; 10];
+        has[0] = true;
+        has[9] = true;
+        let messages = vec![
+            PeerMessage::Bitfield {
+                bitfield: encode_bitfield(&has),
+            },
+            PeerMessage::Have { piece_index: 2 },
+            // Out of range once the count is known, so ignored.
+            PeerMessage::Have { piece_index: 99 },
+        ];
+        let (mut conn, _remote) = mock_peer(0, messages).await;
+        conn.defer_pieces();
+        for _ in 0..3 {
+            conn.receive().await.unwrap();
+        }
+        assert!(conn.peer_has().is_empty());
+        conn.set_piece_count(10).unwrap();
+        has[2] = true;
+        assert_eq!(conn.peer_has(), has);
+
+        // A bitfield that does not fit the torrent.
+        let messages = vec![PeerMessage::Bitfield {
+            bitfield: vec![0xff],
+        }];
+        let (mut conn, _remote) = mock_peer(0, messages).await;
+        conn.defer_pieces();
+        conn.receive().await.unwrap();
+        assert!(conn.set_piece_count(10).is_err());
+    }
+
+    #[tokio::test]
     async fn accept_answers_only_handshakes_for_our_torrent_from_others() {
         let info_hash = [5u8; 20];
         let ours = [2u8; 20];
@@ -875,7 +972,7 @@ mod tests {
                 socket.read_exact(&mut reply).await.ok().map(|_| reply)
             });
             let (socket, from) = listener.accept().await.unwrap();
-            let result = PeerConnection::accept(socket, from, info_hash, ours, 1, None).await;
+            let result = PeerConnection::accept(socket, from, info_hash, ours, 1, None, None).await;
             assert_eq!(result.is_ok(), accepted, "{:?}", result.as_ref().err());
             if let Ok(conn) = &result {
                 assert_eq!(conn.peer_id, theirs);
@@ -934,7 +1031,7 @@ mod tests {
             (ours, read_message(&mut socket).await)
         });
 
-        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1, Some(6881))
+        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1, Some(6881), None)
             .await
             .unwrap();
         assert!(conn.supports_extensions());
@@ -955,7 +1052,7 @@ mod tests {
 
         let (ours, next) = remote.await.unwrap();
         let localhost = "127.0.0.1".parse().unwrap();
-        assert_eq!(ours, ExtendedHandshake::ours(Some(6881), localhost));
+        assert_eq!(ours, ExtendedHandshake::ours(Some(6881), None, localhost));
         assert_eq!(
             next,
             PeerMessage::Extended {
@@ -985,7 +1082,7 @@ mod tests {
             socket.read_to_end(&mut Vec::new()).await.unwrap();
         });
 
-        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1, None)
+        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1, None, None)
             .await
             .unwrap();
         let err = conn.receive().await.unwrap_err();

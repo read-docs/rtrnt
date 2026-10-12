@@ -27,11 +27,15 @@ pub const CLIENT: &str = concat!("rtrnt ", env!("CARGO_PKG_VERSION"));
 /// How many requests we queue from one peer, sent as `reqq`; more are
 /// dropped. libtorrent allows as many by default.
 pub const MAX_QUEUED_REQUESTS: u32 = 500;
+/// Name of the metadata exchange extension (BEP 9), which lets magnet links
+/// fetch the info dictionary from peers.
+pub const UT_METADATA: &str = "ut_metadata";
+/// Extended message id peers send us `ut_metadata` messages with. The same
+/// as libtorrent's.
+pub const UT_METADATA_ID: u8 = 2;
 /// The extensions we implement, each with the extended message id peers
 /// must send its messages to us with. Advertised in our handshake as `m`.
-/// None yet; `ut_metadata` (BEP 9) and `ut_pex` (BEP 11) go here once they
-/// are implemented.
-pub const EXTENSIONS: &[(&str, u8)] = &[];
+pub const EXTENSIONS: &[(&str, u8)] = &[(UT_METADATA, UT_METADATA_ID)];
 
 /// An extension handshake. Every field is optional on the wire.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -47,12 +51,18 @@ pub struct ExtendedHandshake {
     pub request_queue: Option<u32>,
     /// `yourip`: the receiver's address, as the sender sees it.
     pub your_ip: Option<IpAddr>,
+    /// `metadata_size`: the length of the torrent's info dictionary, which
+    /// the sender can send through `ut_metadata` (BEP 9). Left out by a
+    /// sender that does not have it yet.
+    pub metadata_size: Option<u32>,
 }
 
 /// Our handshake as it goes on the wire. `serde_bencode` sorts the keys.
 #[derive(Serialize)]
 struct Wire<'a> {
     m: &'a BTreeMap<String, u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata_size: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     v: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -65,8 +75,9 @@ struct Wire<'a> {
 
 impl ExtendedHandshake {
     /// Our handshake for the peer at `peer_ip`. `listen_port` is the port we
-    /// accept incoming peers on, if any.
-    pub fn ours(listen_port: Option<u16>, peer_ip: IpAddr) -> Self {
+    /// accept incoming peers on, if any, and `metadata_size` the length of
+    /// the info dictionary, if we have it to send.
+    pub fn ours(listen_port: Option<u16>, metadata_size: Option<u32>, peer_ip: IpAddr) -> Self {
         Self {
             extensions: EXTENSIONS
                 .iter()
@@ -76,6 +87,7 @@ impl ExtendedHandshake {
             listen_port,
             request_queue: Some(MAX_QUEUED_REQUESTS),
             your_ip: Some(peer_ip),
+            metadata_size,
         }
     }
 
@@ -89,6 +101,7 @@ impl ExtendedHandshake {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let wire = Wire {
             m: &self.extensions,
+            metadata_size: self.metadata_size,
             v: self.client.as_deref(),
             p: self.listen_port,
             reqq: self.request_queue,
@@ -144,6 +157,9 @@ impl ExtendedHandshake {
                 .and_then(|n| u32::try_from(n).ok())
                 .filter(|&n| n != 0),
             your_ip: bytes(b"yourip").and_then(parse_ip),
+            metadata_size: int(b"metadata_size")
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|&n| n != 0),
         })
     }
 
@@ -156,6 +172,7 @@ impl ExtendedHandshake {
         self.listen_port = newer.listen_port.or(self.listen_port);
         self.request_queue = newer.request_queue.or(self.request_queue);
         self.your_ip = newer.your_ip.or(self.your_ip);
+        self.metadata_size = newer.metadata_size.or(self.metadata_size);
     }
 }
 
@@ -177,8 +194,8 @@ mod tests {
     #[test]
     fn our_handshake_roundtrips() {
         let ip: IpAddr = "10.1.2.3".parse().unwrap();
-        let ours = ExtendedHandshake::ours(Some(6881), ip);
-        assert!(ours.extensions.is_empty());
+        let ours = ExtendedHandshake::ours(Some(6881), None, ip);
+        assert_eq!(ours.id(UT_METADATA), Some(UT_METADATA_ID));
         assert_eq!(ours.client.as_deref(), Some(CLIENT));
         assert!(CLIENT.starts_with("rtrnt "));
 
@@ -186,12 +203,19 @@ mod tests {
         assert_eq!(
             payload,
             format!(
-                "d1:mde1:pi6881e4:reqqi500e1:v{}:{}6:yourip4:\x0a\x01\x02\x03e",
+                "d1:md11:ut_metadatai2ee1:pi6881e4:reqqi500e1:v{}:{}6:yourip4:\x0a\x01\x02\x03e",
                 CLIENT.len(),
                 CLIENT
             )
             .as_bytes()
         );
+        assert_eq!(ExtendedHandshake::decode(&payload).unwrap(), ours);
+
+        // With the metadata to send, its size goes out too.
+        let ours = ExtendedHandshake::ours(None, Some(5205), ip);
+        let payload = ours.encode().unwrap();
+        let expected = b"13:metadata_sizei5205e";
+        assert!(payload.windows(expected.len()).any(|w| w == expected));
         assert_eq!(ExtendedHandshake::decode(&payload).unwrap(), ours);
     }
 
@@ -203,6 +227,7 @@ mod tests {
             listen_port: None,
             request_queue: Some(1),
             your_ip: Some("2001:db8::1".parse().unwrap()),
+            metadata_size: Some(31_337),
         };
         let decoded = ExtendedHandshake::decode(&handshake.encode().unwrap()).unwrap();
         assert_eq!(decoded, handshake);
@@ -214,7 +239,7 @@ mod tests {
     #[test]
     fn ipv4_mapped_addresses_are_sent_as_ipv4() {
         let ip: IpAddr = "::ffff:10.1.2.3".parse().unwrap();
-        let payload = ExtendedHandshake::ours(None, ip).encode().unwrap();
+        let payload = ExtendedHandshake::ours(None, None, ip).encode().unwrap();
         let decoded = ExtendedHandshake::decode(&payload).unwrap();
         assert_eq!(decoded.your_ip, Some("10.1.2.3".parse().unwrap()));
         assert_eq!(decoded.listen_port, None);
@@ -233,6 +258,7 @@ mod tests {
         assert_eq!(handshake.listen_port, Some(51413));
         assert_eq!(handshake.request_queue, Some(512));
         assert_eq!(handshake.your_ip, Some("127.0.0.1".parse().unwrap()));
+        assert_eq!(handshake.metadata_size, Some(5205));
     }
 
     #[test]
@@ -241,15 +267,18 @@ mod tests {
             ExtendedHandshake::decode(b"de").unwrap(),
             ExtendedHandshake::default()
         );
-        let payload = b"d1:mli1ee1:p4:68814:reqqi-1e1:vi7e6:yourip3:abce";
+        let payload = b"d1:mli1ee13:metadata_size1:51:p4:68814:reqqi-1e1:vi7e6:yourip3:abce";
         assert_eq!(
             ExtendedHandshake::decode(payload).unwrap(),
             ExtendedHandshake::default()
         );
         // Out of range values, and extension entries that make no sense.
-        let payload = b"d1:md1:ai256e1:b1:x1:ci-1e1:di4ee1:pi65536e4:reqqi0ee";
+        let payload = b"d1:md1:ai256e1:b1:x1:ci-1e1:di4ee13:metadata_sizei0e1:pi65536e4:reqqi0ee";
         let handshake = ExtendedHandshake::decode(payload).unwrap();
         assert_eq!(handshake.extensions, [("d".to_string(), 4)].into());
+        assert_eq!(handshake.metadata_size, None);
+        let handshake = ExtendedHandshake::decode(b"d13:metadata_sizei4294967296ee").unwrap();
+        assert_eq!(handshake.metadata_size, None);
         assert_eq!(handshake.listen_port, None);
         assert_eq!(handshake.request_queue, None);
         // A client name that is not UTF-8 is kept, lossily.
@@ -291,8 +320,11 @@ mod tests {
         let mut handshake =
             ExtendedHandshake::decode(b"d1:md11:ut_metadatai2e6:ut_pexi1ee4:reqqi64e1:v1:ae")
                 .unwrap();
-        handshake.update(ExtendedHandshake::decode(b"d1:md6:ut_pexi0ee4:reqqi32ee").unwrap());
+        handshake.update(
+            ExtendedHandshake::decode(b"d1:md6:ut_pexi0ee13:metadata_sizei99e4:reqqi32ee").unwrap(),
+        );
         assert_eq!(handshake.id("ut_metadata"), Some(2));
+        assert_eq!(handshake.metadata_size, Some(99));
         assert_eq!(handshake.id("ut_pex"), None);
         assert_eq!(handshake.request_queue, Some(32));
         assert_eq!(handshake.client.as_deref(), Some("a"));

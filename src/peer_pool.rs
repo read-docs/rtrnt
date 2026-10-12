@@ -70,6 +70,15 @@ impl PeerPool {
         self.retrying.push((now + backoff, addr));
     }
 
+    /// Puts a peer handed out by `next` back at the end of the queue, as if
+    /// it had not been tried, unless it is banned.
+    pub(crate) fn requeue(&mut self, addr: SocketAddr) {
+        let banned = self.known.entry(addr).or_default().banned;
+        if !banned && !self.ready.contains(&addr) {
+            self.ready.push_back(addr);
+        }
+    }
+
     /// Never connects to `addr` again.
     pub(crate) fn ban(&mut self, addr: SocketAddr) {
         self.known.entry(addr).or_default().banned = true;
@@ -144,6 +153,19 @@ mod tests {
         pool.add([addr(1)]);
         assert_eq!(pool.next(now + RETRY_BACKOFF * 100), None);
         assert_eq!(pool.next_retry(), None);
+    }
+
+    #[test]
+    fn requeued_peers_are_handed_out_again_unless_banned() {
+        let now = Instant::now();
+        let mut pool = PeerPool::default();
+        pool.add([addr(1), addr(2)]);
+        assert_eq!(drain(&mut pool, now), [addr(1), addr(2)]);
+        pool.requeue(addr(2));
+        pool.requeue(addr(2));
+        pool.ban(addr(1));
+        pool.requeue(addr(1));
+        assert_eq!(drain(&mut pool, now), [addr(2)]);
     }
 
     #[test]

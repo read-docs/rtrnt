@@ -138,24 +138,92 @@ impl TorrentFile {
     }
 }
 
+/// A parsed torrent with its info hash and the exact bytes of its info
+/// dictionary, which peers fetching the torrent by magnet link are sent
+/// (BEP 9).
+pub struct Metainfo {
+    pub torrent: TorrentFile,
+    pub info_hash: [u8; 20],
+    pub info_bytes: Vec<u8>,
+}
+
 /// Parses a `.torrent` file and computes its info hash.
 pub fn parse(data: &[u8]) -> Result<(TorrentFile, [u8; 20])> {
+    let metainfo = parse_metainfo(data)?;
+    Ok((metainfo.torrent, metainfo.info_hash))
+}
+
+/// Parses a `.torrent` file, keeping the bytes of its info dictionary.
+pub fn parse_metainfo(data: &[u8]) -> Result<Metainfo> {
     let torrent: TorrentFile = serde_bencode::from_bytes(data).context("invalid torrent file")?;
     torrent.validate()?;
 
     // Hash the raw bytes of the info dict: re-encoding the parsed struct
     // would drop keys we don't model (e.g. `private`) and change the hash.
-    let info_bytes = &data[bencode::info_span(data)?];
-    let hash: [u8; 20] = sha1::Sha1::digest(info_bytes).into();
+    let info_bytes = data[bencode::info_span(data)?].to_vec();
+    let info_hash: [u8; 20] = sha1::Sha1::digest(&info_bytes).into();
 
-    Ok((torrent, hash))
+    Ok(Metainfo {
+        torrent,
+        info_hash,
+        info_bytes,
+    })
 }
 
 pub async fn load_file(path: &Path) -> Result<(TorrentFile, [u8; 20])> {
+    let metainfo = load_metainfo(path).await?;
+    Ok((metainfo.torrent, metainfo.info_hash))
+}
+
+/// Reads and parses a `.torrent` file, keeping the bytes of its info
+/// dictionary.
+pub async fn load_metainfo(path: &Path) -> Result<Metainfo> {
     let data = tokio::fs::read(path)
         .await
         .with_context(|| format!("failed to read {}", path.display()))?;
-    parse(&data)
+    parse_metainfo(&data)
+}
+
+/// Builds a torrent from an info dictionary fetched from peers (BEP 9),
+/// announcing to the tracker `tiers`. The caller checks the info hash.
+pub fn from_info(info_bytes: &[u8], tiers: &[Vec<String>]) -> Result<TorrentFile> {
+    // Scanned first because it limits the nesting depth, which
+    // `serde_bencode` would follow until the stack overflows.
+    let len = bencode::value_len(info_bytes).context("metadata is not bencoded")?;
+    if info_bytes.first() != Some(&b'd') || len != info_bytes.len() {
+        bail!("metadata is not a bencoded dictionary");
+    }
+    let info: Info = serde_bencode::from_bytes(info_bytes).context("invalid metadata")?;
+    let torrent = TorrentFile {
+        announce: tiers.iter().flatten().next().cloned(),
+        announce_list: (!tiers.is_empty()).then(|| tiers.to_vec()),
+        info,
+    };
+    torrent.validate()?;
+    Ok(torrent)
+}
+
+/// Encodes a `.torrent` file announcing to the tracker `tiers` around
+/// `info_bytes`, which go in unchanged so the info hash stays the same.
+pub fn encode_with_info(tiers: &[Vec<String>], info_bytes: &[u8]) -> Result<Vec<u8>> {
+    // Keys in sorted order, as bencode requires.
+    let mut data = b"d".to_vec();
+    if let Some(first) = tiers.iter().flatten().next() {
+        data.extend_from_slice(b"8:announce");
+        data.extend(bencoded(first)?);
+        data.extend_from_slice(b"13:announce-list");
+        data.extend(bencoded(&tiers)?);
+    }
+    data.extend_from_slice(b"10:created by");
+    data.extend(bencoded(&crate::extension::CLIENT)?);
+    data.extend_from_slice(b"4:info");
+    data.extend_from_slice(info_bytes);
+    data.push(b'e');
+    Ok(data)
+}
+
+fn bencoded<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    serde_bencode::to_bytes(value).context("cannot encode torrent")
 }
 
 #[cfg(test)]
@@ -239,6 +307,50 @@ mod tests {
         assert_eq!(torrent.tracker_tiers(), [["http://x"]]);
         let expected: [u8; 20] = sha1::Sha1::digest(&info).into();
         assert_eq!(hash, expected);
+    }
+
+    /// An info dict with a key we do not model, so re-encoding the parsed
+    /// struct would change it.
+    fn raw_info() -> Vec<u8> {
+        let mut info = b"d6:lengthi10e4:name4:file12:piece lengthi32e6:pieces20:".to_vec();
+        info.extend_from_slice(&[7u8; 20]);
+        info.extend_from_slice(b"6:source3:xyze");
+        info
+    }
+
+    #[test]
+    fn builds_a_torrent_from_fetched_metadata() {
+        let info = raw_info();
+        let tiers = vec![vec!["udp://a".to_string()], vec!["http://b".to_string()]];
+        let torrent = from_info(&info, &tiers).unwrap();
+        assert_eq!(torrent.info.name, "file");
+        assert_eq!(torrent.length(), 10);
+        assert_eq!(torrent.tracker_tiers(), tiers);
+        assert!(from_info(&info, &[]).unwrap().tracker_tiers().is_empty());
+
+        let mut trailing = info.clone();
+        trailing.push(b'x');
+        let cases: &[&[u8]] = &[b"", b"le", b"i1e", b"de", &trailing, &info[1..]];
+        for case in cases {
+            assert!(from_info(case, &tiers).is_err(), "accepted {case:?}");
+        }
+    }
+
+    #[test]
+    fn saved_torrent_keeps_the_info_dict_byte_for_byte() {
+        let info = raw_info();
+        let hash: [u8; 20] = sha1::Sha1::digest(&info).into();
+        let tiers = vec![
+            vec!["udp://a".to_string(), "udp://b".to_string()],
+            vec!["http://c".to_string()],
+        ];
+        for tiers in [tiers, Vec::new()] {
+            let data = encode_with_info(&tiers, &info).unwrap();
+            let metainfo = parse_metainfo(&data).unwrap();
+            assert_eq!(metainfo.info_hash, hash);
+            assert_eq!(metainfo.info_bytes, info);
+            assert_eq!(metainfo.torrent.tracker_tiers(), tiers);
+        }
     }
 
     #[test]

@@ -119,6 +119,13 @@ impl Announcer {
         }
     }
 
+    /// Sets how many bytes were left to download when we started, for a
+    /// magnet link whose size was unknown at the `started` announce. Later
+    /// announces count down from it.
+    pub fn set_left(&mut self, left: u64) {
+        self.started.left = left;
+    }
+
     /// Records that the download finished: the next announce, due at once,
     /// is `completed`. If it has not gone out by `stop`, it goes then.
     pub fn complete(&mut self) {
@@ -285,6 +292,13 @@ mod tests {
         );
         assert_eq!(request.event, AnnounceEvent::Regular);
         assert_eq!(a.request(AnnounceEvent::Completed, (5000, 0)).left, 0);
+    }
+
+    #[test]
+    fn left_can_be_set_once_the_size_is_known() {
+        let mut a = announcer(Instant::now());
+        a.set_left(5000);
+        assert_eq!(a.request(AnnounceEvent::Regular, (400, 0)).left, 4600);
     }
 
     #[test]
