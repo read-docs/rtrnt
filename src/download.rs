@@ -76,7 +76,8 @@ pub async fn download_file(torrent_path: &Path, config: &DownloadConfig) -> Resu
         storage,
     });
 
-    let have = check_existing(&session).await?;
+    let candidates = verify::candidates(&session.torrent, &session.storage)?;
+    let have = hash_pieces(&session, candidates).await?;
     let left = session.torrent.length() - verified_bytes(&session.torrent, &have)?;
     if left == 0 {
         info!(output = %config.output_dir.display(), "already complete");
@@ -105,15 +106,37 @@ pub async fn download_file(torrent_path: &Path, config: &DownloadConfig) -> Resu
     Ok(())
 }
 
-/// Hashes data left on disk by an earlier run and returns which pieces are
-/// already done, showing progress for anything worth checking.
-async fn check_existing(session: &Arc<Session>) -> Result<Vec<bool>> {
+/// Verifies a download against its torrent without changing anything on
+/// disk, and prints which files are missing, the wrong size or corrupt.
+/// Fails unless every piece is intact.
+pub async fn check_file(torrent_path: &Path, output_dir: &Path) -> Result<()> {
+    let (torrent, info_hash) = torrent::load_file(torrent_path).await?;
+    let storage = Arc::new(Storage::open_existing(&torrent.info, output_dir)?);
+    let pieces = verify::present(&torrent, &storage)?;
+    let session = Arc::new(Session {
+        torrent,
+        info_hash,
+        peer_id: peer::generate_peer_id(),
+        storage,
+    });
+    let have = hash_pieces(&session, pieces).await?;
+
+    let report = verify::Report::new(&session.torrent, &session.storage, &have);
+    print!("{report}");
+    if !report.is_complete() {
+        bail!("{} is incomplete", session.torrent.info.name);
+    }
+    Ok(())
+}
+
+/// Hashes `pieces` on disk, showing progress, and returns which pieces of
+/// the torrent are there and intact.
+async fn hash_pieces(session: &Arc<Session>, pieces: Vec<usize>) -> Result<Vec<bool>> {
     let torrent = &session.torrent;
-    let candidates = verify::candidates(torrent, &session.storage)?;
-    if candidates.is_empty() {
+    if pieces.is_empty() {
         return Ok(vec![false; torrent.num_pieces()]);
     }
-    let total = candidates
+    let total = pieces
         .iter()
         .map(|&index| torrent.piece_len(index))
         .sum::<Result<u64>>()?;
@@ -127,7 +150,7 @@ async fn check_existing(session: &Arc<Session>) -> Result<Vec<bool>> {
     let session = Arc::clone(session);
     let check_bar = bar.clone();
     let have = tokio::task::spawn_blocking(move || {
-        verify::verify(&session.torrent, &session.storage, &candidates, &|len| {
+        verify::verify(&session.torrent, &session.storage, &pieces, &|len| {
             check_bar.inc(len)
         })
     })
@@ -135,7 +158,7 @@ async fn check_existing(session: &Arc<Session>) -> Result<Vec<bool>> {
     bar.finish_and_clear();
 
     let done = have.iter().filter(|&&have| have).count();
-    info!(done, pieces = have.len(), "checked existing data");
+    info!(done, pieces = have.len(), "checked data on disk");
     Ok(have)
 }
 

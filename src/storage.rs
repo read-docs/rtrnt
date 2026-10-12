@@ -11,14 +11,21 @@ const MAX_OPEN_FILES: usize = 64;
 
 /// One file of the torrent, placed in the concatenated byte stream.
 #[derive(Debug)]
-struct FileSpan {
-    path: PathBuf,
+pub struct FileSpan {
+    pub path: PathBuf,
     /// Offset of the file's first byte in the torrent's byte stream.
-    offset: u64,
-    length: u64,
-    /// Created empty by `Storage::new`, so it holds nothing from an earlier
-    /// run.
-    fresh: bool,
+    pub offset: u64,
+    pub length: u64,
+    /// The file's size when the storage was opened, before any resizing, or
+    /// `None` if it did not exist.
+    pub found: Option<u64>,
+}
+
+impl FileSpan {
+    /// Bytes at the start of the file that were there before we opened it.
+    fn prior_len(&self) -> u64 {
+        self.found.unwrap_or(0)
+    }
 }
 
 /// Maps the torrent's byte stream onto files on disk.
@@ -27,19 +34,20 @@ pub struct Storage {
     files: Vec<FileSpan>,
     piece_length: u64,
     total_length: u64,
+    writable: bool,
     handles: Mutex<HandleCache>,
 }
 
-/// Open read-write handles by index into `Storage::files`, least recently
-/// used first. I/O goes through positional reads and writes, so a handle is
-/// shared without a cursor and the lock is held only to look it up.
+/// Open handles by index into `Storage::files`, least recently used first.
+/// I/O goes through positional reads and writes, so a handle is shared
+/// without a cursor and the lock is held only to look it up.
 #[derive(Debug, Default)]
 struct HandleCache {
     open: Vec<(usize, Arc<File>)>,
 }
 
 impl HandleCache {
-    fn get(&mut self, index: usize, path: &Path) -> Result<Arc<File>> {
+    fn get(&mut self, index: usize, path: &Path, writable: bool) -> Result<Arc<File>> {
         if let Some(pos) = self.open.iter().position(|(i, _)| *i == index) {
             let entry = self.open.remove(pos);
             let handle = Arc::clone(&entry.1);
@@ -49,7 +57,7 @@ impl HandleCache {
         let handle = Arc::new(
             OpenOptions::new()
                 .read(true)
-                .write(true)
+                .write(writable)
                 .open(path)
                 .with_context(|| format!("failed to open {}", path.display()))?,
         );
@@ -66,40 +74,7 @@ impl Storage {
     /// Creates (or opens) every file with its final size. Single-file
     /// torrents go in `out_dir/name`, multi-file ones under `out_dir/name/`.
     pub fn new(info: &Info, out_dir: &Path) -> Result<Self> {
-        check_component(&info.name)?;
-        let root = out_dir.join(&info.name);
-
-        let mut files = Vec::new();
-        let mut offset = 0u64;
-        match (&info.length, &info.files) {
-            (Some(length), None) => files.push(FileSpan {
-                path: root,
-                offset: 0,
-                length: *length,
-                fresh: true,
-            }),
-            (None, Some(entries)) => {
-                for entry in entries {
-                    if entry.path.is_empty() {
-                        bail!("torrent contains a file with an empty path");
-                    }
-                    let mut path = root.clone();
-                    for component in &entry.path {
-                        check_component(component)?;
-                        path.push(component);
-                    }
-                    files.push(FileSpan {
-                        path,
-                        offset,
-                        length: entry.length,
-                        fresh: true,
-                    });
-                    offset += entry.length;
-                }
-            }
-            _ => bail!("torrent must have exactly one of `length` or `files`"),
-        }
-
+        let mut files = layout(info, out_dir)?;
         for file in &mut files {
             if let Some(parent) = file.path.parent() {
                 std::fs::create_dir_all(parent)
@@ -112,17 +87,45 @@ impl Storage {
                 .truncate(false)
                 .open(&file.path)
                 .with_context(|| format!("failed to create {}", file.path.display()))?;
-            file.fresh = handle.metadata()?.len() == 0;
+            file.found = Some(handle.metadata()?.len());
             handle.set_len(file.length)?;
         }
+        Ok(Self::with_files(info, files, true))
+    }
 
+    /// Opens whatever files of the torrent are already on disk, read-only,
+    /// without creating or resizing anything. Reading a range that is not on
+    /// disk fails; see `is_on_disk`.
+    pub fn open_existing(info: &Info, out_dir: &Path) -> Result<Self> {
+        let mut files = layout(info, out_dir)?;
+        for file in &mut files {
+            file.found = match std::fs::metadata(&file.path) {
+                Ok(meta) if meta.is_file() => Some(meta.len()),
+                Ok(_) => bail!("{} is not a file", file.path.display()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("failed to read {}", file.path.display()));
+                }
+            };
+        }
+        Ok(Self::with_files(info, files, false))
+    }
+
+    fn with_files(info: &Info, files: Vec<FileSpan>, writable: bool) -> Self {
         let total_length = files.iter().map(|f| f.length).sum();
-        Ok(Self {
+        Self {
             files,
             piece_length: info.piece_length,
             total_length,
+            writable,
             handles: Mutex::default(),
-        })
+        }
+    }
+
+    /// The torrent's files, in order.
+    pub fn files(&self) -> &[FileSpan] {
+        &self.files
     }
 
     /// Writes a verified piece to disk on the blocking thread pool.
@@ -133,6 +136,9 @@ impl Storage {
     }
 
     pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
+        if !self.writable {
+            bail!("storage was opened read-only");
+        }
         self.check_range(offset, data.len())?;
         for (index, file_offset, range) in self.segments(offset, data.len()) {
             let path = &self.files[index].path;
@@ -155,19 +161,28 @@ impl Storage {
         Ok(data)
     }
 
-    /// Whether `offset..offset + len` overlaps a file that existed with data
-    /// before `new`. Ranges that do not are all zeros, never a finished piece
-    /// from an earlier run.
+    /// Whether `offset..offset + len` overlaps data that was on disk before
+    /// the storage was opened. Ranges that do not are all zeros, never a
+    /// finished piece from an earlier run.
     pub fn may_hold_prior_data(&self, offset: u64, len: usize) -> bool {
         self.segments(offset, len)
-            .any(|(index, _, _)| !self.files[index].fresh)
+            .any(|(index, file_offset, _)| file_offset < self.files[index].prior_len())
+    }
+
+    /// Whether every byte of `offset..offset + len` was on disk before the
+    /// storage was opened.
+    pub fn is_on_disk(&self, offset: u64, len: usize) -> bool {
+        self.segments(offset, len)
+            .all(|(index, file_offset, range)| {
+                file_offset + range.len() as u64 <= self.files[index].prior_len()
+            })
     }
 
     fn handle(&self, index: usize) -> Result<Arc<File>> {
         self.handles
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(index, &self.files[index].path)
+            .get(index, &self.files[index].path, self.writable)
     }
 
     fn check_range(&self, offset: u64, len: usize) -> Result<()> {
@@ -246,6 +261,45 @@ fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result
         }
     }
     Ok(())
+}
+
+/// Where each file of the torrent goes: `out_dir/name` for a single file,
+/// under `out_dir/name/` for several. Nothing is touched on disk.
+fn layout(info: &Info, out_dir: &Path) -> Result<Vec<FileSpan>> {
+    check_component(&info.name)?;
+    let root = out_dir.join(&info.name);
+
+    let mut files = Vec::new();
+    let mut offset = 0u64;
+    match (&info.length, &info.files) {
+        (Some(length), None) => files.push(FileSpan {
+            path: root,
+            offset: 0,
+            length: *length,
+            found: None,
+        }),
+        (None, Some(entries)) => {
+            for entry in entries {
+                if entry.path.is_empty() {
+                    bail!("torrent contains a file with an empty path");
+                }
+                let mut path = root.clone();
+                for component in &entry.path {
+                    check_component(component)?;
+                    path.push(component);
+                }
+                files.push(FileSpan {
+                    path,
+                    offset,
+                    length: entry.length,
+                    found: None,
+                });
+                offset += entry.length;
+            }
+        }
+        _ => bail!("torrent must have exactly one of `length` or `files`"),
+    }
+    Ok(files)
 }
 
 /// Rejects path components that could escape the output directory.
@@ -333,6 +387,32 @@ mod tests {
         assert_eq!(cached(&storage).len(), MAX_OPEN_FILES);
         let root = dir.path().join("root");
         assert_eq!(std::fs::read(root.join("f1")).unwrap(), [1]);
+    }
+
+    #[test]
+    fn open_existing_reads_without_touching_the_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = multi_file_info(&[(&["a"], 3), (&["b"], 6), (&["c"], 2)]);
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a"), b"abc").unwrap();
+        // "b" is cut short and "c" is missing.
+        std::fs::write(root.join("b"), b"def").unwrap();
+
+        let storage = Storage::open_existing(&info, dir.path()).unwrap();
+        let found: Vec<_> = storage.files().iter().map(|f| f.found).collect();
+        assert_eq!(found, [Some(3), Some(3), None]);
+        assert!(storage.is_on_disk(0, 6));
+        assert!(!storage.is_on_disk(0, 7));
+        assert!(storage.may_hold_prior_data(5, 2));
+        assert!(!storage.may_hold_prior_data(6, 5));
+        assert_eq!(storage.read_at(1, 4).unwrap(), b"bcde");
+        assert!(storage.read_at(9, 2).is_err());
+        assert!(storage.write_at(0, b"x").is_err());
+
+        assert_eq!(std::fs::read(root.join("a")).unwrap(), b"abc");
+        assert_eq!(std::fs::read(root.join("b")).unwrap(), b"def");
+        assert!(!root.join("c").exists());
     }
 
     #[test]

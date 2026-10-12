@@ -15,6 +15,10 @@ struct Args {
     /// Maximum number of peers to download from at once
     #[arg(long, default_value_t = 30)]
     max_peers: usize,
+    /// Verify an existing download against the torrent instead of
+    /// downloading; exits with an error unless every piece is intact
+    #[arg(long)]
+    check: bool,
 }
 
 #[tokio::main]
@@ -27,6 +31,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    if args.check {
+        return download::check_file(&args.torrent, &args.output).await;
+    }
     let config = DownloadConfig {
         output_dir: args.output,
         max_peers: args.max_peers,

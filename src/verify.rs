@@ -5,19 +5,32 @@ use crate::storage::Storage;
 use crate::torrent::TorrentFile;
 use anyhow::{Result, anyhow};
 use sha1::Digest;
+use std::fmt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Most threads hashing at once. Reading from disk is usually the limit, and
 /// each thread holds a whole piece in memory.
 const MAX_THREADS: usize = 4;
 
-/// Pieces that may hold data from an earlier run: those overlapping a file
-/// that `Storage::new` did not create empty.
+/// Pieces that may hold data from an earlier run: those overlapping data
+/// that was on disk before `Storage::new` created and resized the files.
 pub fn candidates(torrent: &TorrentFile, storage: &Storage) -> Result<Vec<usize>> {
+    pieces_where(torrent, |offset, len| {
+        storage.may_hold_prior_data(offset, len)
+    })
+}
+
+/// Pieces whose every byte is on disk, so they can be read and hashed.
+pub fn present(torrent: &TorrentFile, storage: &Storage) -> Result<Vec<usize>> {
+    pieces_where(torrent, |offset, len| storage.is_on_disk(offset, len))
+}
+
+fn pieces_where(torrent: &TorrentFile, keep: impl Fn(u64, usize) -> bool) -> Result<Vec<usize>> {
     let mut pieces = Vec::new();
     for index in 0..torrent.num_pieces() {
         let (offset, len) = piece_range(torrent, index)?;
-        if storage.may_hold_prior_data(offset, len) {
+        if keep(offset, len) {
             pieces.push(index);
         }
     }
@@ -78,6 +91,90 @@ pub fn verify(
         }
     }
     Ok(have)
+}
+
+/// The outcome of checking a download against its torrent.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Report {
+    pub good_pieces: usize,
+    pub total_pieces: usize,
+    /// Files with something wrong, in torrent order.
+    pub problems: Vec<(PathBuf, FileProblem)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum FileProblem {
+    Missing,
+    WrongSize {
+        expected: u64,
+        found: u64,
+    },
+    /// Pieces overlapping the file that did not match their hash. A piece
+    /// spanning two files counts against both.
+    BadPieces(usize),
+}
+
+impl Report {
+    /// Compares the files on disk and the pieces that verified (`have`)
+    /// against the torrent.
+    pub fn new(torrent: &TorrentFile, storage: &Storage, have: &[bool]) -> Self {
+        let piece_length = torrent.info.piece_length;
+        let problems = storage
+            .files()
+            .iter()
+            .filter_map(|file| {
+                let problem = match file.found {
+                    None => FileProblem::Missing,
+                    Some(found) if found != file.length => FileProblem::WrongSize {
+                        expected: file.length,
+                        found,
+                    },
+                    // An empty file of the right size overlaps no piece.
+                    Some(_) if file.length == 0 => return None,
+                    Some(_) => {
+                        let first = file.offset / piece_length;
+                        let last = (file.offset + file.length - 1) / piece_length;
+                        let bad = (first..=last)
+                            .filter(|&i| !have.get(i as usize).copied().unwrap_or(false))
+                            .count();
+                        if bad == 0 {
+                            return None;
+                        }
+                        FileProblem::BadPieces(bad)
+                    }
+                };
+                Some((file.path.clone(), problem))
+            })
+            .collect();
+        Self {
+            good_pieces: have.iter().filter(|&&have| have).count(),
+            total_pieces: have.len(),
+            problems,
+        }
+    }
+
+    /// Whether every piece verified and every file has the right size.
+    pub fn is_complete(&self) -> bool {
+        self.good_pieces == self.total_pieces && self.problems.is_empty()
+    }
+}
+
+impl fmt::Display for Report {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "{} of {} pieces OK", self.good_pieces, self.total_pieces)?;
+        for (path, problem) in &self.problems {
+            let path = path.display();
+            match problem {
+                FileProblem::Missing => writeln!(f, "missing     {path}")?,
+                FileProblem::WrongSize { expected, found } => {
+                    writeln!(f, "wrong size  {path}: {found} bytes, expected {expected}")?
+                }
+                FileProblem::BadPieces(1) => writeln!(f, "corrupt     {path}: 1 bad piece")?,
+                FileProblem::BadPieces(n) => writeln!(f, "corrupt     {path}: {n} bad pieces")?,
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Whether piece `index` on disk matches its hash, and the piece's length.
@@ -181,5 +278,67 @@ mod tests {
         assert!(candidates(&torrent, &storage).unwrap().is_empty());
         let have = verify(&torrent, &storage, &[], &|_| {}).unwrap();
         assert_eq!(have, [false, false, false]);
+    }
+
+    /// Writes the files, checks them read-only and returns the report.
+    fn check(a: Option<&[u8]>, b: Option<&[u8]>) -> (Report, PathBuf) {
+        let torrent = torrent(b"abcdefghijk");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        for (name, contents) in [("a", a), ("b", b)] {
+            if let Some(contents) = contents {
+                std::fs::write(root.join(name), contents).unwrap();
+            }
+        }
+        let storage = Storage::open_existing(&torrent.info, dir.path()).unwrap();
+        let pieces = present(&torrent, &storage).unwrap();
+        let have = verify(&torrent, &storage, &pieces, &|_| {}).unwrap();
+        (Report::new(&torrent, &storage, &have), root)
+    }
+
+    #[test]
+    fn report_on_a_complete_download() {
+        let (report, _) = check(Some(b"abcdef"), Some(b"ghijk"));
+        assert!(report.is_complete());
+        assert_eq!(report.to_string(), "3 of 3 pieces OK\n");
+    }
+
+    #[test]
+    fn report_on_a_missing_file() {
+        let (report, root) = check(Some(b"abcdef"), None);
+        assert!(!report.is_complete());
+        // Piece 1 spans both files, so "a" cannot be fully verified either.
+        assert_eq!(
+            report.problems,
+            [
+                (root.join("a"), FileProblem::BadPieces(1)),
+                (root.join("b"), FileProblem::Missing),
+            ]
+        );
+        assert_eq!(report.good_pieces, 1);
+    }
+
+    #[test]
+    fn report_on_corrupt_and_resized_files() {
+        let (report, root) = check(Some(b"abcdeX"), Some(b"ghijk!"));
+        assert_eq!(
+            report.problems,
+            [
+                (root.join("a"), FileProblem::BadPieces(1)),
+                (
+                    root.join("b"),
+                    FileProblem::WrongSize {
+                        expected: 5,
+                        found: 6
+                    }
+                ),
+            ]
+        );
+        assert_eq!(report.good_pieces, 2);
+        let text = report.to_string();
+        assert!(text.starts_with("2 of 3 pieces OK\n"), "{text}");
+        assert!(text.contains("corrupt     "), "{text}");
+        assert!(text.contains(": 6 bytes, expected 5\n"), "{text}");
     }
 }
