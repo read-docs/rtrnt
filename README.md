@@ -22,7 +22,7 @@ A terminal-based BitTorrent client written in Rust.
 cargo run --release -- path/to/file.torrent -o ~/Downloads
 ```
 
-Options: `-o, --output <DIR>` (default `.`), `--max-peers <N>` (default 30), `-p, --port <PORT>` to listen on for incoming peers (default 6881) and `--check` to verify a finished download. Set `RUST_LOG=debug` for per-peer logs.
+Options: `-o, --output <DIR>` (default `.`), `--max-peers <N>` (default 30), `-p, --port <PORT>` to listen on for incoming peers (default 6881), `--check` to verify a finished download, and `--seed-ratio <RATIO>` and `--seed-time <MINUTES>` to keep seeding once the download is complete, until we have uploaded that many times the torrent's size or for that long, whichever comes first (both default to 0, which exits at completion). Set `RUST_LOG=debug` for per-peer logs.
 
 Run the tests with `cargo test`. They include a loopback integration test against a mock seeder.
 
@@ -46,7 +46,8 @@ src/
 ├── lib.rs       # Library root
 ├── announcer.rs # Re-announces and completed/stopped events
 ├── bencode.rs   # Raw bencode scanning (info-hash span)
-├── download.rs  # Piece queue, peer workers, block pipelining
+├── choker.rs    # Choking algorithm: who may download from us
+├── download.rs  # Piece queue, peer workers, block pipelining, seeding
 ├── peer.rs      # Peer wire protocol: handshake, message encode/decode
 ├── peer_pool.rs # Known peers, retry backoff and bans
 ├── storage.rs   # Maps pieces onto files on disk (single and multi-file)

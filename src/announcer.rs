@@ -1,6 +1,6 @@
-//! Keeps the tracker informed for the whole download: re-announces on the
-//! tracker's interval with real stats, and sends `completed` and `stopped`
-//! at the end.
+//! Keeps the tracker informed for the whole run: re-announces on the
+//! tracker's interval with real stats, sends `completed` when the download
+//! finishes, and `stopped` at the end.
 
 use crate::tracker::{AnnounceEvent, AnnounceRequest, AnnounceResponse, Tiers};
 use anyhow::Result;
@@ -19,6 +19,33 @@ const MAX_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
 /// How long the final `completed` and `stopped` announces may take in total.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Payload bytes moved this session, as reported to the tracker.
+#[derive(Debug, Default)]
+pub struct Transferred {
+    /// Verified piece data received, not counting data already on disk.
+    pub downloaded: AtomicU64,
+    /// Block data sent to peers.
+    pub uploaded: AtomicU64,
+}
+
+impl Transferred {
+    fn load(&self) -> (u64, u64) {
+        (
+            self.downloaded.load(Ordering::Relaxed),
+            self.uploaded.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Whether the tracker has heard that the download finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Completion {
+    Downloading,
+    /// Finished, and `completed` is still to be sent.
+    Due,
+    Sent,
+}
+
 pub struct Announcer {
     trackers: Tiers,
     /// The `started` request. Later announces send its stats updated.
@@ -30,9 +57,11 @@ pub struct Announcer {
     last: Instant,
     /// When the next announce is due.
     next: Instant,
-    /// A background announce. It works on a copy of the tiers and hands it
-    /// back, reordered to put the tracker that answered first.
-    in_flight: Option<JoinHandle<(Tiers, Result<AnnounceResponse>)>>,
+    completion: Completion,
+    /// A background announce, of the given event. It works on a copy of the
+    /// tiers and hands it back, reordered to put the tracker that answered
+    /// first.
+    in_flight: Option<JoinHandle<(Tiers, AnnounceEvent, Result<AnnounceResponse>)>>,
 }
 
 impl Announcer {
@@ -60,6 +89,7 @@ impl Announcer {
             min_interval: MIN_INTERVAL,
             last: now,
             next: now + DEFAULT_INTERVAL,
+            completion: Completion::Downloading,
             in_flight: None,
         }
     }
@@ -77,13 +107,24 @@ impl Announcer {
         debug!(interval = ?self.interval, "next announce scheduled");
     }
 
-    /// The request for `event`, reporting `downloaded` bytes since `started`.
-    fn request(&self, event: AnnounceEvent, downloaded: u64) -> AnnounceRequest {
+    /// The request for `event`, reporting the bytes `downloaded` and
+    /// `uploaded` since `started`.
+    fn request(&self, event: AnnounceEvent, (downloaded, uploaded): (u64, u64)) -> AnnounceRequest {
         AnnounceRequest {
             event,
             downloaded,
+            uploaded,
             left: self.started.left.saturating_sub(downloaded),
             ..self.started
+        }
+    }
+
+    /// Records that the download finished: the next announce, due at once,
+    /// is `completed`. If it has not gone out by `stop`, it goes then.
+    pub fn complete(&mut self) {
+        if self.completion == Completion::Downloading {
+            self.completion = Completion::Due;
+            self.next = Instant::now();
         }
     }
 
@@ -94,35 +135,43 @@ impl Announcer {
     }
 
     /// Waits until the next announce is due, sends it in the background
-    /// with the current `downloaded` count, and returns the peers it got
-    /// (none if every tracker failed).
+    /// with the current `transferred` counts, and returns the peers it got
+    /// (none if every tracker failed). It is `completed` if the download has
+    /// finished since the last one, otherwise a regular announce.
     ///
     /// Cancel-safe: an announce already sent is kept, and the next call
     /// waits for its answer.
-    pub async fn poll(&mut self, downloaded: &AtomicU64) -> Vec<SocketAddr> {
+    pub async fn poll(&mut self, transferred: &Transferred) -> Vec<SocketAddr> {
         if self.in_flight.is_none() {
             tokio::time::sleep_until(self.next).await;
             self.last = Instant::now();
         }
-        let request = self.request(AnnounceEvent::Regular, downloaded.load(Ordering::Relaxed));
+        let event = match self.completion {
+            Completion::Due => AnnounceEvent::Completed,
+            _ => AnnounceEvent::Regular,
+        };
+        let request = self.request(event, transferred.load());
         let handle = self.in_flight.get_or_insert_with(|| {
             let mut trackers = self.trackers.clone();
             tokio::spawn(async move {
                 let result = trackers.announce(&request).await;
-                (trackers, result)
+                (trackers, request.event, result)
             })
         });
-        let result = match handle.await {
-            Ok((trackers, result)) => {
+        let (event, result) = match handle.await {
+            Ok((trackers, event, result)) => {
                 self.trackers = trackers;
-                result
+                (event, result)
             }
-            Err(e) => Err(e.into()),
+            Err(e) => (AnnounceEvent::Regular, Err(e.into())),
         };
         self.in_flight = None;
         match result {
             Ok(response) => {
-                info!(peers = response.peers.len(), "re-announced");
+                if event == AnnounceEvent::Completed {
+                    self.completion = Completion::Sent;
+                }
+                info!(peers = response.peers.len(), ?event, "re-announced");
                 self.schedule(&response);
                 response.peers
             }
@@ -134,21 +183,23 @@ impl Announcer {
         }
     }
 
-    /// Tells the tracker we are leaving: `completed` first if the download
-    /// finished, then `stopped`. Failures are only logged, and the tracker
-    /// gets `STOP_TIMEOUT` in total so it cannot hold up the exit.
-    pub async fn stop(mut self, completed: bool, downloaded: u64) {
+    /// Tells the tracker we are leaving, with the final `transferred`
+    /// counts: `completed` first if the download finished and the tracker
+    /// has not heard yet, then `stopped`. Failures are only logged, and the
+    /// tracker gets `STOP_TIMEOUT` in total so it cannot hold up the exit.
+    pub async fn stop(mut self, transferred: &Transferred) {
         if let Some(handle) = self.in_flight.take() {
             handle.abort();
         }
-        let events: &[AnnounceEvent] = if completed {
+        let counts = transferred.load();
+        let events: &[AnnounceEvent] = if self.completion == Completion::Due {
             &[AnnounceEvent::Completed, AnnounceEvent::Stopped]
         } else {
             &[AnnounceEvent::Stopped]
         };
         let send = async {
             for &event in events {
-                let request = self.request(event, downloaded);
+                let request = self.request(event, counts);
                 match self.trackers.announce(&request).await {
                     Ok(_) => debug!(?event, "announced"),
                     Err(e) => warn!(?event, "announce failed: {e:#}"),
@@ -227,9 +278,28 @@ mod tests {
     fn requests_report_progress() {
         let a = announcer(Instant::now());
         assert_eq!(a.started.event, AnnounceEvent::Started);
-        let request = a.request(AnnounceEvent::Regular, 400);
-        assert_eq!((request.downloaded, request.left), (400, 600));
+        let request = a.request(AnnounceEvent::Regular, (400, 7000));
+        assert_eq!(
+            (request.downloaded, request.uploaded, request.left),
+            (400, 7000, 600)
+        );
         assert_eq!(request.event, AnnounceEvent::Regular);
-        assert_eq!(a.request(AnnounceEvent::Completed, 5000).left, 0);
+        assert_eq!(a.request(AnnounceEvent::Completed, (5000, 0)).left, 0);
+    }
+
+    #[test]
+    fn completion_makes_the_next_announce_due_at_once() {
+        let now = Instant::now();
+        let mut a = announcer(now);
+        a.schedule(&response(Some(1800), Some(600)));
+        a.complete();
+        assert_eq!(a.completion, Completion::Due);
+        assert!(a.next <= Instant::now());
+        // Only once: a download finishes a single time.
+        a.completion = Completion::Sent;
+        a.next = now + Duration::from_secs(1800);
+        a.complete();
+        assert_eq!(a.completion, Completion::Sent);
+        assert_eq!(a.next, now + Duration::from_secs(1800));
     }
 }

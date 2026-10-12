@@ -1,4 +1,4 @@
-use crate::announcer::Announcer;
+use crate::announcer::{Announcer, Transferred};
 use crate::choker::Choker;
 use crate::peer::{self, PeerConnection, PeerMessage};
 use crate::peer_pool::PeerPool;
@@ -7,13 +7,13 @@ use crate::torrent::{self, TorrentFile};
 use crate::tracker::{AnnounceEvent, AnnounceRequest};
 use crate::verify;
 use anyhow::{Result, anyhow, bail};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use rand::Rng;
 use sha1::Digest;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -58,26 +58,63 @@ const MAX_QUEUED_UPLOADS: usize = 500;
 /// Messages a worker handles from a peer that keeps sending, before it sends
 /// the next block that peer asked for.
 const MAX_MESSAGES_PER_BLOCK: usize = 16;
+/// How often a seed limit is checked, and the upload count on the progress
+/// bar brought up to date, while seeding.
+const SEED_CHECK: Duration = Duration::from_secs(1);
 
 pub struct DownloadConfig {
     pub output_dir: PathBuf,
     pub max_peers: usize,
     /// Port to listen on for incoming peers; 0 picks a free one.
     pub listen_port: u16,
+    pub seed: SeedLimits,
 }
 
-/// Everything a peer worker needs to know about the torrent.
+/// How long to keep seeding once every piece is done. Seeding stops at
+/// whichever limit is reached first; with neither, the run ends as soon as
+/// the download is complete.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SeedLimits {
+    /// Stop once we have uploaded this many times the torrent's size this
+    /// session; 0 for no ratio limit. The torrent's size rather than what we
+    /// downloaded, so that a download resumed from disk still gives back
+    /// its share.
+    pub ratio: f64,
+    /// Stop after seeding this long; zero for no time limit.
+    pub time: Duration,
+}
+
+impl SeedLimits {
+    /// Whether to seed at all once the download is complete.
+    pub fn enabled(&self) -> bool {
+        self.ratio > 0.0 || !self.time.is_zero()
+    }
+
+    /// Whether a limit is reached after uploading `uploaded` bytes of a
+    /// torrent of `size` bytes, having seeded for `seeded`.
+    fn reached(&self, uploaded: u64, size: u64, seeded: Duration) -> bool {
+        (self.ratio > 0.0 && uploaded as f64 >= self.ratio * size as f64)
+            || (!self.time.is_zero() && seeded >= self.time)
+    }
+}
+
+/// A torrent to download and seed: what the peer workers need to know about
+/// it, and how long to stay once it is complete.
 pub struct Session {
     pub torrent: TorrentFile,
     pub info_hash: [u8; 20],
     pub peer_id: [u8; 20],
     pub storage: Arc<Storage>,
+    pub seed: SeedLimits,
 }
 
-/// Downloads the torrent at `torrent_path`, stopping early (see
-/// `download_from_peers`) if `shutdown` resolves. It is first polled once
-/// the tracker has answered, so a signal handler behind it is only
-/// installed then.
+/// Downloads the torrent at `torrent_path` and seeds it for as long as
+/// `config.seed` says, stopping early (see `download_from_peers`) if
+/// `shutdown` resolves. It is first polled once the tracker has answered,
+/// so a signal handler behind it is only installed then.
+///
+/// A download that is already complete on disk exits at once, unless it is
+/// to be seeded.
 pub async fn download_file(
     torrent_path: &Path,
     config: &DownloadConfig,
@@ -100,6 +137,7 @@ pub async fn download_file(
         info_hash,
         peer_id: peer::generate_peer_id(),
         storage,
+        seed: config.seed,
     });
 
     let candidates = verify::candidates(&session.torrent, &session.storage)?;
@@ -107,7 +145,9 @@ pub async fn download_file(
     let left = session.torrent.length() - verified_bytes(&session.torrent, &have)?;
     if left == 0 {
         info!(output = %config.output_dir.display(), "already complete");
-        return Ok(());
+        if !config.seed.enabled() {
+            return Ok(());
+        }
     }
 
     let listener = listen(config.listen_port).await;
@@ -129,8 +169,9 @@ pub async fn download_file(
     };
     let tiers = session.torrent.tracker_tiers();
     let (announcer, peers) = Announcer::start(tiers, request).await?;
-    if peers.is_empty() {
-        announcer.stop(false, 0).await;
+    // A seed can wait for peers to connect to it.
+    if peers.is_empty() && left > 0 {
+        announcer.stop(&Transferred::default()).await;
         bail!("no tracker returned any peers");
     }
     info!(peers = peers.len(), "tracker announce succeeded");
@@ -145,7 +186,7 @@ pub async fn download_file(
         shutdown,
     )
     .await?;
-    info!(output = %config.output_dir.display(), "download complete");
+    info!(output = %config.output_dir.display(), "done");
     Ok(())
 }
 
@@ -178,6 +219,7 @@ pub async fn check_file(torrent_path: &Path, output_dir: &Path) -> Result<()> {
         info_hash,
         peer_id: peer::generate_peer_id(),
         storage,
+        seed: SeedLimits::default(),
     });
     let have = hash_pieces(&session, pieces).await?;
 
@@ -242,10 +284,17 @@ fn verified_bytes(torrent: &TorrentFile, have: &[bool]) -> Result<u64> {
 /// Every connected peer may download the pieces we have, as far as the
 /// choker (see `choker`) unchokes it.
 ///
+/// Once every piece is done, we seed until a limit in `session.seed` is
+/// reached (or not at all without one): workers keep serving their peers,
+/// new peers are still taken on, and running out of peers no longer ends
+/// the run. A peer that is a seed too is let go.
+///
 /// With an `announcer`, the tracker is re-announced to on its interval and
-/// the peers it returns join the pool. If we run out of peers, the tracker is
-/// asked for more once before giving up. At the end the tracker is sent
-/// `completed` (if the download finished) and `stopped`.
+/// the peers it returns join the pool. If we run out of peers while
+/// downloading, the tracker is asked for more once before giving up. The
+/// tracker is sent `completed` when the download finishes (not if it was
+/// complete from the start) and `stopped` at the end, with the bytes
+/// downloaded and uploaded.
 ///
 /// When `shutdown` resolves, no more blocks are requested and workers exit,
 /// each finishing any piece write it has started. The tracker is still sent
@@ -265,8 +314,9 @@ pub async fn download_from_peers(
     if have.len() != num_pieces {
         bail!("have {} piece flags for {num_pieces} pieces", have.len());
     }
+    let seed = session.seed;
     let swarm = Arc::new(Swarm {
-        queue: PieceQueue::new(have),
+        queue: PieceQueue::new(have).seeding(seed.enabled()),
         progress: Progress::new(torrent.length(), verified_bytes(torrent, have)?),
         connected: ConnectedPeers::default(),
         choker: Choker::default(),
@@ -307,7 +357,35 @@ pub async fn download_from_peers(
     let mut choking = std::pin::pin!(choker.run(|| queue.is_done()));
     let mut shutdown = std::pin::pin!(shutdown);
     let mut interrupted = false;
-    while !queue.is_done() {
+    // Whether the download finishes this session, rather than having been
+    // complete on disk.
+    let downloading = !queue.is_done();
+    // When we finished downloading and started seeding.
+    let mut seeding_since = None;
+    loop {
+        if queue.is_done() {
+            let since = match seeding_since {
+                Some(since) => since,
+                None => {
+                    if let Some(announcer) = announcer.as_mut().filter(|_| downloading) {
+                        announcer.complete();
+                    }
+                    if !seed.enabled() {
+                        break;
+                    }
+                    info!(ratio = seed.ratio, time = ?seed.time, "download complete, seeding");
+                    *seeding_since.insert(Instant::now())
+                }
+            };
+            let uploaded = progress.transferred.uploaded.load(Ordering::Relaxed);
+            progress
+                .bar
+                .set_message(format!("seeding, {} up", HumanBytes(uploaded)));
+            if seed.reached(uploaded, torrent.length(), since.elapsed()) {
+                info!(uploaded, "seed limit reached");
+                break;
+            }
+        }
         while workers.len() < max_peers {
             let Some(addr) = pool.next(Instant::now()) else {
                 break;
@@ -317,7 +395,7 @@ pub async fn download_from_peers(
         }
 
         let retry_at = pool.next_retry().filter(|_| workers.len() < max_peers);
-        if workers.is_empty() && retry_at.is_none() {
+        if workers.is_empty() && retry_at.is_none() && seeding_since.is_none() {
             match &mut announcer {
                 Some(announcer) if !asked_for_peers => {
                     info!("out of peers, asking the tracker for more");
@@ -367,8 +445,10 @@ pub async fn download_from_peers(
                 }
             }
             () = sleep_until_some(retry_at) => {}
-            peers = reannounce(&mut announcer, &progress.downloaded) => pool.add(peers),
+            peers = reannounce(&mut announcer, &progress.transferred) => pool.add(peers),
             () = &mut choking => {}
+            () = queue.wait_for(|| queue.is_done()), if seeding_since.is_none() => {}
+            () = tokio::time::sleep(SEED_CHECK), if seeding_since.is_some() => {}
             () = &mut shutdown => {
                 info!("interrupted, stopping");
                 interrupted = true;
@@ -397,8 +477,7 @@ pub async fn download_from_peers(
         progress.bar.abandon();
     }
     if let Some(announcer) = announcer {
-        let downloaded = progress.downloaded.load(Ordering::Relaxed);
-        announcer.stop(remaining == 0, downloaded).await;
+        announcer.stop(&progress.transferred).await;
     }
     if remaining > 0 {
         if interrupted {
@@ -487,9 +566,12 @@ impl Drop for Connected<'_> {
 
 /// Runs the next re-announce and returns its peers, or waits forever
 /// without a tracker. Cancel-safe.
-async fn reannounce(announcer: &mut Option<Announcer>, downloaded: &AtomicU64) -> Vec<SocketAddr> {
+async fn reannounce(
+    announcer: &mut Option<Announcer>,
+    transferred: &Transferred,
+) -> Vec<SocketAddr> {
     match announcer {
-        Some(announcer) => announcer.poll(downloaded).await,
+        Some(announcer) => announcer.poll(transferred).await,
         None => std::future::pending().await,
     }
 }
@@ -529,12 +611,11 @@ impl std::fmt::Display for Interrupted {
 
 impl std::error::Error for Interrupted {}
 
-/// Bytes verified and written, shown on the progress bar and reported to the
-/// tracker.
+/// Bytes verified and written, shown on the progress bar, and bytes moved
+/// either way, reported to the tracker.
 struct Progress {
     bar: ProgressBar,
-    /// Downloaded this session, not counting data already on disk.
-    downloaded: AtomicU64,
+    transferred: Transferred,
 }
 
 impl Progress {
@@ -553,13 +634,23 @@ impl Progress {
         bar.reset_eta();
         Self {
             bar,
-            downloaded: AtomicU64::new(0),
+            transferred: Transferred::default(),
         }
     }
 
+    /// Counts a verified piece.
     fn add(&self, bytes: u64) {
         self.bar.inc(bytes);
-        self.downloaded.fetch_add(bytes, Ordering::Relaxed);
+        self.transferred
+            .downloaded
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Counts a block sent to a peer.
+    fn uploaded(&self, bytes: u64) {
+        self.transferred
+            .uploaded
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 }
 
@@ -639,6 +730,10 @@ async fn peer_worker(
             pieces.update(conn.peer_has());
             has_changed = false;
         }
+        if queue.is_done() && conn.peer_has().iter().all(|&has| has) {
+            debug!(%addr, "both seeding, letting go");
+            return Ok(());
+        }
         // Interested only while the peer has a piece we still need, even if
         // another peer is downloading it right now. Any piece we hold counts.
         let wanted = !active.is_empty() || queue.wants(&pieces);
@@ -685,6 +780,7 @@ async fn peer_worker(
             if let Some(request) = uploads.pop() {
                 serve_block(&mut conn, &session.storage, request).await?;
                 slot.uploaded(request.length.into());
+                progress.uploaded(request.length.into());
             }
             messages_since_block = 0;
         }
@@ -1156,6 +1252,9 @@ struct QueueState {
     /// Set when the download stops: no more pieces are handed out, and
     /// workers exit.
     closed: bool,
+    /// Whether workers keep serving their peers once every piece is done,
+    /// until the queue is closed.
+    seed: bool,
 }
 
 impl PieceQueue {
@@ -1171,9 +1270,20 @@ impl PieceQueue {
                 have: have.to_vec(),
                 completed: Vec::new(),
                 closed: false,
+                seed: false,
             }),
             changed: Notify::new(),
         }
+    }
+
+    /// Keeps workers going once every piece is done if `seed` is set, so
+    /// they can upload to their peers, until the queue is closed.
+    fn seeding(mut self, seed: bool) -> Self {
+        self.state
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .seed = seed;
+        self
     }
 
     fn lock(&self) -> MutexGuard<'_, QueueState> {
@@ -1307,11 +1417,11 @@ impl PieceQueue {
         self.lock().closed
     }
 
-    /// Whether workers should exit: every piece is done or the queue is
-    /// closed.
+    /// Whether workers should exit: the queue is closed, or every piece is
+    /// done and we are not seeding.
     fn is_finished(&self) -> bool {
         let state = self.lock();
-        state.remaining == 0 || state.closed
+        state.closed || (state.remaining == 0 && !state.seed)
     }
 }
 
@@ -1880,6 +1990,44 @@ mod tests {
         assert_eq!(queue.completed_count(), 2);
         assert!(queue.completed_since(5).is_empty());
         assert!(!queue.has(3));
+    }
+
+    #[test]
+    fn seed_limits_stop_at_whichever_comes_first() {
+        let minute = Duration::from_secs(60);
+        let none = SeedLimits::default();
+        assert!(!none.enabled());
+        let ratio = SeedLimits {
+            ratio: 1.5,
+            time: Duration::ZERO,
+        };
+        assert!(ratio.enabled());
+        assert!(!ratio.reached(149, 100, 1000 * minute));
+        assert!(ratio.reached(150, 100, Duration::ZERO));
+        let time = SeedLimits {
+            ratio: 0.0,
+            time: minute,
+        };
+        assert!(time.enabled());
+        assert!(!time.reached(u64::MAX, 100, minute / 2));
+        assert!(time.reached(0, 100, minute));
+        let both = SeedLimits {
+            ratio: 2.0,
+            time: minute,
+        };
+        assert!(both.reached(200, 100, Duration::ZERO));
+        assert!(both.reached(0, 100, minute));
+        assert!(!both.reached(199, 100, minute / 2));
+    }
+
+    #[test]
+    fn a_seeding_queue_keeps_workers_until_closed() {
+        let queue = PieceQueue::new(&[true, true]);
+        assert!(queue.is_done() && queue.is_finished());
+        let queue = PieceQueue::new(&[true, true]).seeding(true);
+        assert!(queue.is_done() && !queue.is_finished());
+        queue.close();
+        assert!(queue.is_finished());
     }
 
     #[test]

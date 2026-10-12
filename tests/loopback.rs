@@ -1,7 +1,9 @@
 //! End-to-end downloads from mock seeders (and a mock tracker) over loopback.
 
 use rtrnt::announcer::Announcer;
-use rtrnt::download::{Interrupted, Session, download_from_peers};
+use rtrnt::download::{
+    DownloadConfig, Interrupted, SeedLimits, Session, download_file, download_from_peers,
+};
 use rtrnt::peer::{PeerMessage, generate_peer_id, handshake_bytes, parse_handshake};
 use rtrnt::storage::Storage;
 use rtrnt::torrent::{FileInfo, Info, TorrentFile};
@@ -242,12 +244,22 @@ fn test_data() -> Vec<u8> {
 }
 
 fn session(torrent: TorrentFile, info_hash: [u8; 20], out: &Path) -> Arc<Session> {
+    seeding_session(torrent, info_hash, out, SeedLimits::default())
+}
+
+fn seeding_session(
+    torrent: TorrentFile,
+    info_hash: [u8; 20],
+    out: &Path,
+    seed: SeedLimits,
+) -> Arc<Session> {
     let storage = Arc::new(Storage::new(&torrent.info, out).unwrap());
     Arc::new(Session {
         torrent,
         info_hash,
         peer_id: generate_peer_id(),
         storage,
+        seed,
     })
 }
 
@@ -1088,6 +1100,267 @@ async fn reports_events_and_progress_to_the_tracker() {
             ["stopped".into(), total, "0".into()],
         ]
     );
+}
+
+/// Asks the client over `socket` for every block of the torrent once it
+/// unchokes us, and checks what comes back.
+async fn leech_everything(socket: &mut TcpStream, data: &[u8]) {
+    send(socket, PeerMessage::Interested).await;
+    loop {
+        match next_message(socket).await {
+            Some(PeerMessage::Unchoke) => break,
+            Some(PeerMessage::Bitfield { .. } | PeerMessage::Have { .. }) => {}
+            other => panic!("expected an unchoke, got {other:?}"),
+        }
+    }
+    let mut requests = Vec::new();
+    for (index, chunk) in data.chunks(PIECE_LENGTH as usize).enumerate() {
+        for begin in (0..chunk.len()).step_by(BLOCK as usize) {
+            let length = (chunk.len() - begin).min(BLOCK as usize);
+            requests.push((index as u32, begin as u32, length as u32));
+        }
+    }
+    let messages: Vec<PeerMessage> = requests
+        .iter()
+        .map(|&(index, begin, length)| request(index, begin, length))
+        .collect();
+    send_batch(socket, &messages).await;
+    for (index, begin, length) in requests {
+        assert_eq!(
+            next_message(socket).await,
+            Some(piece(data, index, begin, length))
+        );
+    }
+}
+
+/// The `event`, `downloaded`, `uploaded` and `left` of each announce.
+fn announces(queries: &[String]) -> Vec<[String; 4]> {
+    queries
+        .iter()
+        .map(|query| {
+            let param = |key| query_param(query, key).unwrap_or("").to_string();
+            [
+                param("event"),
+                param("downloaded"),
+                param("uploaded"),
+                param("left"),
+            ]
+        })
+        .collect()
+}
+
+/// With `--seed-ratio 1`, a finished download keeps going: the tracker hears
+/// `completed` at once, a leecher that joins then downloads the whole
+/// torrent from us, and with that the run ends, reporting the upload.
+#[tokio::test]
+async fn seeds_after_completion_until_the_ratio_is_reached() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+    let total = data.len() as u64;
+
+    // A seed, so we let it go once we are one too.
+    let seeder = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seeder_addr = seeder.local_addr().unwrap();
+    let seeder_data = Arc::clone(&data);
+    tokio::spawn(async move {
+        let mut socket = accept_leecher(&seeder, info_hash, num_pieces).await;
+        send(&mut socket, PeerMessage::Unchoke).await;
+        serve(socket, &seeder_data).await;
+    });
+
+    let (tracker_url, mut queries) = mock_tracker(vec![seeder_addr]).await;
+    let request = AnnounceRequest {
+        info_hash,
+        peer_id: generate_peer_id(),
+        port: 6881,
+        uploaded: 0,
+        downloaded: 0,
+        left: total,
+        event: AnnounceEvent::Started,
+    };
+    let (announcer, peers) = Announcer::start(vec![vec![tracker_url]], request)
+        .await
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let our_addr = listener.local_addr().unwrap();
+    let leecher_data = Arc::clone(&data);
+    let leecher = tokio::spawn(async move {
+        // Joins once the tracker has heard that we finished.
+        let mut seen = Vec::new();
+        while let Some(query) = queries.recv().await {
+            let completed = query_param(&query, "event") == Some("completed");
+            seen.push(query);
+            if completed {
+                break;
+            }
+        }
+        let mut socket = connect_to(our_addr, info_hash).await;
+        leech_everything(&mut socket, &leecher_data).await;
+        assert_eq!(next_message(&mut socket).await, None, "still seeding");
+        (seen, queries)
+    });
+
+    let out = tempfile::tempdir().unwrap();
+    let seed = SeedLimits {
+        ratio: 1.0,
+        time: Duration::ZERO,
+    };
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        download_from_peers(
+            seeding_session(torrent, info_hash, out.path(), seed),
+            &vec![false; num_pieces],
+            &peers,
+            10,
+            Some(listener),
+            Some(announcer),
+            pending(),
+        ),
+    )
+    .await
+    .expect("seeding did not stop")
+    .expect("download failed");
+    assert_files_match(out.path(), &data);
+
+    let (mut seen, mut queries) = leecher.await.unwrap();
+    while let Ok(query) = queries.try_recv() {
+        seen.push(query);
+    }
+    let (total, zero) = (total.to_string(), "0".to_string());
+    assert_eq!(
+        announces(&seen),
+        [
+            ["started".into(), zero.clone(), zero.clone(), total.clone()],
+            [
+                "completed".into(),
+                total.clone(),
+                zero.clone(),
+                zero.clone()
+            ],
+            ["stopped".into(), total.clone(), total, zero],
+        ]
+    );
+}
+
+/// `download_file` on a download that is already complete, with a seed
+/// ratio: it announces itself as a seed, waits for peers though the tracker
+/// has none, and serves the one that finds it through the port it
+/// announced. The tracker never hears `completed`.
+#[tokio::test]
+async fn seeds_a_download_that_is_already_complete() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (mut torrent, info_hash) = make_torrent(&data);
+    let total = data.len() as u64;
+
+    let (tracker_url, mut queries) = mock_tracker(Vec::new()).await;
+    torrent.announce = Some(tracker_url);
+    let out = tempfile::tempdir().unwrap();
+    write_files(out.path(), &data);
+    let torrent_path = out.path().join("multi.torrent");
+    std::fs::write(&torrent_path, serde_bencode::to_bytes(&torrent).unwrap()).unwrap();
+
+    let leecher_data = Arc::clone(&data);
+    let leecher = tokio::spawn(async move {
+        let started = queries.recv().await.unwrap();
+        let port: u16 = query_param(&started, "port").unwrap().parse().unwrap();
+        let mut socket = connect_to(SocketAddr::from(([127, 0, 0, 1], port)), info_hash).await;
+        leech_everything(&mut socket, &leecher_data).await;
+        assert_eq!(next_message(&mut socket).await, None, "still seeding");
+        (vec![started], queries)
+    });
+
+    let config = DownloadConfig {
+        output_dir: out.path().to_path_buf(),
+        max_peers: 10,
+        listen_port: 0,
+        seed: SeedLimits {
+            ratio: 1.0,
+            time: Duration::ZERO,
+        },
+    };
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        download_file(&torrent_path, &config, pending()),
+    )
+    .await
+    .expect("seeding did not stop")
+    .expect("seeding failed");
+
+    let (mut seen, mut queries) = leecher.await.unwrap();
+    while let Ok(query) = queries.try_recv() {
+        seen.push(query);
+    }
+    let (total, zero) = (total.to_string(), "0".to_string());
+    assert_eq!(
+        announces(&seen),
+        [
+            ["started".into(), zero.clone(), zero.clone(), zero.clone()],
+            ["stopped".into(), zero.clone(), total, zero],
+        ]
+    );
+}
+
+/// With only a time limit and nobody to upload to, seeding lasts until the
+/// time is up rather than ending when we run out of peers. A shutdown while
+/// seeding ends the run successfully.
+#[tokio::test]
+async fn seeding_ends_when_the_time_is_up_or_on_shutdown() {
+    init_tracing();
+    let data = test_data();
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+    let out = tempfile::tempdir().unwrap();
+    write_files(out.path(), &data);
+
+    let limit = Duration::from_millis(300);
+    let seed = SeedLimits {
+        ratio: 0.0,
+        time: limit,
+    };
+    let session = seeding_session(torrent, info_hash, out.path(), seed);
+    let started = tokio::time::Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        download_from_peers(
+            Arc::clone(&session),
+            &vec![true; num_pieces],
+            &[],
+            10,
+            None,
+            None,
+            pending(),
+        ),
+    )
+    .await
+    .expect("seeding did not stop")
+    .expect("seeding failed");
+    assert!(started.elapsed() >= limit);
+
+    let forever = SeedLimits {
+        ratio: 1000.0,
+        time: Duration::ZERO,
+    };
+    let (torrent, _) = make_torrent(&data);
+    let session = seeding_session(torrent, info_hash, out.path(), forever);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        download_from_peers(
+            session,
+            &vec![true; num_pieces],
+            &[],
+            10,
+            None,
+            None,
+            tokio::time::sleep(limit),
+        ),
+    )
+    .await
+    .expect("shutdown did not stop seeding")
+    .expect("a shutdown while seeding is a success");
 }
 
 /// Interrupted after one piece: the download stops with `Interrupted`, the
