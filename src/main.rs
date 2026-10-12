@@ -54,6 +54,9 @@ struct Args {
     /// on Ctrl-C; with neither, the run ends at completion
     #[arg(long, default_value_t = 0, value_name = "MINUTES")]
     seed_time: u64,
+    /// Do not look for peers in the DHT, only ask the trackers
+    #[arg(long)]
+    no_dht: bool,
 }
 
 /// Parses `--seed-ratio`, which must be a finite number, 0 or more.
@@ -95,6 +98,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         ratio: args.seed_ratio,
         time: Duration::from_secs(args.seed_time.saturating_mul(60)),
     };
+    config.dht = !args.no_dht;
     // clap requires the torrent unless --print-config is given.
     let torrent = args.torrent.context("no torrent given")?;
 

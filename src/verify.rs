@@ -213,6 +213,7 @@ mod tests {
                 name: "root".into(),
                 piece_length: PIECE_LENGTH as u64,
                 pieces: ByteBuf::from(pieces),
+                private: None,
                 length: None,
                 files: Some(vec![
                     FileInfo {

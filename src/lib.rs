@@ -4,6 +4,7 @@ pub mod announcer;
 pub mod bencode;
 mod choker;
 pub mod config;
+pub mod dht;
 pub mod download;
 pub mod extension;
 pub mod peer;

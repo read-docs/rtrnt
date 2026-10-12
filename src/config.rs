@@ -52,6 +52,7 @@ impl Options {
             listen_port: self.port.unwrap_or(peer::DEFAULT_LISTEN_PORT),
             // Only set on the command line for now.
             seed: SeedLimits::default(),
+            dht: true,
         }
     }
 }

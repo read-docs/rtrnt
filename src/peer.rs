@@ -20,6 +20,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(90);
 const PROTOCOL: &[u8; 19] = b"BitTorrent protocol";
 const PEER_ID_PREFIX: &[u8; 8] = b"-RT0100-";
+/// Reserved handshake bit saying we run a DHT node (BEP 5): the last bit of
+/// the last reserved byte.
+const RESERVED_DHT: u8 = 0x01;
 
 /// Azureus-style peer id: client prefix plus 12 random alphanumerics.
 pub fn generate_peer_id() -> [u8; 20] {
@@ -242,9 +245,10 @@ pub fn handshake_bytes(info_hash: &[u8; 20], peer_id: &[u8; 20]) -> [u8; 68] {
     let mut handshake = [0u8; 68];
     handshake[0] = PROTOCOL.len() as u8;
     handshake[1..20].copy_from_slice(PROTOCOL);
-    // Bytes 20..28 are reserved extension bits. We only set the extension
-    // protocol's (BEP 10).
+    // Bytes 20..28 are reserved extension bits. We set the extension
+    // protocol's (BEP 10) and the DHT's (BEP 5).
     handshake[20 + extension::RESERVED_BYTE] |= extension::RESERVED_BIT;
+    handshake[27] |= RESERVED_DHT;
     handshake[28..48].copy_from_slice(info_hash);
     handshake[48..68].copy_from_slice(peer_id);
     handshake
@@ -262,6 +266,12 @@ impl Handshake {
     /// Whether the peer supports the extension protocol (BEP 10).
     pub fn supports_extensions(&self) -> bool {
         self.reserved[extension::RESERVED_BYTE] & extension::RESERVED_BIT != 0
+    }
+
+    /// Whether the peer runs a DHT node (BEP 5), and so wants our `Port`
+    /// message.
+    pub fn supports_dht(&self) -> bool {
+        self.reserved[7] & RESERVED_DHT != 0
     }
 }
 
@@ -301,6 +311,8 @@ pub struct PeerConnection {
     read_buf: BytesMut,
     pub addr: SocketAddr,
     pub peer_id: [u8; 20],
+    /// Whether the peer runs a DHT node.
+    dht: bool,
     peer_choking: bool,
     peer_has: Vec<bool>,
     am_interested: bool,
@@ -384,6 +396,7 @@ impl PeerConnection {
             read_buf: BytesMut::with_capacity(32 * 1024),
             addr,
             peer_id: handshake.peer_id,
+            dht: handshake.supports_dht(),
             peer_choking: true,
             peer_has: vec![false; num_pieces],
             am_interested: false,
@@ -439,6 +452,11 @@ impl PeerConnection {
             .and_then(|handshake| handshake.id(name))
             .ok_or_else(|| anyhow!("peer does not support the {name} extension"))?;
         self.send(&PeerMessage::Extended { id, payload }).await
+    }
+
+    /// Whether the peer runs a DHT node, and so wants our `Port` message.
+    pub fn supports_dht(&self) -> bool {
+        self.dht
     }
 
     pub fn is_choked(&self) -> bool {
@@ -683,10 +701,11 @@ mod tests {
         assert!(peer_id[8..].iter().all(u8::is_ascii_alphanumeric));
 
         let handshake = handshake_bytes(&info_hash, &peer_id);
-        assert_eq!(handshake[20..28], [0, 0, 0, 0, 0, 0x10, 0, 0]);
+        assert_eq!(handshake[20..28], [0, 0, 0, 0, 0, 0x10, 0, 0x01]);
         let parsed = parse_handshake(&handshake, &info_hash).unwrap();
         assert_eq!(parsed.peer_id, peer_id);
         assert!(parsed.supports_extensions());
+        assert!(parsed.supports_dht());
         assert!(parse_handshake(&handshake, &[4u8; 20]).is_err());
 
         let mut bad = handshake;
@@ -736,6 +755,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!conn.supports_extensions());
+        assert!(conn.supports_dht());
         conn.keep_alive().await.unwrap();
         conn.set_interested(false).await.unwrap();
         conn.set_interested(true).await.unwrap();
@@ -860,6 +880,7 @@ mod tests {
             if let Ok(conn) = &result {
                 assert_eq!(conn.peer_id, theirs);
                 assert_eq!(conn.addr, from);
+                assert!(conn.supports_dht());
             }
             drop(result);
             let reply = remote.await.unwrap();

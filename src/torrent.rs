@@ -28,6 +28,10 @@ pub struct Info {
     #[serde(rename = "piece length")]
     pub piece_length: u64,
     pub pieces: ByteBuf,
+    /// `1` for a private torrent (BEP 27): its peers come from its trackers
+    /// only, never from the DHT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub length: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -50,6 +54,11 @@ impl TorrentFile {
                 .map(|files| files.iter().map(|f| f.length).sum())
                 .unwrap_or(0)
         })
+    }
+
+    /// Whether the torrent is private (BEP 27).
+    pub fn is_private(&self) -> bool {
+        self.info.private == Some(1)
     }
 
     pub fn num_pieces(&self) -> usize {
@@ -162,6 +171,7 @@ mod tests {
                 name: "file".into(),
                 piece_length,
                 pieces: ByteBuf::from(vec![0u8; pieces * 20]),
+                private: None,
                 length: Some(length),
                 files: None,
             },
@@ -225,6 +235,7 @@ mod tests {
 
         let (torrent, hash) = parse(&data).unwrap();
         assert_eq!(torrent.info.name, "file");
+        assert!(torrent.is_private());
         assert_eq!(torrent.tracker_tiers(), [["http://x"]]);
         let expected: [u8; 20] = sha1::Sha1::digest(&info).into();
         assert_eq!(hash, expected);
