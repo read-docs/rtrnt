@@ -20,8 +20,17 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 const BLOCK_SIZE: u32 = 16 * 1024;
-/// Block requests kept in flight per peer.
-const PIPELINE: usize = 16;
+/// Block requests in flight to a new peer, before its rate is known.
+const INITIAL_PIPELINE: usize = 4;
+const MIN_PIPELINE: usize = 2;
+/// Many clients drop requests beyond a few hundred queued. The extension
+/// handshake (BEP 10 `reqq`) would tell us a peer's real limit.
+const MAX_PIPELINE: usize = 250;
+/// The pipeline holds about this much of a peer's measured throughput, so
+/// the peer never runs dry while our next requests are on their way.
+const PIPELINE_QUEUE_TIME: Duration = Duration::from_secs(3);
+/// How long the download rate is measured before the depth is resized.
+const RATE_WINDOW: Duration = Duration::from_secs(1);
 /// Peers that send this many corrupt pieces are dropped.
 const MAX_HASH_FAILURES: u32 = 3;
 /// A peer that has no piece we need for this long is dropped.
@@ -261,15 +270,27 @@ async fn peer_worker(
     debug!(%addr, "connected");
 
     let mut pieces = queue.register_peer();
+    // Pieces we hold a claim on, with requests spread over all of them so the
+    // pipeline does not drain at every piece boundary.
+    let mut active: Vec<ActivePiece<'_>> = Vec::new();
+    let mut pipeline = Pipeline::new(Instant::now());
     let mut hash_failures = 0;
     let mut last_useful = Instant::now();
     // Set while we are interested but choked.
     let mut unchoke_deadline = None;
-    while !queue.is_done() {
-        pieces.update(conn.peer_has());
+    let mut has_changed = true;
+    loop {
+        drop_completed(&mut conn, &mut active).await?;
+        if queue.is_done() {
+            return Ok(());
+        }
+        if has_changed {
+            pieces.update(conn.peer_has());
+            has_changed = false;
+        }
         // Interested only while the peer has a piece we still need, even if
-        // another peer is downloading it right now.
-        let wanted = queue.wants(&pieces);
+        // another peer is downloading it right now. Any piece we hold counts.
+        let wanted = !active.is_empty() || queue.wants(&pieces);
         conn.set_interested(wanted).await?;
         let now = Instant::now();
         if wanted {
@@ -280,13 +301,21 @@ async fn peer_worker(
             Some(deadline) => Some(deadline),
             None => Some(now + UNCHOKE_TIMEOUT),
         };
+        if !conn.is_choked() {
+            request_blocks(
+                &mut conn,
+                queue,
+                &pieces,
+                torrent,
+                &mut active,
+                &mut pipeline,
+            )
+            .await?;
+        }
 
-        let claim = if conn.is_choked() {
-            None
-        } else {
-            queue.claim(&pieces)
-        };
-        let Some(claim) = claim else {
+        // `receive` and `receive_untimed` are cancel-safe, so losing a race
+        // loses no data.
+        let message = if active.is_empty() {
             if unchoke_deadline.is_some_and(|deadline| now >= deadline) {
                 bail!("peer did not unchoke us");
             }
@@ -295,26 +324,64 @@ async fn peer_worker(
             }
             conn.keep_alive().await?;
             // Wait for an unchoke, for a piece to be returned or completed,
-            // or for the peer to announce a new piece. `receive_untimed` is
-            // cancel-safe.
+            // or for the peer to announce a new piece.
             tokio::select! {
-                _ = queue.changed.notified() => {}
-                message = conn.receive_untimed() => { message?; }
-                _ = tokio::time::sleep(IDLE_POLL) => {}
+                _ = queue.changed.notified() => None,
+                message = conn.receive_untimed() => Some(message?),
+                _ = tokio::time::sleep(IDLE_POLL) => None,
             }
+        } else {
+            conn.keep_alive().await?;
+            let completed_elsewhere = || active.iter().any(|piece| piece.claim.is_completed());
+            tokio::select! {
+                message = conn.receive() => Some(message?),
+                () = queue.wait_for(completed_elsewhere) => None,
+            }
+        };
+        let Some(message) = message else {
             continue;
         };
 
-        let index = claim.index;
-        let piece_len = torrent.piece_len(index)?;
-        let hash = torrent.piece_hash(index)?;
-        match download_piece(&mut conn, &claim, piece_len, &hash).await {
-            Ok(data) => {
+        match message {
+            PeerMessage::Have { .. } | PeerMessage::Bitfield { .. } => has_changed = true,
+            // Dropping the claims returns the pieces; the next turn waits for
+            // an unchoke.
+            PeerMessage::Choke if !active.is_empty() => {
+                debug!(%addr, pieces = active.len(), "choked mid-download");
+                active.clear();
+            }
+            PeerMessage::Piece {
+                index,
+                begin,
+                block,
+            } => {
+                // Blocks of pieces we no longer hold are late replies to
+                // requests abandoned on a choke or cancelled in endgame.
+                let Some(pos) = active.iter().position(|piece| piece.index == index) else {
+                    continue;
+                };
+                if !active[pos].add_block(begin, &block)? {
+                    continue;
+                }
+                pipeline.received(block.len() as u64, Instant::now());
+                if !active[pos].is_complete() {
+                    continue;
+                }
+                let index = active[pos].claim.index;
+                let Some((claim, data)) = active.swap_remove(pos).verify() else {
+                    hash_failures += 1;
+                    warn!(%addr, index, "piece failed hash check");
+                    if hash_failures >= MAX_HASH_FAILURES {
+                        bail!(Misbehaved("too many corrupt pieces"));
+                    }
+                    continue;
+                };
                 // In endgame another peer may have finished it meanwhile. If
                 // both pass this check, both write the same verified bytes.
                 if claim.is_completed() {
                     continue;
                 }
+                let piece_len = data.len() as u64;
                 session.storage.write_piece(index, data).await?;
                 if claim.complete() {
                     *pieces_done += 1;
@@ -322,142 +389,218 @@ async fn peer_worker(
                     debug!(%addr, index, "piece complete");
                 }
             }
-            Err(PieceError::CompletedElsewhere) => {
-                debug!(%addr, index, "piece completed by another peer");
-            }
-            // The claim is dropped, returning the piece, and the next turn
-            // waits for an unchoke.
-            Err(PieceError::Choked) => debug!(%addr, index, "choked mid-piece"),
-            Err(PieceError::HashMismatch) => {
-                hash_failures += 1;
-                warn!(%addr, index, "piece failed hash check");
-                if hash_failures >= MAX_HASH_FAILURES {
-                    bail!(Misbehaved("too many corrupt pieces"));
-                }
-            }
-            Err(PieceError::Other(e)) => return Err(e),
+            _ => {}
         }
+    }
+}
+
+/// Tops up the requests in flight to the pipeline depth, claiming another
+/// piece whenever every block of the held ones has been requested.
+async fn request_blocks<'q>(
+    conn: &mut PeerConnection,
+    queue: &'q PieceQueue,
+    pieces: &PeerPieces<'_>,
+    torrent: &TorrentFile,
+    active: &mut Vec<ActivePiece<'q>>,
+    pipeline: &mut Pipeline,
+) -> Result<()> {
+    let in_flight: usize = active.iter().map(ActivePiece::in_flight).sum();
+    if in_flight == 0 {
+        // Time spent choked or with nothing to ask for says nothing about
+        // the peer's speed.
+        pipeline.restart(Instant::now());
+    }
+    let mut requests = Vec::new();
+    while in_flight + requests.len() < pipeline.depth() {
+        let pos = match active.iter().position(ActivePiece::has_unrequested) {
+            Some(pos) => pos,
+            None => {
+                let held: Vec<usize> = active.iter().map(|piece| piece.claim.index).collect();
+                let Some(claim) = queue.claim(pieces, &held) else {
+                    break;
+                };
+                let piece_len = torrent.piece_len(claim.index)?;
+                let hash = torrent.piece_hash(claim.index)?;
+                active.push(ActivePiece::new(claim, piece_len, hash)?);
+                active.len() - 1
+            }
+        };
+        requests.push(active[pos].request_next());
+    }
+    if !requests.is_empty() {
+        conn.send_all(&requests).await?;
     }
     Ok(())
 }
 
-#[derive(Debug)]
-enum PieceError {
-    /// The peer choked us; outstanding requests were discarded.
-    Choked,
-    /// Another peer completed the piece first (endgame); outstanding
-    /// requests were cancelled.
-    CompletedElsewhere,
-    HashMismatch,
-    Other(anyhow::Error),
-}
-
-impl From<anyhow::Error> for PieceError {
-    fn from(e: anyhow::Error) -> Self {
-        PieceError::Other(e)
-    }
-}
-
-/// Downloads one piece with up to `PIPELINE` block requests in flight.
-/// Gives up early, cancelling outstanding requests, if another peer
-/// completes the piece first.
-async fn download_piece(
+/// Lets go of held pieces that another worker has completed (endgame),
+/// cancelling the requests still outstanding for them.
+async fn drop_completed(
     conn: &mut PeerConnection,
-    claim: &PieceClaim<'_>,
-    piece_len: u64,
-    expected_hash: &[u8; 20],
-) -> Result<Vec<u8>, PieceError> {
-    let piece_index = u32::try_from(claim.index).map_err(|_| anyhow!("piece index too large"))?;
-    let piece_len = u32::try_from(piece_len).map_err(|_| anyhow!("piece too large"))?;
-    let num_blocks = piece_len.div_ceil(BLOCK_SIZE) as usize;
-    let block_len = |block: usize| {
+    active: &mut Vec<ActivePiece<'_>>,
+) -> Result<()> {
+    let mut cancels = Vec::new();
+    active.retain(|piece| {
+        let completed = piece.claim.is_completed();
+        if completed {
+            debug!(addr = %conn.addr, index = piece.claim.index, "piece completed by another peer");
+            cancels.extend(piece.cancels());
+        }
+        !completed
+    });
+    if !cancels.is_empty() {
+        conn.send_all(&cancels).await?;
+    }
+    Ok(())
+}
+
+/// Sizes a peer's request pipeline to its measured download rate, so that
+/// about `PIPELINE_QUEUE_TIME` worth of blocks is always on its way.
+///
+/// A deeper pipeline lets more data arrive per round trip, so the measured
+/// rate grows until the link is the limit, and the depth follows it: a fast
+/// peer gets a deep queue, a slow one a short queue (and so holds fewer
+/// pieces hostage).
+struct Pipeline {
+    depth: usize,
+    window_start: Instant,
+    window_bytes: u64,
+}
+
+impl Pipeline {
+    fn new(now: Instant) -> Self {
+        Self {
+            depth: INITIAL_PIPELINE,
+            window_start: now,
+            window_bytes: 0,
+        }
+    }
+
+    fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Starts a fresh measurement window, keeping the current depth.
+    fn restart(&mut self, now: Instant) {
+        self.window_start = now;
+        self.window_bytes = 0;
+    }
+
+    /// Counts a received block. Once `RATE_WINDOW` has passed, the depth is
+    /// resized to the rate over the window.
+    fn received(&mut self, bytes: u64, now: Instant) {
+        self.window_bytes += bytes;
+        let elapsed = now.saturating_duration_since(self.window_start).as_millis();
+        if elapsed < RATE_WINDOW.as_millis() {
+            return;
+        }
+        // rate * queue time / block size, in whole blocks.
+        let blocks = (u128::from(self.window_bytes) * PIPELINE_QUEUE_TIME.as_millis())
+            .div_ceil(elapsed * u128::from(BLOCK_SIZE));
+        self.depth = usize::try_from(blocks)
+            .unwrap_or(MAX_PIPELINE)
+            .clamp(MIN_PIPELINE, MAX_PIPELINE);
+        self.restart(now);
+    }
+}
+
+/// A claimed piece being downloaded. Blocks are requested in order, so the
+/// ones before `next_request` have been asked for.
+struct ActivePiece<'a> {
+    claim: PieceClaim<'a>,
+    /// `claim.index` as sent on the wire.
+    index: u32,
+    hash: [u8; 20],
+    data: Vec<u8>,
+    received: Vec<bool>,
+    next_request: usize,
+    /// Blocks received, all before `next_request`.
+    done: usize,
+}
+
+impl<'a> ActivePiece<'a> {
+    fn new(claim: PieceClaim<'a>, piece_len: u64, hash: [u8; 20]) -> Result<Self> {
+        let index = u32::try_from(claim.index).map_err(|_| anyhow!("piece index too large"))?;
+        let piece_len = u32::try_from(piece_len).map_err(|_| anyhow!("piece too large"))?;
+        Ok(Self {
+            claim,
+            index,
+            hash,
+            data: vec![0u8; piece_len as usize],
+            received: vec![false; piece_len.div_ceil(BLOCK_SIZE) as usize],
+            next_request: 0,
+            done: 0,
+        })
+    }
+
+    fn block_len(&self, block: usize) -> u32 {
         let begin = block as u32 * BLOCK_SIZE;
-        BLOCK_SIZE.min(piece_len - begin)
-    };
+        BLOCK_SIZE.min(self.data.len() as u32 - begin)
+    }
 
-    let mut data = vec![0u8; piece_len as usize];
-    let mut received = vec![false; num_blocks];
-    let mut next_request = 0;
-    let mut in_flight = 0;
-    let mut done = 0;
+    /// Requests sent and not yet answered.
+    fn in_flight(&self) -> usize {
+        self.next_request - self.done
+    }
 
-    while done < num_blocks {
-        conn.keep_alive().await?;
-        let mut requests = Vec::new();
-        while in_flight < PIPELINE && next_request < num_blocks {
-            requests.push(PeerMessage::Request {
-                index: piece_index,
-                begin: next_request as u32 * BLOCK_SIZE,
-                length: block_len(next_request),
-            });
-            next_request += 1;
-            in_flight += 1;
-        }
-        if !requests.is_empty() {
-            conn.send_all(&requests).await?;
-        }
+    fn has_unrequested(&self) -> bool {
+        self.next_request < self.received.len()
+    }
 
-        // `receive` is cancel-safe, so losing the race loses no data.
-        let message = tokio::select! {
-            message = conn.receive() => Some(message?),
-            () = claim.completed_elsewhere() => None,
-        };
-        let Some(message) = message else {
-            let cancels: Vec<PeerMessage> = (0..next_request)
-                .filter(|&block| !received[block])
-                .map(|block| PeerMessage::Cancel {
-                    index: piece_index,
-                    begin: block as u32 * BLOCK_SIZE,
-                    length: block_len(block),
-                })
-                .collect();
-            if !cancels.is_empty() {
-                conn.send_all(&cancels).await?;
-            }
-            return Err(PieceError::CompletedElsewhere);
-        };
-        match message {
-            PeerMessage::Piece {
-                index,
-                begin,
-                block,
-            } if index == piece_index => {
-                let block_index = (begin / BLOCK_SIZE) as usize;
-                if begin % BLOCK_SIZE != 0
-                    || block_index >= num_blocks
-                    || block.len() != block_len(block_index) as usize
-                {
-                    return Err(anyhow!(Misbehaved("peer sent an invalid block")).into());
-                }
-                // A late reply to a request abandoned on a choke, for a block
-                // we have not asked for again yet. Ignore it rather than
-                // dropping an honest peer.
-                if block_index >= next_request {
-                    continue;
-                }
-                // Saturating: after a choke, late replies to the abandoned
-                // requests can arrive alongside replies to the new ones.
-                in_flight = in_flight.saturating_sub(1);
-                if received[block_index] {
-                    continue;
-                }
-                let start = begin as usize;
-                data[start..start + block.len()].copy_from_slice(&block);
-                received[block_index] = true;
-                done += 1;
-            }
-            PeerMessage::Choke => return Err(PieceError::Choked),
-            // Blocks of other pieces are late replies to abandoned requests;
-            // Have/Bitfield were already applied by `receive`.
-            _ => {}
+    /// The request for the next block. Call only if `has_unrequested`.
+    fn request_next(&mut self) -> PeerMessage {
+        let block = self.next_request;
+        self.next_request += 1;
+        PeerMessage::Request {
+            index: self.index,
+            begin: block as u32 * BLOCK_SIZE,
+            length: self.block_len(block),
         }
     }
 
-    let actual: [u8; 20] = sha1::Sha1::digest(&data).into();
-    if &actual != expected_hash {
-        return Err(PieceError::HashMismatch);
+    /// Cancels for every request still outstanding.
+    fn cancels(&self) -> impl Iterator<Item = PeerMessage> + '_ {
+        (0..self.next_request)
+            .filter(|&block| !self.received[block])
+            .map(|block| PeerMessage::Cancel {
+                index: self.index,
+                begin: block as u32 * BLOCK_SIZE,
+                length: self.block_len(block),
+            })
     }
-    Ok(data)
+
+    /// Stores a block of this piece. Returns false if it was not one we are
+    /// waiting for: a duplicate, or a late reply to a request abandoned on a
+    /// choke for a block we have not asked for again yet. Those are ignored
+    /// rather than dropping an honest peer.
+    fn add_block(&mut self, begin: u32, block: &[u8]) -> Result<bool> {
+        let index = (begin / BLOCK_SIZE) as usize;
+        if !begin.is_multiple_of(BLOCK_SIZE)
+            || index >= self.received.len()
+            || block.len() != self.block_len(index) as usize
+        {
+            bail!(Misbehaved("peer sent an invalid block"));
+        }
+        if index >= self.next_request || self.received[index] {
+            return Ok(false);
+        }
+        let start = begin as usize;
+        self.data[start..start + block.len()].copy_from_slice(block);
+        self.received[index] = true;
+        self.done += 1;
+        Ok(true)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.done == self.received.len()
+    }
+
+    /// The claim and data of a complete piece, or `None` if the data does
+    /// not match the piece hash (dropping the claim).
+    fn verify(self) -> Option<(PieceClaim<'a>, Vec<u8>)> {
+        let actual: [u8; 20] = sha1::Sha1::digest(&self.data).into();
+        (actual == self.hash).then_some((self.claim, self.data))
+    }
 }
 
 /// Pieces not yet downloaded, shared between all peer workers.
@@ -513,13 +656,18 @@ impl PieceQueue {
     /// peer can no longer hold up the end of the download.
     ///
     /// The piece goes back to the queue when its last claim is dropped
-    /// without `complete()`.
-    fn claim(&self, peer: &PeerPieces<'_>) -> Option<PieceClaim<'_>> {
+    /// without `complete()`. Pieces in `held`, which the caller already
+    /// claimed, are never duplicated.
+    fn claim(&self, peer: &PeerPieces<'_>, held: &[usize]) -> Option<PieceClaim<'_>> {
         let mut guard = self.lock();
         let state = &mut *guard;
         let mut rng = rand::rng();
         let index = if state.pending.is_empty() {
-            let candidates = state.in_flight.iter().map(|(&i, &holders)| (i, holders));
+            let candidates = state
+                .in_flight
+                .iter()
+                .filter(|(i, _)| !held.contains(i))
+                .map(|(&i, &holders)| (i, holders));
             let index = pick_least(candidates, &peer.has, &mut rng)?;
             let holders = state.in_flight.entry(index).or_insert(0);
             *holders += 1;
@@ -549,6 +697,21 @@ impl PieceQueue {
         let state = self.lock();
         let has = |i: &usize| peer.has.get(*i).copied().unwrap_or(false);
         state.pending.iter().any(has) || state.in_flight.keys().any(has)
+    }
+
+    /// Resolves once `done` returns true, checking again whenever a piece is
+    /// returned or completed.
+    async fn wait_for(&self, mut done: impl FnMut() -> bool) {
+        loop {
+            let mut changed = std::pin::pin!(self.changed.notified());
+            // Register before checking, so a change in between still wakes
+            // us.
+            changed.as_mut().enable();
+            if done() {
+                return;
+            }
+            changed.await;
+        }
     }
 
     fn remaining(&self) -> usize {
@@ -588,20 +751,6 @@ impl PieceClaim<'_> {
         // While a claim exists its piece is never pending, so it is either
         // in flight or done.
         !self.queue.lock().in_flight.contains_key(&self.index)
-    }
-
-    /// Resolves once another worker has completed this piece.
-    async fn completed_elsewhere(&self) {
-        loop {
-            let mut changed = std::pin::pin!(self.queue.changed.notified());
-            // Register before checking, so a completion in between still
-            // wakes us.
-            changed.as_mut().enable();
-            if self.is_completed() {
-                return;
-            }
-            changed.await;
-        }
     }
 }
 
@@ -714,8 +863,6 @@ mod tests {
 
     use rand::SeedableRng;
     use rand::rngs::StdRng;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
 
     fn peer<'a>(queue: &'a PieceQueue, has: &[bool]) -> PeerPieces<'a> {
         let mut peer = queue.register_peer();
@@ -730,31 +877,31 @@ mod tests {
     #[test]
     fn claims_only_pieces_the_peer_has() {
         let queue = PieceQueue::new(3);
-        assert!(queue.claim(&peer(&queue, &[false; 3])).is_none());
+        assert!(queue.claim(&peer(&queue, &[false; 3]), &[]).is_none());
         let partial = peer(&queue, &[false, true, true]);
-        let claim = queue.claim(&partial).unwrap();
-        let second = queue.claim(&partial).unwrap();
+        let claim = queue.claim(&partial, &[]).unwrap();
+        let second = queue.claim(&partial, &[]).unwrap();
         let mut claimed = [claim.index, second.index];
         claimed.sort();
         assert_eq!(claimed, [1, 2]);
-        assert!(queue.claim(&partial).is_none());
+        assert!(queue.claim(&partial, &[]).is_none());
         drop(second);
         claim.complete();
         assert_eq!(queue.remaining(), 2);
         // Piece 0 is now the rarest: only `full` has it.
         let full = peer(&queue, &[true; 3]);
-        assert_eq!(queue.claim(&full).unwrap().index, 0);
+        assert_eq!(queue.claim(&full, &[]).unwrap().index, 0);
     }
 
     #[test]
     fn dropped_claim_returns_piece() {
         let queue = PieceQueue::new(1);
         let seed = peer(&queue, &[true]);
-        drop(queue.claim(&seed).unwrap());
-        let claim = queue.claim(&seed).unwrap();
+        drop(queue.claim(&seed, &[]).unwrap());
+        let claim = queue.claim(&seed, &[]).unwrap();
         claim.complete();
         assert!(queue.is_done());
-        assert!(queue.claim(&seed).is_none());
+        assert!(queue.claim(&seed, &[]).is_none());
     }
 
     #[test]
@@ -764,9 +911,9 @@ mod tests {
         let _b = peer(&queue, &[true, false, false, true]);
         let seed = peer(&queue, &[true; 4]);
         assert_eq!(availability(&queue), [3, 2, 1, 3]);
-        let first = queue.claim(&seed).unwrap();
+        let first = queue.claim(&seed, &[]).unwrap();
         assert_eq!(first.index, 2);
-        let second = queue.claim(&seed).unwrap();
+        let second = queue.claim(&seed, &[]).unwrap();
         assert_eq!(second.index, 1);
     }
 
@@ -796,13 +943,13 @@ mod tests {
         assert!(queue.wants(&b));
 
         // In flight with another peer still counts: endgame may need it.
-        let claim = queue.claim(&b).unwrap();
+        let claim = queue.claim(&b, &[]).unwrap();
         assert_eq!(claim.index, 1);
         assert!(queue.wants(&b));
         assert!(claim.complete());
         assert!(!queue.wants(&b));
         assert!(queue.wants(&a));
-        queue.claim(&a).unwrap().complete();
+        queue.claim(&a, &[]).unwrap().complete();
         assert!(!queue.wants(&a));
     }
 
@@ -840,12 +987,12 @@ mod tests {
     fn endgame_duplicates_in_flight_pieces() {
         let queue = PieceQueue::new(2);
         let seed = peer(&queue, &[true; 2]);
-        let a = queue.claim(&seed).unwrap();
-        let b = queue.claim(&seed).unwrap();
+        let a = queue.claim(&seed, &[]).unwrap();
+        let b = queue.claim(&seed, &[]).unwrap();
         // Nothing pending: further claims join in-flight pieces, spreading
         // over the one with the fewest downloaders.
-        let c = queue.claim(&seed).unwrap();
-        let d = queue.claim(&seed).unwrap();
+        let c = queue.claim(&seed, &[]).unwrap();
+        let d = queue.claim(&seed, &[]).unwrap();
         assert_ne!(c.index, d.index);
         let (first, dup) = if c.index == a.index { (a, c) } else { (b, c) };
 
@@ -855,7 +1002,7 @@ mod tests {
         assert!(!dup.complete(), "a piece must only be completed once");
         assert_eq!(queue.remaining(), 1);
         // The completed piece is never handed out again.
-        let e = queue.claim(&seed).unwrap();
+        let e = queue.claim(&seed, &[]).unwrap();
         assert_eq!(e.index, d.index);
     }
 
@@ -863,8 +1010,8 @@ mod tests {
     fn endgame_piece_is_requeued_only_when_every_claim_is_dropped() {
         let queue = PieceQueue::new(1);
         let seed = peer(&queue, &[true]);
-        let a = queue.claim(&seed).unwrap();
-        let b = queue.claim(&seed).unwrap();
+        let a = queue.claim(&seed, &[]).unwrap();
+        let b = queue.claim(&seed, &[]).unwrap();
         assert_eq!(queue.lock().in_flight[&0], 2);
         drop(a);
         assert!(queue.lock().pending.is_empty());
@@ -879,79 +1026,200 @@ mod tests {
     fn dropping_a_duplicate_after_completion_changes_nothing() {
         let queue = PieceQueue::new(1);
         let seed = peer(&queue, &[true]);
-        let a = queue.claim(&seed).unwrap();
-        let b = queue.claim(&seed).unwrap();
+        let a = queue.claim(&seed, &[]).unwrap();
+        let b = queue.claim(&seed, &[]).unwrap();
         assert!(a.complete());
         drop(b);
         assert!(queue.is_done());
         assert!(queue.lock().pending.is_empty());
-        assert!(queue.claim(&seed).is_none());
+        assert!(queue.claim(&seed, &[]).is_none());
     }
 
-    #[tokio::test]
-    async fn ignores_late_block_not_yet_requested_again() {
-        // More blocks than fit in the pipeline, so the last one is not
-        // requested in the first batch.
-        const BLOCKS: u32 = PIPELINE as u32 + 4;
-        let piece: Vec<u8> = (0..BLOCKS * BLOCK_SIZE).map(|i| (i % 251) as u8).collect();
-        let hash: [u8; 20] = sha1::Sha1::digest(&piece).into();
-        let info_hash = [7u8; 20];
+    /// A piece of two and a half blocks, its hash, and an `ActivePiece` for it.
+    fn active<'a>(queue: &'a PieceQueue, seed: &PeerPieces<'_>) -> (Vec<u8>, ActivePiece<'a>) {
+        let len = BLOCK_SIZE as usize * 5 / 2;
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let hash = sha1::Sha1::digest(&data).into();
+        let claim = queue.claim(seed, &[]).unwrap();
+        let piece = ActivePiece::new(claim, len as u64, hash).unwrap();
+        (data, piece)
+    }
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let seed_piece = piece.clone();
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut handshake = [0u8; 68];
-            socket.read_exact(&mut handshake).await.unwrap();
-            let reply = peer::handshake_bytes(&info_hash, &[1u8; 20]);
-            socket.write_all(&reply).await.unwrap();
-            let block = |b: u32| {
-                let start = (b * BLOCK_SIZE) as usize;
-                PeerMessage::Piece {
-                    index: 0,
-                    begin: b * BLOCK_SIZE,
-                    block: seed_piece[start..start + BLOCK_SIZE as usize].to_vec(),
-                }
+    fn block(data: &[u8], block: usize) -> &[u8] {
+        let start = block * BLOCK_SIZE as usize;
+        &data[start..data.len().min(start + BLOCK_SIZE as usize)]
+    }
+
+    #[test]
+    fn active_piece_requests_blocks_in_order_and_assembles_them() {
+        let queue = PieceQueue::new(1);
+        let seed = peer(&queue, &[true]);
+        let (data, mut piece) = active(&queue, &seed);
+        let mut lengths = Vec::new();
+        while piece.has_unrequested() {
+            let PeerMessage::Request { begin, length, .. } = piece.request_next() else {
+                panic!("not a request");
             };
-            // Still in transit from a request made before a choke.
-            socket.write_all(&block(BLOCKS - 1).encode()).await.unwrap();
-            loop {
-                let Ok(len) = socket.read_u32().await else {
-                    return;
-                };
-                let mut payload = vec![0u8; len as usize];
-                if socket.read_exact(&mut payload).await.is_err() {
-                    return;
-                }
-                if let Ok(PeerMessage::Request { begin, .. }) = PeerMessage::decode(&payload) {
-                    let reply = block(begin / BLOCK_SIZE).encode();
-                    socket.write_all(&reply).await.unwrap();
-                }
-            }
-        });
+            lengths.push((begin, length));
+        }
+        let half = BLOCK_SIZE / 2;
+        assert_eq!(
+            lengths,
+            [
+                (0, BLOCK_SIZE),
+                (BLOCK_SIZE, BLOCK_SIZE),
+                (2 * BLOCK_SIZE, half)
+            ]
+        );
+        assert_eq!(piece.in_flight(), 3);
 
-        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1)
-            .await
-            .unwrap();
+        for b in [2, 0, 1] {
+            assert!(!piece.is_complete());
+            assert!(
+                piece
+                    .add_block(b as u32 * BLOCK_SIZE, block(&data, b))
+                    .unwrap()
+            );
+        }
+        assert_eq!(piece.in_flight(), 0);
+        assert!(piece.is_complete());
+        let (claim, assembled) = piece.verify().expect("hash mismatch");
+        assert_eq!(assembled, data);
+        assert!(claim.complete());
+    }
+
+    #[test]
+    fn active_piece_ignores_duplicate_and_unrequested_blocks() {
         let queue = PieceQueue::new(1);
         let seed = peer(&queue, &[true]);
-        let claim = queue.claim(&seed).unwrap();
-        let data = download_piece(&mut conn, &claim, piece.len() as u64, &hash)
-            .await
-            .expect("late block dropped the peer");
-        assert_eq!(data, piece);
+        let (data, mut piece) = active(&queue, &seed);
+        piece.request_next();
+        // A late reply to a request abandoned on a choke, for a block we
+        // have not asked for again yet.
+        assert!(!piece.add_block(BLOCK_SIZE, block(&data, 1)).unwrap());
+        assert_eq!(piece.in_flight(), 1);
+        assert!(piece.add_block(0, block(&data, 0)).unwrap());
+        assert!(!piece.add_block(0, block(&data, 0)).unwrap());
+        assert_eq!(piece.in_flight(), 0);
+        assert_eq!(piece.done, 1);
+    }
+
+    #[test]
+    fn active_piece_rejects_invalid_blocks() {
+        let queue = PieceQueue::new(1);
+        let seed = peer(&queue, &[true]);
+        let (data, mut piece) = active(&queue, &seed);
+        while piece.has_unrequested() {
+            piece.request_next();
+        }
+        let full = vec![0u8; BLOCK_SIZE as usize];
+        for (begin, block) in [
+            (1, block(&data, 0)),
+            (0, &full[1..]),
+            (2 * BLOCK_SIZE, &full[..]),
+            (3 * BLOCK_SIZE, block(&data, 2)),
+        ] {
+            let err = piece.add_block(begin, block).unwrap_err();
+            assert!(err.is::<Misbehaved>(), "begin {begin}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn active_piece_cancels_only_outstanding_requests() {
+        let queue = PieceQueue::new(1);
+        let seed = peer(&queue, &[true]);
+        let (data, mut piece) = active(&queue, &seed);
+        piece.request_next();
+        piece.request_next();
+        piece.add_block(0, block(&data, 0)).unwrap();
+        let cancels: Vec<PeerMessage> = piece.cancels().collect();
+        assert_eq!(
+            cancels,
+            [PeerMessage::Cancel {
+                index: 0,
+                begin: BLOCK_SIZE,
+                length: BLOCK_SIZE,
+            }]
+        );
+    }
+
+    #[test]
+    fn corrupt_piece_fails_verification_and_is_returned() {
+        let queue = PieceQueue::new(1);
+        let seed = peer(&queue, &[true]);
+        let (mut data, mut piece) = active(&queue, &seed);
+        data[0] ^= 0xff;
+        for b in 0..3 {
+            piece.request_next();
+            piece
+                .add_block(b as u32 * BLOCK_SIZE, block(&data, b))
+                .unwrap();
+        }
+        assert!(piece.verify().is_none());
+        assert!(queue.lock().pending.contains(&0));
+    }
+
+    #[test]
+    fn endgame_never_duplicates_a_piece_the_worker_holds() {
+        let queue = PieceQueue::new(2);
+        let seed = peer(&queue, &[true; 2]);
+        let a = queue.claim(&seed, &[]).unwrap();
+        let b = queue.claim(&seed, &[]).unwrap();
+        assert!(queue.claim(&seed, &[a.index, b.index]).is_none());
+        let dup = queue.claim(&seed, &[a.index]).unwrap();
+        assert_eq!(dup.index, b.index);
+    }
+
+    #[test]
+    fn pipeline_follows_the_download_rate() {
+        let start = Instant::now();
+        let mut pipeline = Pipeline::new(start);
+        assert_eq!(pipeline.depth(), INITIAL_PIPELINE);
+        let block = u64::from(BLOCK_SIZE);
+
+        // Nothing changes until a whole window has passed.
+        pipeline.received(100 * block, start + RATE_WINDOW / 2);
+        assert_eq!(pipeline.depth(), INITIAL_PIPELINE);
+        // 100 blocks in a second: three seconds' worth.
+        pipeline.received(0, start + RATE_WINDOW);
+        assert_eq!(pipeline.depth(), 300.min(MAX_PIPELINE));
+
+        // 10 blocks over the next two seconds.
+        let later = start + RATE_WINDOW + Duration::from_secs(2);
+        pipeline.received(10 * block, later);
+        assert_eq!(pipeline.depth(), 15);
+
+        // One block in ten seconds: never below the minimum.
+        let much_later = later + Duration::from_secs(10);
+        pipeline.received(block, much_later);
+        assert_eq!(pipeline.depth(), MIN_PIPELINE);
+
+        // Way past the maximum.
+        pipeline.received(10_000 * block, much_later + RATE_WINDOW);
+        assert_eq!(pipeline.depth(), MAX_PIPELINE);
+    }
+
+    #[test]
+    fn pipeline_restart_discards_idle_time() {
+        let start = Instant::now();
+        let mut pipeline = Pipeline::new(start);
+        let block = u64::from(BLOCK_SIZE);
+        // Choked for a minute, then 20 blocks in the first second.
+        let resumed = start + Duration::from_secs(60);
+        pipeline.restart(resumed);
+        pipeline.received(20 * block, resumed + RATE_WINDOW);
+        assert_eq!(pipeline.depth(), 60);
     }
 
     #[tokio::test]
-    async fn completed_elsewhere_wakes_on_completion() {
+    async fn wait_for_wakes_on_completion() {
         let queue = PieceQueue::new(1);
         let seed = peer(&queue, &[true]);
-        let a = queue.claim(&seed).unwrap();
-        let b = queue.claim(&seed).unwrap();
+        let a = queue.claim(&seed, &[]).unwrap();
+        let b = queue.claim(&seed, &[]).unwrap();
         let short = Duration::from_millis(50);
         assert!(
-            tokio::time::timeout(short, b.completed_elsewhere())
+            tokio::time::timeout(short, queue.wait_for(|| b.is_completed()))
                 .await
                 .is_err(),
             "resolved before the piece was completed"
@@ -961,7 +1229,7 @@ mod tests {
             a.complete();
         };
         tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(b.completed_elsewhere(), complete_later)
+            tokio::join!(queue.wait_for(|| b.is_completed()), complete_later)
         })
         .await
         .expect("not woken by completion");

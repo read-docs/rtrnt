@@ -438,6 +438,74 @@ async fn loses_interest_when_a_peer_has_nothing_left_we_need() {
     );
 }
 
+/// Requests are pipelined across piece boundaries: the seeder holds back its
+/// replies until four requests (a new peer's pipeline depth) are queued,
+/// which takes two of these two-block pieces. A per-piece pipeline would
+/// stall here.
+#[tokio::test]
+async fn pipelines_requests_across_pieces() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+    assert_eq!(PIECE_LENGTH, 2 * 16 * 1024);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seeder_addr = listener.local_addr().unwrap();
+    let seeder_data = Arc::clone(&data);
+    let first_batch = tokio::spawn(async move {
+        let mut socket = accept_leecher(&listener, info_hash, num_pieces).await;
+        send(&mut socket, PeerMessage::Unchoke).await;
+        let mut queued = Vec::new();
+        while queued.len() < 4 {
+            match read_message(&mut socket).await {
+                Some(PeerMessage::Request {
+                    index,
+                    begin,
+                    length,
+                }) => queued.push((index, begin, length)),
+                Some(_) => {}
+                None => return queued,
+            }
+        }
+        for &(index, begin, length) in &queued {
+            let start = index as usize * PIECE_LENGTH as usize + begin as usize;
+            let block = seeder_data[start..start + length as usize].to_vec();
+            send(
+                &mut socket,
+                PeerMessage::Piece {
+                    index,
+                    begin,
+                    block,
+                },
+            )
+            .await;
+        }
+        serve(socket, &seeder_data).await;
+        queued
+    });
+
+    let out = tempfile::tempdir().unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        download_from_peers(
+            session(torrent, info_hash, out.path()),
+            &[seeder_addr],
+            10,
+            None,
+        ),
+    )
+    .await
+    .expect("pipeline stalled at a piece boundary")
+    .expect("download failed");
+    assert_files_match(out.path(), &data);
+
+    let queued = first_batch.await.unwrap();
+    let mut pieces: Vec<u32> = queued.iter().map(|&(index, ..)| index).collect();
+    pieces.dedup();
+    assert_eq!(pieces.len(), 2, "first requests: {queued:?}");
+}
+
 /// A minimal HTTP tracker: answers every announce with `peers` and forwards
 /// each request's query string.
 async fn mock_tracker(peers: Vec<SocketAddr>) -> (String, mpsc::UnboundedReceiver<String>) {
