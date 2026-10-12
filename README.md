@@ -24,6 +24,18 @@ cargo run --release -- path/to/file.torrent -o ~/Downloads
 
 Options: `-o, --output <DIR>` (default `.`), `--max-peers <N>` (default 30), `-p, --port <PORT>` to listen on for incoming peers (default 6881) and `--check` to verify a finished download. Set `RUST_LOG=debug` for per-peer logs.
 
+### Config file
+
+The first three options can also be set in `~/.config/rtrnt/config.toml` (or `$XDG_CONFIG_HOME/rtrnt/config.toml`), or in a file given with `--config <PATH>`. Keys are the long option names, and every key is optional:
+
+```toml
+output = "~/Downloads"
+max-peers = 50
+port = 51413
+```
+
+A flag on the command line overrides the file, and the file overrides the built-in defaults. `--print-config` shows the effective settings and where each one came from. Unknown keys are errors, so typos don't go unnoticed.
+
 Run the tests with `cargo test`. They include a loopback integration test against a mock seeder.
 
 See [ROADMAP.md](ROADMAP.md) for what's done and what's next.
@@ -35,6 +47,7 @@ See [ROADMAP.md](ROADMAP.md) for what's done and what's next.
 - **sha1** - Piece hash verification
 - **reqwest** - HTTP tracker communication
 - **clap** - Command-line interface
+- **toml** - Config file parsing
 - **indicatif** - Progress tracking
 - **anyhow** - Error handling
 
@@ -46,6 +59,7 @@ src/
 ├── lib.rs       # Library root
 ├── announcer.rs # Re-announces and completed/stopped events
 ├── bencode.rs   # Raw bencode scanning (info-hash span)
+├── config.rs    # Config file loading and CLI > file > default precedence
 ├── download.rs  # Piece queue, peer workers, block pipelining
 ├── peer.rs      # Peer wire protocol: handshake, message encode/decode
 ├── peer_pool.rs # Known peers, retry backoff and bans
