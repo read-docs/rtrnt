@@ -213,6 +213,80 @@ async fn downloads_multi_file_torrent_from_mock_seeder() {
     assert_files_match(out.path(), &data);
 }
 
+/// With room for a single connection, a dead peer and one that disconnects
+/// mid-download must each be replaced by the next peer from the list.
+#[tokio::test]
+async fn replaces_peers_that_fail() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+
+    let dead_addr: SocketAddr = {
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        dead.local_addr().unwrap()
+    };
+
+    // Serves one block, then hangs up.
+    let flaky = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let flaky_addr = flaky.local_addr().unwrap();
+    let flaky_data = Arc::clone(&data);
+    let (flaky_served, flaky_served_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut socket = accept_leecher(&flaky, info_hash, num_pieces).await;
+        send(&mut socket, PeerMessage::Unchoke).await;
+        while let Some(message) = read_message(&mut socket).await {
+            if let PeerMessage::Request {
+                index,
+                begin,
+                length,
+            } = message
+            {
+                let start = index as usize * PIECE_LENGTH as usize + begin as usize;
+                let block = flaky_data[start..start + length as usize].to_vec();
+                send(
+                    &mut socket,
+                    PeerMessage::Piece {
+                        index,
+                        begin,
+                        block,
+                    },
+                )
+                .await;
+                let _ = flaky_served.send(());
+                return;
+            }
+        }
+    });
+
+    // Only accepts once the flaky peer has had its turn, so the download
+    // cannot finish without replacing it.
+    let healthy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let healthy_addr = healthy.local_addr().unwrap();
+    let healthy_data = Arc::clone(&data);
+    tokio::spawn(async move {
+        flaky_served_rx.await.unwrap();
+        let mut socket = accept_leecher(&healthy, info_hash, num_pieces).await;
+        send(&mut socket, PeerMessage::Unchoke).await;
+        serve(socket, &healthy_data).await;
+    });
+
+    let out = tempfile::tempdir().unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        download_from_peers(
+            session(torrent, info_hash, out.path()),
+            &[dead_addr, flaky_addr, healthy_addr],
+            1,
+        ),
+    )
+    .await
+    .expect("download timed out")
+    .expect("download failed");
+
+    assert_files_match(out.path(), &data);
+}
+
 /// One seeder takes a piece and never sends it. Endgame must fetch that piece
 /// from the healthy seeder and cancel the stalled requests, instead of
 /// waiting out the 30 s read timeout.

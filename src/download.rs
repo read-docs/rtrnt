@@ -1,4 +1,5 @@
 use crate::peer::{self, PeerConnection, PeerMessage};
+use crate::peer_pool::PeerPool;
 use crate::storage::Storage;
 use crate::torrent::{self, TorrentFile};
 use crate::tracker::{self, AnnounceRequest};
@@ -25,6 +26,8 @@ const MAX_HASH_FAILURES: u32 = 3;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// How often an idle worker re-checks the queue.
 const IDLE_POLL: Duration = Duration::from_secs(2);
+/// How long finished workers get to wind down before being aborted.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 pub struct DownloadConfig {
     pub output_dir: PathBuf,
@@ -73,7 +76,9 @@ pub async fn download_file(torrent_path: &Path, config: &DownloadConfig) -> Resu
     Ok(())
 }
 
-/// Downloads every piece from up to `max_peers` of `peers`.
+/// Downloads every piece from `peers`, connected to at most `max_peers` at
+/// once. A peer that drops is replaced by the next one, and failed peers are
+/// retried with backoff (see `PeerPool`).
 pub async fn download_from_peers(
     session: Arc<Session>,
     peers: &[SocketAddr],
@@ -82,23 +87,59 @@ pub async fn download_from_peers(
     let num_pieces = session.torrent.num_pieces();
     let queue = Arc::new(PieceQueue::new(num_pieces));
     let progress = progress_bar(session.torrent.length());
+    let mut pool = PeerPool::default();
+    pool.add(peers.iter().copied());
 
     let mut workers = JoinSet::new();
-    for &addr in peers.iter().take(max_peers) {
-        let session = Arc::clone(&session);
-        let queue = Arc::clone(&queue);
-        let progress = progress.clone();
-        workers.spawn(async move {
-            match peer_worker(&session, &queue, &progress, addr).await {
-                Ok(()) => debug!(%addr, "peer finished"),
-                Err(e) => debug!(%addr, "peer dropped: {e:#}"),
-            }
-        });
-    }
-    while let Some(result) = workers.join_next().await {
-        if let Err(e) = result {
-            warn!("peer task failed: {e}");
+    while !queue.is_done() {
+        while workers.len() < max_peers {
+            let Some(addr) = pool.next(Instant::now()) else {
+                break;
+            };
+            let session = Arc::clone(&session);
+            let queue = Arc::clone(&queue);
+            let progress = progress.clone();
+            workers.spawn(async move {
+                let mut pieces = 0;
+                let result = peer_worker(&session, &queue, &progress, addr, &mut pieces).await;
+                (addr, pieces, result)
+            });
         }
+
+        let retry_at = pool.next_retry().filter(|_| workers.len() < max_peers);
+        if workers.is_empty() && retry_at.is_none() {
+            break;
+        }
+        tokio::select! {
+            Some(joined) = workers.join_next() => {
+                let (addr, pieces, result) = match joined {
+                    Ok(exit) => exit,
+                    Err(e) => {
+                        warn!("peer task failed: {e}");
+                        continue;
+                    }
+                };
+                match result {
+                    Ok(()) => debug!(%addr, "peer finished"),
+                    Err(e) if e.is::<Misbehaved>() => {
+                        warn!(%addr, "banning peer: {e:#}");
+                        pool.ban(addr);
+                    }
+                    Err(e) => {
+                        debug!(%addr, pieces, "peer dropped: {e:#}");
+                        pool.failed(addr, pieces > 0, Instant::now());
+                    }
+                }
+            }
+            () = sleep_until_some(retry_at) => {}
+        }
+    }
+
+    // Workers still downloading notice completion and exit (sending Cancel
+    // for duplicate endgame requests); ones still connecting are cut short.
+    let drain = async { while workers.join_next().await.is_some() {} };
+    if tokio::time::timeout(SHUTDOWN_GRACE, drain).await.is_err() {
+        workers.shutdown().await;
     }
     progress.finish();
 
@@ -108,6 +149,26 @@ pub async fn download_from_peers(
     }
     Ok(())
 }
+
+/// Sleeps until `at`, or forever if it is `None`.
+async fn sleep_until_some(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// A peer that broke the protocol or sent bad data. It is never retried.
+#[derive(Debug)]
+struct Misbehaved(&'static str);
+
+impl std::fmt::Display for Misbehaved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for Misbehaved {}
 
 fn progress_bar(total: u64) -> ProgressBar {
     let bar = ProgressBar::new(total);
@@ -120,11 +181,14 @@ fn progress_bar(total: u64) -> ProgressBar {
     bar
 }
 
+/// Downloads from one peer until the torrent is complete or the peer fails.
+/// `pieces_done` counts the pieces this peer delivered first, even on error.
 async fn peer_worker(
     session: &Session,
     queue: &PieceQueue,
     progress: &ProgressBar,
     addr: SocketAddr,
+    pieces_done: &mut usize,
 ) -> Result<()> {
     let torrent = &session.torrent;
     let mut conn = PeerConnection::connect(
@@ -169,6 +233,7 @@ async fn peer_worker(
                 }
                 session.storage.write_piece(index, data).await?;
                 if claim.complete() {
+                    *pieces_done += 1;
                     progress.inc(piece_len);
                     debug!(%addr, index, "piece complete");
                 }
@@ -185,7 +250,7 @@ async fn peer_worker(
                 hash_failures += 1;
                 warn!(%addr, index, "piece failed hash check");
                 if hash_failures >= MAX_HASH_FAILURES {
-                    bail!("too many corrupt pieces");
+                    bail!(Misbehaved("too many corrupt pieces"));
                 }
             }
             Err(PieceError::Other(e)) => return Err(e),
@@ -279,7 +344,7 @@ async fn download_piece(
                     || block_index >= num_blocks
                     || block.len() != block_len(block_index) as usize
                 {
-                    return Err(anyhow!("peer sent an invalid block").into());
+                    return Err(anyhow!(Misbehaved("peer sent an invalid block")).into());
                 }
                 // A late reply to a request abandoned on a choke, for a block
                 // we have not asked for again yet. Ignore it rather than

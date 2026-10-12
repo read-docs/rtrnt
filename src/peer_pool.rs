@@ -1,0 +1,162 @@
+//! Every peer we know of, and when each may be tried (again).
+
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
+use std::time::Duration;
+use tokio::time::Instant;
+
+/// A peer that fails this many times in a row is given up on.
+const MAX_FAILURES: u32 = 3;
+/// Wait before the first retry of a failed peer; doubled after each failure.
+const RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+pub(crate) struct PeerPool {
+    /// Peers that can be tried now, in the order they were learned.
+    ready: VecDeque<SocketAddr>,
+    /// Failed peers waiting out their backoff.
+    retrying: Vec<(Instant, SocketAddr)>,
+    /// Every peer ever added, so a tracker repeating it does not duplicate it.
+    known: HashMap<SocketAddr, PeerState>,
+}
+
+#[derive(Default)]
+struct PeerState {
+    /// Failures since the peer last delivered a piece.
+    failures: u32,
+    banned: bool,
+}
+
+impl PeerPool {
+    /// Adds peers not seen before. Known peers, including connected, retrying
+    /// and banned ones, are left alone.
+    pub(crate) fn add(&mut self, peers: impl IntoIterator<Item = SocketAddr>) {
+        for addr in peers {
+            if let Entry::Vacant(entry) = self.known.entry(addr) {
+                entry.insert(PeerState::default());
+                self.ready.push_back(addr);
+            }
+        }
+    }
+
+    /// Takes the next peer to connect to, if any is ready at `now`.
+    pub(crate) fn next(&mut self, now: Instant) -> Option<SocketAddr> {
+        let (mut due, waiting): (Vec<_>, Vec<_>) =
+            self.retrying.drain(..).partition(|&(at, _)| at <= now);
+        self.retrying = waiting;
+        due.sort();
+        self.ready.extend(due.into_iter().map(|(_, addr)| addr));
+        self.ready.pop_front()
+    }
+
+    /// When the next peer in backoff becomes ready.
+    pub(crate) fn next_retry(&self) -> Option<Instant> {
+        self.retrying.iter().map(|&(at, _)| at).min()
+    }
+
+    /// Records that a connection to `addr` ended with an error. `useful`
+    /// peers (those that delivered a piece) start counting failures afresh.
+    pub(crate) fn failed(&mut self, addr: SocketAddr, useful: bool, now: Instant) {
+        let state = self.known.entry(addr).or_default();
+        if state.banned {
+            return;
+        }
+        state.failures = if useful { 1 } else { state.failures + 1 };
+        if state.failures >= MAX_FAILURES {
+            return;
+        }
+        let backoff = RETRY_BACKOFF * 2u32.pow(state.failures - 1);
+        self.retrying.push((now + backoff, addr));
+    }
+
+    /// Never connects to `addr` again.
+    pub(crate) fn ban(&mut self, addr: SocketAddr) {
+        self.known.entry(addr).or_default().banned = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    fn drain(pool: &mut PeerPool, now: Instant) -> Vec<SocketAddr> {
+        std::iter::from_fn(|| pool.next(now)).collect()
+    }
+
+    #[test]
+    fn hands_out_each_new_peer_once_in_order() {
+        let now = Instant::now();
+        let mut pool = PeerPool::default();
+        pool.add([addr(1), addr(2), addr(1)]);
+        pool.add([addr(2), addr(3)]);
+        assert_eq!(drain(&mut pool, now), [addr(1), addr(2), addr(3)]);
+        // Re-announced peers that are already connected are not duplicated.
+        pool.add([addr(1), addr(3)]);
+        assert_eq!(pool.next(now), None);
+        assert_eq!(pool.next_retry(), None);
+    }
+
+    #[test]
+    fn retries_failed_peer_with_growing_backoff_then_gives_up() {
+        let start = Instant::now();
+        let mut pool = PeerPool::default();
+        pool.add([addr(1)]);
+        let mut now = start;
+        for backoff in [RETRY_BACKOFF, RETRY_BACKOFF * 2] {
+            assert_eq!(pool.next(now), Some(addr(1)));
+            pool.failed(addr(1), false, now);
+            assert_eq!(pool.next_retry(), Some(now + backoff));
+            assert_eq!(pool.next(now + backoff - Duration::from_millis(1)), None);
+            now += backoff;
+        }
+        assert_eq!(pool.next(now), Some(addr(1)));
+        pool.failed(addr(1), false, now);
+        assert_eq!(pool.next_retry(), None, "retried past MAX_FAILURES");
+        assert_eq!(pool.next(now + RETRY_BACKOFF * 100), None);
+    }
+
+    #[test]
+    fn useful_peer_failures_start_over() {
+        let mut now = Instant::now();
+        let mut pool = PeerPool::default();
+        pool.add([addr(1)]);
+        for _ in 0..MAX_FAILURES * 2 {
+            assert_eq!(pool.next(now), Some(addr(1)));
+            pool.failed(addr(1), true, now);
+            assert_eq!(pool.next_retry(), Some(now + RETRY_BACKOFF));
+            now += RETRY_BACKOFF;
+        }
+    }
+
+    #[test]
+    fn banned_peer_is_never_returned() {
+        let now = Instant::now();
+        let mut pool = PeerPool::default();
+        pool.add([addr(1)]);
+        assert_eq!(pool.next(now), Some(addr(1)));
+        pool.ban(addr(1));
+        pool.failed(addr(1), true, now);
+        pool.add([addr(1)]);
+        assert_eq!(pool.next(now + RETRY_BACKOFF * 100), None);
+        assert_eq!(pool.next_retry(), None);
+    }
+
+    #[test]
+    fn due_retries_queue_behind_fresh_peers_in_due_order() {
+        let now = Instant::now();
+        let mut pool = PeerPool::default();
+        pool.add([addr(1), addr(2)]);
+        assert_eq!(pool.next(now), Some(addr(1)));
+        assert_eq!(pool.next(now), Some(addr(2)));
+        pool.failed(addr(2), false, now);
+        pool.failed(addr(1), false, now + Duration::from_secs(1));
+        pool.add([addr(3)]);
+        let later = now + RETRY_BACKOFF * 2;
+        assert_eq!(drain(&mut pool, later), [addr(3), addr(2), addr(1)]);
+    }
+}
