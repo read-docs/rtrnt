@@ -22,7 +22,7 @@ A terminal-based BitTorrent client written in Rust.
 cargo run --release -- path/to/file.torrent -o ~/Downloads
 ```
 
-Options: `-o, --output <DIR>` (default `.`), `--max-peers <N>` (default 30), `-p, --port <PORT>` to listen on for incoming peers over IPv4 and IPv6 (default 6881), `--no-dht` to find peers through trackers only (`--dht` turns the DHT back on if the config file turned it off), `--check` to verify a finished download, `--scrape` to print each tracker's seeder, leecher and completed counts without downloading, `--seed-ratio <RATIO>` and `--seed-time <MINUTES>` to keep seeding once the download is complete, until we have uploaded that many times the torrent's size or for that long, whichever comes first (both default to 0, which exits at completion), and `--max-download-rate <KIB/S>` and `--max-upload-rate <KIB/S>` to limit how fast piece data moves each way, in KiB per second across all peers (both default to 0, unlimited). The limits count piece data only, not protocol messages or TCP/IP headers, so the traffic on the wire is slightly higher. Without `--no-dht`, peers are also looked up in the BitTorrent DHT (on UDP, same port), so torrents without trackers download too. Set `RUST_LOG=debug` for per-peer logs.
+Options: `-o, --output <DIR>` (default `.`), `--max-peers <N>` (default 30), `-p, --port <PORT>` to listen on for incoming peers over IPv4 and IPv6 (default 6881), `--no-dht` to find peers through trackers only (`--dht` turns the DHT back on if the config file turned it off), `--check` to verify a finished download, `--scrape` to print each tracker's seeder, leecher and completed counts without downloading, `--seed-ratio <RATIO>` and `--seed-time <MINUTES>` to keep seeding once the download is complete, until we have uploaded that many times the torrent's size or for that long, whichever comes first (both default to 0, which exits at completion), and `--max-download-rate <KIB/S>` and `--max-upload-rate <KIB/S>` to limit how fast piece data moves each way, in KiB per second across all peers (both default to 0, unlimited). The limits count piece data only, not protocol messages or TCP/IP headers, so the traffic on the wire is slightly higher. Without `--no-dht`, peers are also looked up in the BitTorrent DHT (on UDP, same port), so torrents without trackers download too. Connected peers that support peer exchange also tell us about more peers, and we tell them about ours (never for private torrents). Set `RUST_LOG=debug` for per-peer logs.
 
 ### Config file
 
@@ -78,19 +78,20 @@ src/
 ├── extension.rs # Extension protocol (BEP 10) handshake
 ├── peer.rs      # Peer wire protocol: handshake, message encode/decode
 ├── peer_pool.rs # Known peers, retry backoff and bans
+├── pex.rs       # Peer exchange (BEP 11): telling peers about each other
 ├── rate_limit.rs # Upload and download rate limits (shared token buckets)
 ├── storage.rs   # Maps pieces onto files on disk (single and multi-file)
 ├── torrent.rs   # Torrent file parsing and validation
 └── tracker.rs   # Tracker communication (UDP/HTTP)
 tests/
 ├── dht.rs       # DHT nodes on loopback: bootstrap, announce, lookup
-└── loopback.rs  # End-to-end downloads from mock seeders, a mock tracker and the DHT
+└── loopback.rs  # End-to-end downloads from mock seeders, a mock tracker, the DHT and peer exchange
 ```
 
 ## How It Works
 
 1. **Torrent Parsing** - Reads and parses .torrent files, extracting metadata and calculating info hash
-2. **Tracker Announce and DHT** - Contacts trackers and searches the DHT to discover peers in the swarm
+2. **Tracker Announce, DHT and Peer Exchange** - Contacts trackers, searches the DHT and asks connected peers to discover peers in the swarm
 3. **Peer Handshake** - Establishes connections with peers using the BitTorrent protocol
 4. **Piece Download** - Downloads file pieces in 16KB blocks from multiple peers concurrently
 5. **Verification** - Validates each piece against its SHA-1 hash before assembly
