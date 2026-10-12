@@ -22,7 +22,7 @@ Make the existing download path correct and robust.
 
 Faster, steadier downloads in real swarms.
 
-- [ ] **Rarest-first piece selection**: count piece availability across peers and download rare pieces first, so the swarm stays healthy and we don't stall on the last piece.
+- [x] **Rarest-first piece selection**: piece availability is counted across connected peers (Bitfield, Have, disconnects), and each peer claims the rarest piece it has, with random tie-breaks.
 - [ ] **Endgame mode**: once only a few blocks are left, request them from several peers and send `Cancel` when one arrives. This fixes slow tails.
 - [ ] **Peer pool and replacement**: keep the full tracker peer list and replace dropped peers. Today a worker that dies is never replaced.
 - [ ] **Periodic re-announce**: announce again on the tracker's `interval` with real `downloaded`/`left`, and send `completed`/`stopped` events.

@@ -4,6 +4,7 @@ use crate::torrent::{self, TorrentFile};
 use crate::tracker::{self, AnnounceRequest};
 use anyhow::{Result, anyhow, bail};
 use indicatif::{ProgressBar, ProgressStyle};
+use rand::Rng;
 use sha1::Digest;
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -136,10 +137,12 @@ async fn peer_worker(
     conn.negotiate().await?;
     debug!(%addr, "connected and unchoked");
 
+    let mut pieces = queue.register_peer();
     let mut hash_failures = 0;
     let mut last_useful = Instant::now();
     while !queue.is_done() {
-        let Some(claim) = queue.claim(conn.peer_has()) else {
+        pieces.update(conn.peer_has());
+        let Some(claim) = queue.claim(&pieces) else {
             if last_useful.elapsed() > IDLE_TIMEOUT {
                 bail!("peer has no pieces we need");
             }
@@ -281,6 +284,8 @@ struct QueueState {
     pending: BTreeSet<usize>,
     /// Pieces not yet verified and written, whether pending or in flight.
     remaining: usize,
+    /// How many connected peers have each piece.
+    availability: Vec<u32>,
 }
 
 impl PieceQueue {
@@ -289,6 +294,7 @@ impl PieceQueue {
             state: Mutex::new(QueueState {
                 pending: (0..num_pieces).collect(),
                 remaining: num_pieces,
+                availability: vec![0; num_pieces],
             }),
             changed: Notify::new(),
         }
@@ -298,15 +304,26 @@ impl PieceQueue {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Takes the first pending piece the peer has. The piece goes back to
-    /// the queue when the claim is dropped without `complete()`.
-    fn claim(&self, peer_has: &[bool]) -> Option<PieceClaim<'_>> {
+    /// Starts counting a peer's pieces towards availability. Its pieces are
+    /// uncounted again when the returned handle is dropped.
+    fn register_peer(&self) -> PeerPieces<'_> {
+        PeerPieces {
+            queue: self,
+            has: vec![false; self.lock().availability.len()],
+        }
+    }
+
+    /// Takes the rarest pending piece the peer has, breaking ties at random.
+    /// The piece goes back to the queue when the claim is dropped without
+    /// `complete()`.
+    fn claim(&self, peer: &PeerPieces<'_>) -> Option<PieceClaim<'_>> {
         let mut state = self.lock();
-        let index = state
-            .pending
-            .iter()
-            .copied()
-            .find(|&i| peer_has.get(i).copied().unwrap_or(false))?;
+        let index = pick_rarest(
+            &state.pending,
+            &peer.has,
+            &state.availability,
+            &mut rand::rng(),
+        )?;
         state.pending.remove(&index);
         Some(PieceClaim {
             queue: self,
@@ -347,6 +364,87 @@ impl Drop for PieceClaim<'_> {
     }
 }
 
+/// One peer's pieces as currently counted in the queue's availability.
+struct PeerPieces<'a> {
+    queue: &'a PieceQueue,
+    has: Vec<bool>,
+}
+
+impl PeerPieces<'_> {
+    /// Brings the counted pieces in line with what the peer has advertised.
+    fn update(&mut self, peer_has: &[bool]) {
+        let changed: Vec<usize> = self
+            .has
+            .iter()
+            .zip(peer_has)
+            .enumerate()
+            .filter(|(_, (counted, has))| counted != has)
+            .map(|(i, _)| i)
+            .collect();
+        if changed.is_empty() {
+            return;
+        }
+        let mut state = self.queue.lock();
+        for i in changed {
+            let has = peer_has[i];
+            let count = &mut state.availability[i];
+            *count = if has {
+                count.saturating_add(1)
+            } else {
+                count.saturating_sub(1)
+            };
+            self.has[i] = has;
+        }
+    }
+}
+
+impl Drop for PeerPieces<'_> {
+    fn drop(&mut self) {
+        let mut state = self.queue.lock();
+        for (count, _) in state
+            .availability
+            .iter_mut()
+            .zip(&self.has)
+            .filter(|(_, has)| **has)
+        {
+            *count = count.saturating_sub(1);
+        }
+    }
+}
+
+/// Picks the pending piece in `has` with the lowest availability. Ties are
+/// broken uniformly at random (reservoir sampling) so that peers spread out
+/// over equally rare pieces instead of all fetching the lowest index.
+fn pick_rarest(
+    pending: &BTreeSet<usize>,
+    has: &[bool],
+    availability: &[u32],
+    rng: &mut impl Rng,
+) -> Option<usize> {
+    let mut best = None;
+    let mut ties = 0u32;
+    for &i in pending {
+        if !has.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let count = availability.get(i).copied().unwrap_or(0);
+        match best {
+            Some((_, best_count)) if count > best_count => {}
+            Some((_, best_count)) if count == best_count => {
+                ties += 1;
+                if rng.random_range(0..ties) == 0 {
+                    best = Some((i, count));
+                }
+            }
+            _ => {
+                best = Some((i, count));
+                ties = 1;
+            }
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -355,28 +453,102 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    fn peer<'a>(queue: &'a PieceQueue, has: &[bool]) -> PeerPieces<'a> {
+        let mut peer = queue.register_peer();
+        peer.update(has);
+        peer
+    }
+
+    fn availability(queue: &PieceQueue) -> Vec<u32> {
+        queue.lock().availability.clone()
+    }
+
     #[test]
     fn claims_only_pieces_the_peer_has() {
         let queue = PieceQueue::new(3);
-        assert!(queue.claim(&[false, false, false]).is_none());
-        let claim = queue.claim(&[false, true, true]).unwrap();
-        assert_eq!(claim.index, 1);
-        let second = queue.claim(&[false, true, true]).unwrap();
-        assert_eq!(second.index, 2);
-        assert!(queue.claim(&[false, true, true]).is_none());
+        assert!(queue.claim(&peer(&queue, &[false; 3])).is_none());
+        let partial = peer(&queue, &[false, true, true]);
+        let claim = queue.claim(&partial).unwrap();
+        let second = queue.claim(&partial).unwrap();
+        let mut claimed = [claim.index, second.index];
+        claimed.sort();
+        assert_eq!(claimed, [1, 2]);
+        assert!(queue.claim(&partial).is_none());
         drop(second);
         claim.complete();
         assert_eq!(queue.remaining(), 2);
-        assert_eq!(queue.claim(&[true, true, true]).unwrap().index, 0);
+        // Piece 0 is now the rarest: only `full` has it.
+        let full = peer(&queue, &[true; 3]);
+        assert_eq!(queue.claim(&full).unwrap().index, 0);
     }
 
     #[test]
     fn dropped_claim_returns_piece() {
         let queue = PieceQueue::new(1);
-        drop(queue.claim(&[true]).unwrap());
-        let claim = queue.claim(&[true]).unwrap();
+        let seed = peer(&queue, &[true]);
+        drop(queue.claim(&seed).unwrap());
+        let claim = queue.claim(&seed).unwrap();
         claim.complete();
         assert!(queue.is_done());
-        assert!(queue.claim(&[true]).is_none());
+        assert!(queue.claim(&seed).is_none());
+    }
+
+    #[test]
+    fn claims_rarest_piece_first() {
+        let queue = PieceQueue::new(4);
+        let _a = peer(&queue, &[true, true, false, true]);
+        let _b = peer(&queue, &[true, false, false, true]);
+        let seed = peer(&queue, &[true; 4]);
+        assert_eq!(availability(&queue), [3, 2, 1, 3]);
+        let first = queue.claim(&seed).unwrap();
+        assert_eq!(first.index, 2);
+        let second = queue.claim(&seed).unwrap();
+        assert_eq!(second.index, 1);
+    }
+
+    #[test]
+    fn availability_follows_peer_updates_and_disconnects() {
+        let queue = PieceQueue::new(3);
+        let mut a = peer(&queue, &[true, false, false]);
+        let b = peer(&queue, &[true, true, false]);
+        assert_eq!(availability(&queue), [2, 1, 0]);
+        // A Have message, then a (replacement) bitfield that drops a piece.
+        a.update(&[true, false, true]);
+        assert_eq!(availability(&queue), [2, 1, 1]);
+        a.update(&[false, false, true]);
+        assert_eq!(availability(&queue), [1, 1, 1]);
+        drop(b);
+        assert_eq!(availability(&queue), [0, 0, 1]);
+        drop(a);
+        assert_eq!(availability(&queue), [0, 0, 0]);
+    }
+
+    #[test]
+    fn rarest_ties_are_broken_at_random() {
+        let pending: BTreeSet<usize> = (0..4).collect();
+        let has = [true; 4];
+        let availability = [1, 5, 1, 1];
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut seen = [0u32; 4];
+        for _ in 0..300 {
+            let i = pick_rarest(&pending, &has, &availability, &mut rng).unwrap();
+            seen[i] += 1;
+        }
+        assert_eq!(seen[1], 0, "picked a more common piece");
+        for i in [0, 2, 3] {
+            assert!(seen[i] > 50, "piece {i} picked {} times: {seen:?}", seen[i]);
+        }
+    }
+
+    #[test]
+    fn pick_rarest_skips_pieces_not_pending_or_missing() {
+        let pending: BTreeSet<usize> = [1, 2].into();
+        let mut rng = StdRng::seed_from_u64(0);
+        let pick = |has: &[bool], rng: &mut StdRng| pick_rarest(&pending, has, &[0, 9, 9], rng);
+        assert_eq!(pick(&[true, false, true], &mut rng), Some(2));
+        assert_eq!(pick(&[true, false, false], &mut rng), None);
     }
 }
