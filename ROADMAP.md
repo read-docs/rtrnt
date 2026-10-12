@@ -23,7 +23,7 @@ Make the existing download path correct and robust.
 Faster, steadier downloads in real swarms.
 
 - [x] **Rarest-first piece selection**: piece availability is counted across connected peers (Bitfield, Have, disconnects), and each peer claims the rarest piece it has, with random tie-breaks.
-- [ ] **Endgame mode**: once only a few blocks are left, request them from several peers and send `Cancel` when one arrives. This fixes slow tails.
+- [x] **Endgame mode**: once every remaining piece is in flight, idle peers also download those pieces, starting with the one fewest peers are on. The first verified copy wins, and the others send `Cancel` for their outstanding blocks. A stalled peer no longer holds up the finish. (This works per piece. Per-block endgame is left for adaptive pipelining.)
 - [ ] **Peer pool and replacement**: keep the full tracker peer list and replace dropped peers. Today a worker that dies is never replaced.
 - [ ] **Periodic re-announce**: announce again on the tracker's `interval` with real `downloaded`/`left`, and send `completed`/`stopped` events.
 - [ ] **Tracker tiers ([BEP 12](https://www.bittorrent.org/beps/bep_0012.html))**: shuffle within a tier and promote the tracker that works.

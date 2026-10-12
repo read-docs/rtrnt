@@ -6,7 +6,7 @@ use anyhow::{Result, anyhow, bail};
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
 use sha1::Digest;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -160,12 +160,21 @@ async fn peer_worker(
         let index = claim.index;
         let piece_len = torrent.piece_len(index)?;
         let hash = torrent.piece_hash(index)?;
-        match download_piece(&mut conn, index, piece_len, &hash).await {
+        match download_piece(&mut conn, &claim, piece_len, &hash).await {
             Ok(data) => {
+                // In endgame another peer may have finished it meanwhile. If
+                // both pass this check, both write the same verified bytes.
+                if claim.is_completed() {
+                    continue;
+                }
                 session.storage.write_piece(index, data).await?;
-                claim.complete();
-                progress.inc(piece_len);
-                debug!(%addr, index, "piece complete");
+                if claim.complete() {
+                    progress.inc(piece_len);
+                    debug!(%addr, index, "piece complete");
+                }
+            }
+            Err(PieceError::CompletedElsewhere) => {
+                debug!(%addr, index, "piece completed by another peer");
             }
             Err(PieceError::Choked) => {
                 debug!(%addr, index, "choked mid-piece");
@@ -189,6 +198,9 @@ async fn peer_worker(
 enum PieceError {
     /// The peer choked us; outstanding requests were discarded.
     Choked,
+    /// Another peer completed the piece first (endgame); outstanding
+    /// requests were cancelled.
+    CompletedElsewhere,
     HashMismatch,
     Other(anyhow::Error),
 }
@@ -200,13 +212,15 @@ impl From<anyhow::Error> for PieceError {
 }
 
 /// Downloads one piece with up to `PIPELINE` block requests in flight.
+/// Gives up early, cancelling outstanding requests, if another peer
+/// completes the piece first.
 async fn download_piece(
     conn: &mut PeerConnection,
-    index: usize,
+    claim: &PieceClaim<'_>,
     piece_len: u64,
     expected_hash: &[u8; 20],
 ) -> Result<Vec<u8>, PieceError> {
-    let piece_index = u32::try_from(index).map_err(|_| anyhow!("piece index too large"))?;
+    let piece_index = u32::try_from(claim.index).map_err(|_| anyhow!("piece index too large"))?;
     let piece_len = u32::try_from(piece_len).map_err(|_| anyhow!("piece too large"))?;
     let num_blocks = piece_len.div_ceil(BLOCK_SIZE) as usize;
     let block_len = |block: usize| {
@@ -235,7 +249,26 @@ async fn download_piece(
             conn.send_all(&requests).await?;
         }
 
-        match conn.receive().await? {
+        // `receive` is cancel-safe, so losing the race loses no data.
+        let message = tokio::select! {
+            message = conn.receive() => Some(message?),
+            () = claim.completed_elsewhere() => None,
+        };
+        let Some(message) = message else {
+            let cancels: Vec<PeerMessage> = (0..next_request)
+                .filter(|&block| !received[block])
+                .map(|block| PeerMessage::Cancel {
+                    index: piece_index,
+                    begin: block as u32 * BLOCK_SIZE,
+                    length: block_len(block),
+                })
+                .collect();
+            if !cancels.is_empty() {
+                conn.send_all(&cancels).await?;
+            }
+            return Err(PieceError::CompletedElsewhere);
+        };
+        match message {
             PeerMessage::Piece {
                 index,
                 begin,
@@ -281,7 +314,11 @@ struct PieceQueue {
 }
 
 struct QueueState {
+    /// Pieces nobody is downloading.
     pending: BTreeSet<usize>,
+    /// Pieces being downloaded but not yet completed, with how many workers
+    /// hold a claim on each (more than one only in endgame).
+    in_flight: BTreeMap<usize, u32>,
     /// Pieces not yet verified and written, whether pending or in flight.
     remaining: usize,
     /// How many connected peers have each piece.
@@ -293,6 +330,7 @@ impl PieceQueue {
         Self {
             state: Mutex::new(QueueState {
                 pending: (0..num_pieces).collect(),
+                in_flight: BTreeMap::new(),
                 remaining: num_pieces,
                 availability: vec![0; num_pieces],
             }),
@@ -314,17 +352,36 @@ impl PieceQueue {
     }
 
     /// Takes the rarest pending piece the peer has, breaking ties at random.
-    /// The piece goes back to the queue when the claim is dropped without
-    /// `complete()`.
+    ///
+    /// Endgame: once no piece is pending, every remaining piece is already
+    /// being downloaded, so this joins the in-flight piece with the fewest
+    /// downloaders instead. Whichever copy finishes first wins, so one slow
+    /// peer can no longer hold up the end of the download.
+    ///
+    /// The piece goes back to the queue when its last claim is dropped
+    /// without `complete()`.
     fn claim(&self, peer: &PeerPieces<'_>) -> Option<PieceClaim<'_>> {
-        let mut state = self.lock();
-        let index = pick_rarest(
-            &state.pending,
-            &peer.has,
-            &state.availability,
-            &mut rand::rng(),
-        )?;
-        state.pending.remove(&index);
+        let mut guard = self.lock();
+        let state = &mut *guard;
+        let mut rng = rand::rng();
+        let index = if state.pending.is_empty() {
+            let candidates = state.in_flight.iter().map(|(&i, &holders)| (i, holders));
+            let index = pick_least(candidates, &peer.has, &mut rng)?;
+            let holders = state.in_flight.entry(index).or_insert(0);
+            *holders += 1;
+            debug!(index, holders = *holders, "endgame: duplicating piece");
+            index
+        } else {
+            let availability = &state.availability;
+            let candidates = state
+                .pending
+                .iter()
+                .map(|&i| (i, availability.get(i).copied().unwrap_or(0)));
+            let index = pick_least(candidates, &peer.has, &mut rng)?;
+            state.pending.remove(&index);
+            state.in_flight.insert(index, 1);
+            index
+        };
         Some(PieceClaim {
             queue: self,
             index,
@@ -348,19 +405,61 @@ struct PieceClaim<'a> {
 }
 
 impl PieceClaim<'_> {
-    fn complete(mut self) {
+    /// Marks the piece verified and written. Returns false if another worker
+    /// completed it first.
+    fn complete(mut self) -> bool {
         self.completed = true;
-        self.queue.lock().remaining -= 1;
+        let first = {
+            let mut state = self.queue.lock();
+            let first = state.in_flight.remove(&self.index).is_some();
+            if first {
+                state.remaining -= 1;
+            }
+            first
+        };
         self.queue.changed.notify_waiters();
+        first
+    }
+
+    /// Whether the piece has been completed (by any worker).
+    fn is_completed(&self) -> bool {
+        // While a claim exists its piece is never pending, so it is either
+        // in flight or done.
+        !self.queue.lock().in_flight.contains_key(&self.index)
+    }
+
+    /// Resolves once another worker has completed this piece.
+    async fn completed_elsewhere(&self) {
+        loop {
+            let mut changed = std::pin::pin!(self.queue.changed.notified());
+            // Register before checking, so a completion in between still
+            // wakes us.
+            changed.as_mut().enable();
+            if self.is_completed() {
+                return;
+            }
+            changed.await;
+        }
     }
 }
 
 impl Drop for PieceClaim<'_> {
     fn drop(&mut self) {
-        if !self.completed {
-            self.queue.lock().pending.insert(self.index);
-            self.queue.changed.notify_waiters();
+        if self.completed {
+            return;
         }
+        {
+            let mut state = self.queue.lock();
+            // No entry means another worker already completed the piece.
+            if let Some(holders) = state.in_flight.get_mut(&self.index) {
+                *holders -= 1;
+                if *holders == 0 {
+                    state.in_flight.remove(&self.index);
+                    state.pending.insert(self.index);
+                }
+            }
+        }
+        self.queue.changed.notify_waiters();
     }
 }
 
@@ -412,22 +511,20 @@ impl Drop for PeerPieces<'_> {
     }
 }
 
-/// Picks the pending piece in `has` with the lowest availability. Ties are
-/// broken uniformly at random (reservoir sampling) so that peers spread out
-/// over equally rare pieces instead of all fetching the lowest index.
-fn pick_rarest(
-    pending: &BTreeSet<usize>,
+/// Picks the `(piece, count)` candidate in `has` with the lowest count. Ties
+/// are broken uniformly at random (reservoir sampling) so that peers spread
+/// out over equally good pieces instead of all fetching the lowest index.
+fn pick_least(
+    candidates: impl IntoIterator<Item = (usize, u32)>,
     has: &[bool],
-    availability: &[u32],
     rng: &mut impl Rng,
 ) -> Option<usize> {
     let mut best = None;
     let mut ties = 0u32;
-    for &i in pending {
+    for (i, count) in candidates {
         if !has.get(i).copied().unwrap_or(false) {
             continue;
         }
-        let count = availability.get(i).copied().unwrap_or(0);
         match best {
             Some((_, best_count)) if count > best_count => {}
             Some((_, best_count)) if count == best_count => {
@@ -528,13 +625,12 @@ mod tests {
 
     #[test]
     fn rarest_ties_are_broken_at_random() {
-        let pending: BTreeSet<usize> = (0..4).collect();
+        let candidates = [(0, 1), (1, 5), (2, 1), (3, 1)];
         let has = [true; 4];
-        let availability = [1, 5, 1, 1];
         let mut rng = StdRng::seed_from_u64(7);
         let mut seen = [0u32; 4];
         for _ in 0..300 {
-            let i = pick_rarest(&pending, &has, &availability, &mut rng).unwrap();
+            let i = pick_least(candidates, &has, &mut rng).unwrap();
             seen[i] += 1;
         }
         assert_eq!(seen[1], 0, "picked a more common piece");
@@ -544,11 +640,92 @@ mod tests {
     }
 
     #[test]
-    fn pick_rarest_skips_pieces_not_pending_or_missing() {
-        let pending: BTreeSet<usize> = [1, 2].into();
+    fn pick_least_skips_pieces_the_peer_lacks() {
+        let candidates = [(1, 9), (2, 9)];
         let mut rng = StdRng::seed_from_u64(0);
-        let pick = |has: &[bool], rng: &mut StdRng| pick_rarest(&pending, has, &[0, 9, 9], rng);
-        assert_eq!(pick(&[true, false, true], &mut rng), Some(2));
-        assert_eq!(pick(&[true, false, false], &mut rng), None);
+        assert_eq!(
+            pick_least(candidates, &[true, false, true], &mut rng),
+            Some(2)
+        );
+        assert_eq!(
+            pick_least(candidates, &[true, false, false], &mut rng),
+            None
+        );
+    }
+
+    #[test]
+    fn endgame_duplicates_in_flight_pieces() {
+        let queue = PieceQueue::new(2);
+        let seed = peer(&queue, &[true; 2]);
+        let a = queue.claim(&seed).unwrap();
+        let b = queue.claim(&seed).unwrap();
+        // Nothing pending: further claims join in-flight pieces, spreading
+        // over the one with the fewest downloaders.
+        let c = queue.claim(&seed).unwrap();
+        let d = queue.claim(&seed).unwrap();
+        assert_ne!(c.index, d.index);
+        let (first, dup) = if c.index == a.index { (a, c) } else { (b, c) };
+
+        assert!(!dup.is_completed());
+        assert!(first.complete());
+        assert!(dup.is_completed());
+        assert!(!dup.complete(), "a piece must only be completed once");
+        assert_eq!(queue.remaining(), 1);
+        // The completed piece is never handed out again.
+        let e = queue.claim(&seed).unwrap();
+        assert_eq!(e.index, d.index);
+    }
+
+    #[test]
+    fn endgame_piece_is_requeued_only_when_every_claim_is_dropped() {
+        let queue = PieceQueue::new(1);
+        let seed = peer(&queue, &[true]);
+        let a = queue.claim(&seed).unwrap();
+        let b = queue.claim(&seed).unwrap();
+        assert_eq!(queue.lock().in_flight[&0], 2);
+        drop(a);
+        assert!(queue.lock().pending.is_empty());
+        assert_eq!(queue.lock().in_flight[&0], 1);
+        drop(b);
+        assert!(queue.lock().pending.contains(&0));
+        assert!(queue.lock().in_flight.is_empty());
+        assert_eq!(queue.remaining(), 1);
+    }
+
+    #[test]
+    fn dropping_a_duplicate_after_completion_changes_nothing() {
+        let queue = PieceQueue::new(1);
+        let seed = peer(&queue, &[true]);
+        let a = queue.claim(&seed).unwrap();
+        let b = queue.claim(&seed).unwrap();
+        assert!(a.complete());
+        drop(b);
+        assert!(queue.is_done());
+        assert!(queue.lock().pending.is_empty());
+        assert!(queue.claim(&seed).is_none());
+    }
+
+    #[tokio::test]
+    async fn completed_elsewhere_wakes_on_completion() {
+        let queue = PieceQueue::new(1);
+        let seed = peer(&queue, &[true]);
+        let a = queue.claim(&seed).unwrap();
+        let b = queue.claim(&seed).unwrap();
+        let short = Duration::from_millis(50);
+        assert!(
+            tokio::time::timeout(short, b.completed_elsewhere())
+                .await
+                .is_err(),
+            "resolved before the piece was completed"
+        );
+        let complete_later = async {
+            tokio::task::yield_now().await;
+            a.complete();
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(b.completed_elsewhere(), complete_later)
+        })
+        .await
+        .expect("not woken by completion");
     }
 }

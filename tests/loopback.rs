@@ -7,9 +7,12 @@ use rtrnt::torrent::{FileInfo, Info, TorrentFile};
 use serde_bytes::ByteBuf;
 use sha1::Digest;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
 
 const PIECE_LENGTH: u64 = 32 * 1024;
 const FILES: &[(&str, usize)] = &[("a.bin", 40_000), ("empty.bin", 0), ("b.bin", 50_123)];
@@ -43,9 +46,12 @@ fn make_torrent(data: &[u8]) -> (TorrentFile, [u8; 20]) {
     (torrent, info_hash)
 }
 
-/// Serves `data` to one leecher. Chokes on the first request (dropping it)
-/// and corrupts the first block it sends for piece 1.
-async fn seeder(listener: TcpListener, data: Arc<Vec<u8>>, info_hash: [u8; 20], num_pieces: usize) {
+/// Accepts one leecher, completes the handshake and advertises every piece.
+async fn accept_leecher(
+    listener: &TcpListener,
+    info_hash: [u8; 20],
+    num_pieces: usize,
+) -> TcpStream {
     let (mut socket, _) = listener.accept().await.unwrap();
     let mut handshake = [0u8; 68];
     socket.read_exact(&mut handshake).await.unwrap();
@@ -60,23 +66,55 @@ async fn seeder(listener: TcpListener, data: Arc<Vec<u8>>, info_hash: [u8; 20], 
         bitfield[i / 8] |= 0x80 >> (i % 8);
     }
     send(&mut socket, PeerMessage::Bitfield { bitfield }).await;
+    socket
+}
+
+/// Reads the next message, or `None` once the leecher disconnects.
+async fn read_message(socket: &mut TcpStream) -> Option<PeerMessage> {
+    let len = socket.read_u32().await.ok()?;
+    let mut payload = vec![0u8; len as usize];
+    socket.read_exact(&mut payload).await.ok()?;
+    Some(PeerMessage::decode(&payload).unwrap())
+}
+
+/// Answers block requests from `data` until the leecher disconnects.
+async fn serve(mut socket: TcpStream, data: &[u8]) {
+    while let Some(message) = read_message(&mut socket).await {
+        if let PeerMessage::Request {
+            index,
+            begin,
+            length,
+        } = message
+        {
+            let start = index as usize * PIECE_LENGTH as usize + begin as usize;
+            let block = data[start..start + length as usize].to_vec();
+            send(
+                &mut socket,
+                PeerMessage::Piece {
+                    index,
+                    begin,
+                    block,
+                },
+            )
+            .await;
+        }
+    }
+}
+
+/// Serves `data` to one leecher. Chokes on the first request (dropping it)
+/// and corrupts the first block it sends for piece 1.
+async fn seeder(listener: TcpListener, data: Arc<Vec<u8>>, info_hash: [u8; 20], num_pieces: usize) {
+    let mut socket = accept_leecher(&listener, info_hash, num_pieces).await;
     send(&mut socket, PeerMessage::Unchoke).await;
 
     let mut choked_once = false;
     let mut corrupted_once = false;
-    loop {
-        let Ok(len) = socket.read_u32().await else {
-            return;
-        };
-        let mut payload = vec![0u8; len as usize];
-        if socket.read_exact(&mut payload).await.is_err() {
-            return;
-        }
+    while let Some(message) = read_message(&mut socket).await {
         let PeerMessage::Request {
             index,
             begin,
             length,
-        } = PeerMessage::decode(&payload).unwrap()
+        } = message
         else {
             continue;
         };
@@ -108,16 +146,42 @@ async fn send(socket: &mut TcpStream, message: PeerMessage) {
     socket.write_all(&message.encode()).await.unwrap();
 }
 
-#[tokio::test]
-async fn downloads_multi_file_torrent_from_mock_seeder() {
+fn init_tracing() {
     // `RUST_LOG=debug cargo test -- --nocapture` shows the choke/retry path.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
         .try_init();
+}
 
+fn test_data() -> Vec<u8> {
     let total: usize = FILES.iter().map(|(_, len)| len).sum();
-    let data: Vec<u8> = (0..total).map(|i| (i * 31 % 251) as u8).collect();
+    (0..total).map(|i| (i * 31 % 251) as u8).collect()
+}
+
+fn session(torrent: TorrentFile, info_hash: [u8; 20], out: &Path) -> Arc<Session> {
+    let storage = Arc::new(Storage::new(&torrent.info, out).unwrap());
+    Arc::new(Session {
+        torrent,
+        info_hash,
+        peer_id: generate_peer_id(),
+        storage,
+    })
+}
+
+fn assert_files_match(out: &Path, data: &[u8]) {
+    let mut offset = 0;
+    for (name, len) in FILES {
+        let written = std::fs::read(out.join("multi/dir").join(name)).unwrap();
+        assert_eq!(written, data[offset..offset + len], "{name} differs");
+        offset += len;
+    }
+}
+
+#[tokio::test]
+async fn downloads_multi_file_torrent_from_mock_seeder() {
+    init_tracing();
+    let data = test_data();
     let (torrent, info_hash) = make_torrent(&data);
     let num_pieces = torrent.num_pieces();
     assert_eq!(num_pieces, 3);
@@ -134,26 +198,81 @@ async fn downloads_multi_file_torrent_from_mock_seeder() {
     };
 
     let out = tempfile::tempdir().unwrap();
-    let storage = Arc::new(Storage::new(&torrent.info, out.path()).unwrap());
-    let session = Arc::new(Session {
-        torrent,
-        info_hash,
-        peer_id: generate_peer_id(),
-        storage,
-    });
-
     tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        download_from_peers(session, &[dead_addr, seeder_addr], 10),
+        Duration::from_secs(30),
+        download_from_peers(
+            session(torrent, info_hash, out.path()),
+            &[dead_addr, seeder_addr],
+            10,
+        ),
     )
     .await
     .expect("download timed out")
     .expect("download failed");
 
-    let mut offset = 0;
-    for (name, len) in FILES {
-        let written = std::fs::read(out.path().join("multi/dir").join(name)).unwrap();
-        assert_eq!(written, data[offset..offset + len], "{name} differs");
-        offset += len;
-    }
+    assert_files_match(out.path(), &data);
+}
+
+/// One seeder takes a piece and never sends it. Endgame must fetch that piece
+/// from the healthy seeder and cancel the stalled requests, instead of
+/// waiting out the 30 s read timeout.
+#[tokio::test]
+async fn endgame_finishes_despite_a_stalled_peer() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+
+    let (stalled_requested, stalled_requested_rx) = oneshot::channel();
+    let (cancel_seen, cancel_seen_rx) = oneshot::channel();
+    let stalled = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stalled_addr = stalled.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut socket = accept_leecher(&stalled, info_hash, num_pieces).await;
+        send(&mut socket, PeerMessage::Unchoke).await;
+        let mut stalled_requested = Some(stalled_requested);
+        let mut cancel_seen = Some(cancel_seen);
+        while let Some(message) = read_message(&mut socket).await {
+            match message {
+                PeerMessage::Request { .. } => {
+                    stalled_requested.take().map(|tx| tx.send(()));
+                }
+                PeerMessage::Cancel { .. } => {
+                    cancel_seen.take().map(|tx| tx.send(()));
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // The healthy seeder only unchokes once the stalled one holds a piece, so
+    // the download is guaranteed to need endgame.
+    let healthy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let healthy_addr = healthy.local_addr().unwrap();
+    let healthy_data = Arc::clone(&data);
+    tokio::spawn(async move {
+        let mut socket = accept_leecher(&healthy, info_hash, num_pieces).await;
+        stalled_requested_rx.await.unwrap();
+        send(&mut socket, PeerMessage::Unchoke).await;
+        serve(socket, &healthy_data).await;
+    });
+
+    let out = tempfile::tempdir().unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        download_from_peers(
+            session(torrent, info_hash, out.path()),
+            &[stalled_addr, healthy_addr],
+            10,
+        ),
+    )
+    .await
+    .expect("download stalled behind the slow peer")
+    .expect("download failed");
+
+    assert_files_match(out.path(), &data);
+    tokio::time::timeout(Duration::from_secs(5), cancel_seen_rx)
+        .await
+        .expect("stalled peer never got a Cancel")
+        .unwrap();
 }
