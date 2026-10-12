@@ -16,6 +16,18 @@ A terminal-based BitTorrent client written in Rust.
 - 🔒 **Data Integrity** - SHA-1 hash verification for downloaded pieces
 - 📦 **Bencode Support** - Native torrent file parsing
 
+## Usage
+
+```sh
+cargo run --release -- path/to/file.torrent -o ~/Downloads
+```
+
+Options: `-o, --output <DIR>` (default `.`) and `--max-peers <N>` (default 30). Set `RUST_LOG=debug` for per-peer logs.
+
+Run the tests with `cargo test`. They include a loopback integration test against a mock seeder.
+
+See [ROADMAP.md](ROADMAP.md) for what's done and what's next.
+
 ## Dependencies
 
 - **tokio** - Async runtime
@@ -30,11 +42,16 @@ A terminal-based BitTorrent client written in Rust.
 
 ```
 src/
-├── main.rs      # Entry point
-├── download.rs  # Download coordination and piece management
-├── peer.rs      # Peer connection and message handling
-├── torrent.rs   # Torrent file parsing
+├── main.rs      # CLI entry point (clap + tracing)
+├── lib.rs       # Library root
+├── bencode.rs   # Raw bencode scanning (info-hash span)
+├── download.rs  # Piece queue, peer workers, block pipelining
+├── peer.rs      # Peer wire protocol: handshake, message encode/decode
+├── storage.rs   # Maps pieces onto files on disk (single and multi-file)
+├── torrent.rs   # Torrent file parsing and validation
 └── tracker.rs   # Tracker communication (UDP/HTTP)
+tests/
+└── loopback.rs  # End-to-end download from a mock seeder
 ```
 
 ## How It Works

@@ -1,207 +1,347 @@
-use anyhow::{Result, anyhow};
-use serde::{Deserialize, Serialize};
+use anyhow::{Context, Result, anyhow, bail};
+use serde::Deserialize;
+use serde_bencode::value::Value;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 use tokio::net::UdpSocket;
+use tokio::time::timeout;
+use tracing::{debug, warn};
 use url::Url;
 
-enum UrlProtocol {
-    UDP,
-    HTTP,
-}
+/// BEP 15 magic constant identifying a UDP tracker connect request.
+const UDP_PROTOCOL_ID: u64 = 0x417_2710_1980;
+const UDP_ACTION_CONNECT: u32 = 0;
+const UDP_ACTION_ANNOUNCE: u32 = 1;
+const UDP_ACTION_ERROR: u32 = 3;
+/// Retries with 2s, 4s, 8s timeouts (BEP 15 suggests 15·2ⁿ, too slow for a CLI).
+const UDP_RETRIES: u32 = 3;
+const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[derive(Debug, Clone)]
-pub struct Peer {
-    pub ip: String,
+#[derive(Debug, Clone, Copy)]
+pub struct AnnounceRequest {
+    pub info_hash: [u8; 20],
+    pub peer_id: [u8; 20],
     pub port: u16,
+    pub uploaded: u64,
+    pub downloaded: u64,
+    pub left: u64,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
-struct TrackerResponse {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnnounceResponse {
+    pub peers: Vec<SocketAddr>,
+    /// Seconds the tracker asks us to wait before re-announcing.
+    pub interval: Option<u64>,
+}
+
+/// Announces to each tracker in turn and returns the first non-empty peer list.
+pub async fn announce(trackers: &[String], request: &AnnounceRequest) -> Result<AnnounceResponse> {
+    if trackers.is_empty() {
+        bail!("torrent has no trackers");
+    }
+    for tracker in trackers {
+        match announce_one(tracker, request).await {
+            Ok(response) if !response.peers.is_empty() => {
+                debug!(%tracker, peers = response.peers.len(), "announce succeeded");
+                return Ok(response);
+            }
+            Ok(_) => warn!(%tracker, "tracker returned no peers"),
+            Err(e) => warn!(%tracker, "announce failed: {e:#}"),
+        }
+    }
+    bail!("no tracker returned any peers")
+}
+
+async fn announce_one(tracker: &str, request: &AnnounceRequest) -> Result<AnnounceResponse> {
+    let url = Url::parse(tracker).context("invalid tracker URL")?;
+    match url.scheme() {
+        "udp" => announce_udp(&url, request).await,
+        "http" | "https" => announce_http(tracker, request).await,
+        scheme => bail!("unsupported tracker scheme `{}`", scheme),
+    }
+}
+
+async fn announce_http(tracker: &str, request: &AnnounceRequest) -> Result<AnnounceResponse> {
+    let client = reqwest::Client::builder().timeout(HTTP_TIMEOUT).build()?;
+    let body = client
+        .get(http_announce_url(tracker, request))
+        .send()
+        .await?
+        .bytes()
+        .await?;
+    parse_http_response(&body)
+}
+
+fn http_announce_url(tracker: &str, request: &AnnounceRequest) -> String {
+    let query = format!(
+        "info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}&compact=1&event=started",
+        percent_encode(&request.info_hash),
+        percent_encode(&request.peer_id),
+        request.port,
+        request.uploaded,
+        request.downloaded,
+        request.left,
+    );
+    let separator = if tracker.contains('?') { '&' } else { '?' };
+    format!("{tracker}{separator}{query}")
+}
+
+fn percent_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("%{:02x}", b)).collect()
+}
+
+#[derive(Deserialize)]
+struct HttpTrackerResponse {
+    #[serde(rename = "failure reason", default)]
+    failure_reason: Option<String>,
     #[serde(default)]
     interval: Option<u64>,
-    peers: serde_bytes::ByteBuf,
+    #[serde(default)]
+    peers: Option<Value>,
+    #[serde(default)]
+    peers6: Option<serde_bytes::ByteBuf>,
 }
 
-pub async fn announce(
-    announce_url: &str,
-    info_hash: [u8; 20],
-    downloaded: u64,
-    uploaded: u64,
-    left: u64,
-) -> Result<Vec<Peer>> {
-    let (url, protocol) = format_url(announce_url, info_hash, downloaded, uploaded, left)?;
-    let peers = match protocol {
-        UrlProtocol::UDP => udp_connect(&url, info_hash, downloaded, uploaded, left).await?,
-        UrlProtocol::HTTP => announce_http(&url).await?,
+fn parse_http_response(body: &[u8]) -> Result<AnnounceResponse> {
+    let response: HttpTrackerResponse =
+        serde_bencode::from_bytes(body).context("invalid tracker response")?;
+    if let Some(reason) = response.failure_reason {
+        bail!("tracker error: {}", reason);
+    }
+    let mut peers = match response.peers {
+        // Compact form (BEP 23): 6 bytes per peer.
+        Some(Value::Bytes(bytes)) => parse_compact_v4(&bytes),
+        // Original form: a list of {ip, port, peer id} dicts.
+        Some(Value::List(list)) => list.iter().filter_map(parse_peer_dict).collect(),
+        Some(_) => bail!("unexpected `peers` type in tracker response"),
+        None => Vec::new(),
     };
-    Ok(peers)
+    if let Some(peers6) = response.peers6 {
+        peers.extend(parse_compact_v6(&peers6));
+    }
+    Ok(AnnounceResponse {
+        peers,
+        interval: response.interval,
+    })
 }
 
-async fn udp_connect(
-    url: &str,
-    info_hash: [u8; 20],
-    downloaded: u64,
-    uploaded: u64,
-    left: u64,
-) -> Result<Vec<Peer>> {
-    let parsed = Url::parse(url)?;
-    let host = parsed.host_str().ok_or_else(|| anyhow!("No host"))?;
-    let port = parsed.port().ok_or_else(|| anyhow!("No port"))?;
-
-    let addr = format!("{}:{}", host, port);
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    socket.connect(&addr).await?;
-    let magic_number: u64 = 41727101980;
-    let transaction_id = rand::random::<u32>();
-
-    let mut connect_buf = Vec::new();
-    connect_buf.extend_from_slice(&magic_number.to_be_bytes());
-    connect_buf.extend_from_slice(&0u32.to_be_bytes());
-    connect_buf.extend_from_slice(&transaction_id.to_be_bytes());
-    socket.send(&connect_buf).await?;
-    let mut response = vec![0u8; 16];
-    let n = socket.recv(&mut response).await?;
-    if n > 16 {
-        return Err(anyhow!("Invalid connect response"));
-    }
-    let action = u32::from_be_bytes([response[0], response[1], response[2], response[3]]);
-    let recv_trans_id = u32::from_be_bytes([response[4], response[5], response[6], response[7]]);
-    if action != 0 {
-        return Err(anyhow!("Wrong action in connect response"));
-    }
-
-    if recv_trans_id != transaction_id {
-        return Err(anyhow!("Transaction ID missmatch"));
-    }
-
-    let connection_id_bytes: [u8; 8] = response[8..16].try_into()?;
-    let connection_id = u64::from_be_bytes(connection_id_bytes);
-    let peers = announce_udp(
-        &socket,
-        connection_id,
-        info_hash,
-        downloaded,
-        uploaded,
-        left,
-    )
-    .await?;
-    Ok(peers)
+fn parse_peer_dict(value: &Value) -> Option<SocketAddr> {
+    let Value::Dict(dict) = value else {
+        return None;
+    };
+    let ip = match dict.get(b"ip".as_slice())? {
+        Value::Bytes(ip) => std::str::from_utf8(ip).ok()?.parse::<IpAddr>().ok()?,
+        _ => return None,
+    };
+    let port = match dict.get(b"port".as_slice())? {
+        Value::Int(port) => u16::try_from(*port).ok()?,
+        _ => return None,
+    };
+    Some(SocketAddr::new(ip, port))
 }
 
-async fn announce_udp(
-    socket: &UdpSocket,
-    connection_id: u64,
-    info_hash: [u8; 20],
-    downloaded: u64,
-    uploaded: u64,
-    left: u64,
-) -> Result<Vec<Peer>> {
-    let mut buf = Vec::new();
-    let transaction_id = rand::random::<u32>();
-    let peer_id = b"-RT0001-123456789012";
-
-    // Build announce request packet
-    buf.extend_from_slice(&connection_id.to_be_bytes());
-    buf.extend_from_slice(&1u32.to_be_bytes()); // action = 1 (announce)
-    buf.extend_from_slice(&transaction_id.to_be_bytes());
-    buf.extend_from_slice(&info_hash);
-    buf.extend_from_slice(peer_id);
-    buf.extend_from_slice(&downloaded.to_be_bytes());
-    buf.extend_from_slice(&uploaded.to_be_bytes());
-    buf.extend_from_slice(&left.to_be_bytes());
-    buf.extend_from_slice(&2u32.to_be_bytes()); // event = 2 (started)
-    buf.extend_from_slice(&0u32.to_be_bytes()); // IP = 0 (default)
-    buf.extend_from_slice(&rand::random::<u32>().to_be_bytes()); // key
-    buf.extend_from_slice(&(-1i32).to_be_bytes()); // num_want = -1 (default)
-    buf.extend_from_slice(&6881u16.to_be_bytes()); // port
-
-    // Send announce request
-    socket.send(&buf).await?;
-
-    // Receive announce response
-    let mut response = vec![0u8; 1024];
-    let n = socket.recv(&mut response).await?;
-    response.truncate(n);
-
-    // Parse response
-    if response.len() < 20 {
-        return Err(anyhow!("Response too short"));
-    }
-
-    let action = u32::from_be_bytes([response[0], response[1], response[2], response[3]]);
-    let recv_trans_id = u32::from_be_bytes([response[4], response[5], response[6], response[7]]);
-
-    if action != 1 {
-        return Err(anyhow!("Wrong action in announce response"));
-    }
-
-    if recv_trans_id != transaction_id {
-        return Err(anyhow!("Transaction ID mismatch in announce"));
-    }
-
-    // Extract peers (starting at byte 20)
-    let peers_data = &response[20..];
-    let peers = parse_compact_peers(peers_data)?;
-
-    Ok(peers)
+fn parse_compact_v4(bytes: &[u8]) -> Vec<SocketAddr> {
+    let (chunks, _) = bytes.as_chunks::<6>();
+    chunks
+        .iter()
+        .map(|&[a, b, c, d, p1, p2]| {
+            SocketAddr::new(
+                Ipv4Addr::new(a, b, c, d).into(),
+                u16::from_be_bytes([p1, p2]),
+            )
+        })
+        .collect()
 }
 
-async fn announce_http(url: &str) -> Result<Vec<Peer>> {
-    let response = reqwest::get(url).await?;
-    let body = response.bytes().await?;
-    println!("Response: {:?}", std::str::from_utf8(&body));
-    let tracker_response: TrackerResponse = serde_bencode::from_bytes(&body)?;
-    let peers = parse_compact_peers(&tracker_response.peers)?;
-    Ok(peers)
+fn parse_compact_v6(bytes: &[u8]) -> Vec<SocketAddr> {
+    let (chunks, _) = bytes.as_chunks::<18>();
+    chunks
+        .iter()
+        .map(|chunk| {
+            let (ip, port) = chunk.split_at(16);
+            let ip: [u8; 16] = ip.try_into().unwrap_or_default();
+            SocketAddr::new(
+                Ipv6Addr::from(ip).into(),
+                u16::from_be_bytes([port[0], port[1]]),
+            )
+        })
+        .collect()
 }
 
-fn url_encode_hash(hash: &[u8; 20]) -> String {
-    hash.iter().map(|b| format!("%{:02x}", b)).collect()
-}
+async fn announce_udp(url: &Url, request: &AnnounceRequest) -> Result<AnnounceResponse> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("tracker URL has no host"))?;
+    let port = url
+        .port()
+        .ok_or_else(|| anyhow!("tracker URL has no port"))?;
+    let addr = tokio::net::lookup_host(format!("{host}:{port}"))
+        .await?
+        .next()
+        .ok_or_else(|| anyhow!("could not resolve {}", host))?;
 
-fn parse_compact_peers(peers_bytes: &[u8]) -> Result<Vec<Peer>> {
-    let mut peers = Vec::new();
-
-    for chunk in peers_bytes.chunks_exact(6) {
-        let ip = format!("{}.{}.{}.{}", chunk[0], chunk[1], chunk[2], chunk[3]);
-        let port = u16::from_be_bytes([chunk[4], chunk[5]]);
-
-        peers.push(Peer { ip, port });
-    }
-
-    Ok(peers)
-}
-
-fn format_url(
-    announce_url: &str,
-    info_hash: [u8; 20],
-    downloaded: u64,
-    uploaded: u64,
-    left: u64,
-) -> Result<(String, UrlProtocol)> {
-    let url_type: UrlProtocol = if announce_url.starts_with("udp://") {
-        UrlProtocol::UDP
+    let bind_addr = if addr.is_ipv4() {
+        "0.0.0.0:0"
     } else {
-        UrlProtocol::HTTP
+        "[::]:0"
     };
+    let socket = UdpSocket::bind(bind_addr).await?;
+    socket.connect(addr).await?;
 
-    let url = match url_type {
-        UrlProtocol::UDP => announce_url.to_string(),
-        UrlProtocol::HTTP => {
-            let peer_id = "-RT0001-123456789012";
-            let info_hash_encoded = url_encode_hash(&info_hash);
-            let query = format!(
-                "info_hash={}&peer_id={}&port=6881&uploaded={}&downloaded={}&left={}&compact=1&event=started",
-                info_hash_encoded, peer_id, uploaded, downloaded, left
-            );
+    let mut connect = Vec::with_capacity(16);
+    connect.extend_from_slice(&UDP_PROTOCOL_ID.to_be_bytes());
+    connect.extend_from_slice(&UDP_ACTION_CONNECT.to_be_bytes());
+    let response = udp_transact(&socket, connect, UDP_ACTION_CONNECT).await?;
+    let connection_id = response
+        .get(8..16)
+        .and_then(|b| b.try_into().ok())
+        .map(u64::from_be_bytes)
+        .ok_or_else(|| anyhow!("connect response too short"))?;
 
-            let url = if announce_url.contains('?') {
-                format!("{}&{}", announce_url, query)
-            } else {
-                format!("{}?{}", announce_url, query)
-            };
-            url
+    let mut announce = Vec::with_capacity(98);
+    announce.extend_from_slice(&connection_id.to_be_bytes());
+    announce.extend_from_slice(&UDP_ACTION_ANNOUNCE.to_be_bytes());
+    announce.extend_from_slice(&request.info_hash);
+    announce.extend_from_slice(&request.peer_id);
+    announce.extend_from_slice(&request.downloaded.to_be_bytes());
+    announce.extend_from_slice(&request.left.to_be_bytes());
+    announce.extend_from_slice(&request.uploaded.to_be_bytes());
+    announce.extend_from_slice(&2u32.to_be_bytes()); // event = started
+    announce.extend_from_slice(&0u32.to_be_bytes()); // IP = default
+    announce.extend_from_slice(&rand::random::<u32>().to_be_bytes()); // key
+    announce.extend_from_slice(&(-1i32).to_be_bytes()); // num_want = default
+    announce.extend_from_slice(&request.port.to_be_bytes());
+    let response = udp_transact(&socket, announce, UDP_ACTION_ANNOUNCE).await?;
+    parse_udp_announce(&response, addr.is_ipv6())
+}
+
+/// Sends a request (with a transaction id inserted after the first 12 bytes,
+/// as both request types require) and waits for the matching response,
+/// retrying on timeout.
+async fn udp_transact(socket: &UdpSocket, mut request: Vec<u8>, action: u32) -> Result<Vec<u8>> {
+    let transaction_id = rand::random::<u32>();
+    request.splice(12..12, transaction_id.to_be_bytes());
+
+    for attempt in 0..UDP_RETRIES {
+        socket.send(&request).await?;
+        let wait = Duration::from_secs(2 << attempt);
+        let Ok(response) = timeout(wait, udp_recv(socket, transaction_id)).await else {
+            debug!(attempt, "UDP tracker timed out");
+            continue;
+        };
+        let response = response?;
+        let received_action =
+            u32::from_be_bytes([response[0], response[1], response[2], response[3]]);
+        if received_action == UDP_ACTION_ERROR {
+            bail!("tracker error: {}", String::from_utf8_lossy(&response[8..]));
         }
-    };
+        if received_action != action {
+            bail!("unexpected action {} in tracker response", received_action);
+        }
+        return Ok(response);
+    }
+    bail!("UDP tracker did not respond")
+}
 
-    Ok((url, url_type))
+/// Receives datagrams until one carries our transaction id.
+async fn udp_recv(socket: &UdpSocket, transaction_id: u32) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; 65536];
+    loop {
+        let n = socket.recv(&mut buf).await?;
+        if n >= 8 && buf[4..8] == transaction_id.to_be_bytes() {
+            buf.truncate(n);
+            return Ok(buf);
+        }
+    }
+}
+
+fn parse_udp_announce(response: &[u8], ipv6: bool) -> Result<AnnounceResponse> {
+    if response.len() < 20 {
+        bail!("announce response too short");
+    }
+    let interval = u32::from_be_bytes([response[8], response[9], response[10], response[11]]);
+    let peers = if ipv6 {
+        parse_compact_v6(&response[20..])
+    } else {
+        parse_compact_v4(&response[20..])
+    };
+    Ok(AnnounceResponse {
+        peers,
+        interval: Some(interval.into()),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request() -> AnnounceRequest {
+        AnnounceRequest {
+            info_hash: [0xab; 20],
+            peer_id: *b"-RT0100-abcdefghijkl",
+            port: 6881,
+            uploaded: 1,
+            downloaded: 2,
+            left: 3,
+        }
+    }
+
+    #[test]
+    fn compact_peers() {
+        let peers = parse_compact_v4(&[127, 0, 0, 1, 0x1a, 0xe1, 10, 0, 0, 2, 0, 80, 9]);
+        assert_eq!(
+            peers,
+            [
+                "127.0.0.1:6881".parse().unwrap(),
+                "10.0.0.2:80".parse().unwrap()
+            ]
+        );
+        let mut v6 = vec![0u8; 16];
+        v6[15] = 1;
+        v6.extend_from_slice(&[0, 80]);
+        assert_eq!(parse_compact_v6(&v6), ["[::1]:80".parse().unwrap()]);
+    }
+
+    #[test]
+    fn http_response_compact() {
+        let mut body = b"d8:intervali1800e5:peers6:".to_vec();
+        body.extend_from_slice(&[1, 2, 3, 4, 0, 80]);
+        body.push(b'e');
+        let response = parse_http_response(&body).unwrap();
+        assert_eq!(response.interval, Some(1800));
+        assert_eq!(response.peers, ["1.2.3.4:80".parse().unwrap()]);
+    }
+
+    #[test]
+    fn http_response_dict_list() {
+        let body = b"d5:peersld2:ip7:1.2.3.47:peer id20:aaaaaaaaaaaaaaaaaaaa4:porti6881eed2:ip8:hostname4:porti1eeee";
+        let response = parse_http_response(body).unwrap();
+        assert_eq!(response.peers, ["1.2.3.4:6881".parse().unwrap()]);
+    }
+
+    #[test]
+    fn http_response_failure() {
+        let err = parse_http_response(b"d14:failure reason9:not founde").unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn http_url() {
+        let url = http_announce_url("http://t/announce", &request());
+        assert!(url.starts_with("http://t/announce?info_hash=%ab%ab"));
+        assert!(url.contains("&peer_id=%2d%52%54"));
+        assert!(url.contains("&port=6881&uploaded=1&downloaded=2&left=3&compact=1"));
+        let url = http_announce_url("http://t/announce?key=1", &request());
+        assert!(url.starts_with("http://t/announce?key=1&info_hash="));
+    }
+
+    #[test]
+    fn udp_announce_response() {
+        let mut response = vec![0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0];
+        response.extend_from_slice(&[1, 2, 3, 4, 0, 80]);
+        let parsed = parse_udp_announce(&response, false).unwrap();
+        assert_eq!(parsed.interval, Some(1800));
+        assert_eq!(parsed.peers, ["1.2.3.4:80".parse().unwrap()]);
+        assert!(parse_udp_announce(&response[..19], false).is_err());
+    }
 }
