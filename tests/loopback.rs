@@ -2,6 +2,7 @@
 
 use rtrnt::announcer::Announcer;
 use rtrnt::download::{Interrupted, Session, download_from_peers};
+use rtrnt::extension::ExtendedHandshake;
 use rtrnt::peer::{PeerMessage, generate_peer_id, handshake_bytes, parse_handshake};
 use rtrnt::storage::Storage;
 use rtrnt::torrent::{FileInfo, Info, TorrentFile};
@@ -416,6 +417,10 @@ async fn loses_interest_when_a_peer_has_nothing_left_we_need() {
         let mut received = Vec::new();
         let mut choking_done = Some(choking_done);
         while let Some(message) = read_message(&mut socket).await {
+            // The extension handshake that opens every connection.
+            if matches!(message, PeerMessage::Extended { .. }) {
+                continue;
+            }
             received.push(message);
             if received.last() == Some(&PeerMessage::NotInterested) {
                 choking_done.take().map(|tx| tx.send(()));
@@ -540,6 +545,121 @@ async fn pipelines_requests_across_pieces() {
     let mut pieces: Vec<u32> = queued.iter().map(|&(index, ..)| index).collect();
     pieces.dedup();
     assert_eq!(pieces.len(), 2, "first requests: {queued:?}");
+}
+
+/// The seeder supports the extension protocol and says in its extension
+/// handshake that it queues only two requests. It answers only once no more
+/// requests arrive, so every request we were willing to send is outstanding
+/// by then, and there must never be more than two (a new peer's pipeline
+/// would otherwise allow four).
+#[tokio::test]
+async fn never_exceeds_the_request_queue_a_peer_announces() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+    const REQQ: usize = 2;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seeder_addr = listener.local_addr().unwrap();
+    let seeder_data = Arc::clone(&data);
+    let seeder = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut handshake = [0u8; 68];
+        socket.read_exact(&mut handshake).await.unwrap();
+        assert!(
+            parse_handshake(&handshake, &info_hash)
+                .unwrap()
+                .supports_extensions()
+        );
+        // `handshake_bytes` sets the extension protocol bit.
+        socket
+            .write_all(&handshake_bytes(&info_hash, &generate_peer_id()))
+            .await
+            .unwrap();
+        let theirs = ExtendedHandshake {
+            client: Some("mock seeder".into()),
+            request_queue: Some(REQQ as u32),
+            ..Default::default()
+        };
+        let payload = theirs.encode().unwrap();
+        send(&mut socket, PeerMessage::Extended { id: 0, payload }).await;
+        let all: Vec<usize> = (0..num_pieces).collect();
+        send_bitfield(&mut socket, num_pieces, &all).await;
+        send(&mut socket, PeerMessage::Unchoke).await;
+
+        // Read on a separate task, so waiting for the next message can time
+        // out without losing part of one.
+        let (mut reader, mut writer) = socket.into_split();
+        let (messages_tx, mut messages) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok(len) = reader.read_u32().await {
+                let mut payload = vec![0u8; len as usize];
+                if reader.read_exact(&mut payload).await.is_err() {
+                    break;
+                }
+                let _ = messages_tx.send(PeerMessage::decode(&payload).unwrap());
+            }
+        });
+
+        // Ours comes first.
+        let Some(PeerMessage::Extended { id: 0, payload }) = messages.recv().await else {
+            panic!("no extension handshake");
+        };
+        let ours = ExtendedHandshake::decode(&payload).unwrap();
+        assert!(ours.client.unwrap().starts_with("rtrnt "));
+        assert!(ours.request_queue.is_some());
+
+        let mut outstanding = Vec::new();
+        let mut most_outstanding = 0;
+        loop {
+            match tokio::time::timeout(Duration::from_millis(100), messages.recv()).await {
+                Ok(Some(PeerMessage::Request {
+                    index,
+                    begin,
+                    length,
+                })) => {
+                    outstanding.push((index, begin, length));
+                    most_outstanding = most_outstanding.max(outstanding.len());
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                // No more requests are coming: answer them all.
+                Err(_) => {
+                    for (index, begin, length) in outstanding.drain(..) {
+                        let start = index as usize * PIECE_LENGTH as usize + begin as usize;
+                        let block = seeder_data[start..start + length as usize].to_vec();
+                        let message = PeerMessage::Piece {
+                            index,
+                            begin,
+                            block,
+                        };
+                        writer.write_all(&message.encode()).await.unwrap();
+                    }
+                }
+            }
+        }
+        most_outstanding
+    });
+
+    let out = tempfile::tempdir().unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        download_from_peers(
+            session(torrent, info_hash, out.path()),
+            &vec![false; num_pieces],
+            &[seeder_addr],
+            10,
+            None,
+            None,
+            pending(),
+        ),
+    )
+    .await
+    .expect("download timed out")
+    .expect("download failed");
+    assert_files_match(out.path(), &data);
+    assert_eq!(seeder.await.unwrap(), REQQ);
 }
 
 /// Data left by an interrupted run is hashed at startup: intact pieces are

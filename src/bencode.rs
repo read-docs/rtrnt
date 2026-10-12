@@ -31,6 +31,15 @@ pub fn info_span(data: &[u8]) -> Result<Range<usize>> {
     }
 }
 
+/// Length of the bencoded value at the start of `data`, which may be
+/// followed by other bytes. Also bounds the nesting depth, so the value is
+/// safe to hand to `serde_bencode`.
+pub fn value_len(data: &[u8]) -> Result<usize> {
+    let mut pos = 0;
+    skip_value(data, &mut pos, 0)?;
+    Ok(pos)
+}
+
 /// Parses `<len>:<bytes>` at `pos` and returns the bytes.
 fn parse_string<'a>(data: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> {
     let colon = data[*pos..]
@@ -129,5 +138,17 @@ mod tests {
         let mut data = b"d4:info".to_vec();
         data.extend(std::iter::repeat_n(b'l', 1000));
         assert!(info_span(&data).is_err());
+        assert!(value_len(&data).is_err());
+    }
+
+    #[test]
+    fn measures_a_value_followed_by_other_bytes() {
+        assert_eq!(value_len(b"d1:ali1eee").unwrap(), 10);
+        assert_eq!(value_len(b"d1:ali1eeeextra").unwrap(), 10);
+        assert_eq!(value_len(b"i42e").unwrap(), 4);
+        assert_eq!(value_len(b"3:abcd").unwrap(), 5);
+        for case in [&b""[..], b"d1:a", b"x", b"5:abc"] {
+            assert!(value_len(case).is_err(), "accepted {case:?}");
+        }
     }
 }
