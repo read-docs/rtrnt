@@ -68,7 +68,7 @@ pub async fn download_file(torrent_path: &Path, config: &DownloadConfig) -> Resu
         left: torrent.length(),
         event: AnnounceEvent::Started,
     };
-    let (announcer, peers) = Announcer::start(torrent.trackers(), request).await?;
+    let (announcer, peers) = Announcer::start(torrent.tracker_tiers(), request).await?;
     if peers.is_empty() {
         announcer.stop(false, 0).await;
         bail!("no tracker returned any peers");

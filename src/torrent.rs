@@ -3,6 +3,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use sha1::Digest;
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Pieces are held in memory while downloading, so refuse absurd sizes.
@@ -75,17 +76,29 @@ impl TorrentFile {
             .ok_or_else(|| anyhow!("piece index {} out of range", index))
     }
 
-    /// All tracker URLs, `announce` first, then `announce-list` tiers in
-    /// order, without duplicates.
-    pub fn trackers(&self) -> Vec<String> {
-        let tiers = self.announce_list.iter().flatten().flatten();
-        let mut trackers: Vec<String> = Vec::new();
-        for url in self.announce.iter().chain(tiers) {
-            if !trackers.contains(url) {
-                trackers.push(url.clone());
-            }
-        }
-        trackers
+    /// Tracker URLs in tiers (BEP 12): the `announce-list` tiers if it names
+    /// any tracker, in which case `announce` is ignored, otherwise
+    /// `announce` alone. A URL listed twice is kept where it first appears,
+    /// and empty tiers are dropped.
+    pub fn tracker_tiers(&self) -> Vec<Vec<String>> {
+        let listed = self
+            .announce_list
+            .as_ref()
+            .filter(|tiers| tiers.iter().any(|tier| !tier.is_empty()));
+        let tiers = match listed {
+            Some(tiers) => tiers.clone(),
+            None => self.announce.iter().map(|url| vec![url.clone()]).collect(),
+        };
+        let mut seen = HashSet::new();
+        tiers
+            .into_iter()
+            .map(|tier| -> Vec<String> {
+                tier.into_iter()
+                    .filter(|url| seen.insert(url.clone()))
+                    .collect()
+            })
+            .filter(|tier| !tier.is_empty())
+            .collect()
     }
 
     fn validate(&self) -> Result<()> {
@@ -176,14 +189,28 @@ mod tests {
     }
 
     #[test]
-    fn trackers_are_ordered_and_deduplicated() {
+    fn tracker_tiers_follow_bep_12() {
         let mut t = single_file(10, 32);
-        t.announce = Some("udp://a".into());
+        assert!(t.tracker_tiers().is_empty());
+
+        t.announce = Some("udp://x".into());
+        assert_eq!(t.tracker_tiers(), [["udp://x"]]);
+        // An announce-list without trackers does not count.
+        t.announce_list = Some(vec![vec![]]);
+        assert_eq!(t.tracker_tiers(), [["udp://x"]]);
+
+        // Otherwise it replaces `announce`; duplicates and the tiers they
+        // leave empty are dropped.
         t.announce_list = Some(vec![
             vec!["udp://a".into(), "http://b".into()],
+            vec![],
             vec!["http://c".into(), "http://b".into()],
+            vec!["udp://a".into()],
         ]);
-        assert_eq!(t.trackers(), ["udp://a", "http://b", "http://c"]);
+        assert_eq!(
+            t.tracker_tiers(),
+            [vec!["udp://a", "http://b"], vec!["http://c"]]
+        );
     }
 
     #[test]
@@ -198,7 +225,7 @@ mod tests {
 
         let (torrent, hash) = parse(&data).unwrap();
         assert_eq!(torrent.info.name, "file");
-        assert_eq!(torrent.trackers(), ["http://x"]);
+        assert_eq!(torrent.tracker_tiers(), [["http://x"]]);
         let expected: [u8; 20] = sha1::Sha1::digest(&info).into();
         assert_eq!(hash, expected);
     }

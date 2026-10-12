@@ -436,7 +436,9 @@ async fn reports_events_and_progress_to_the_tracker() {
         left: total,
         event: AnnounceEvent::Started,
     };
-    let (announcer, peers) = Announcer::start(vec![tracker_url], request).await.unwrap();
+    let (announcer, peers) = Announcer::start(vec![vec![tracker_url]], request)
+        .await
+        .unwrap();
     assert_eq!(peers, [seeder_addr]);
 
     let out = tempfile::tempdir().unwrap();

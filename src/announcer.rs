@@ -2,10 +2,9 @@
 //! tracker's interval with real stats, and sends `completed` and `stopped`
 //! at the end.
 
-use crate::tracker::{self, AnnounceEvent, AnnounceRequest, AnnounceResponse};
+use crate::tracker::{AnnounceEvent, AnnounceRequest, AnnounceResponse, Tiers};
 use anyhow::Result;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -21,7 +20,7 @@ const MAX_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Announcer {
-    trackers: Arc<[String]>,
+    trackers: Tiers,
     /// The `started` request. Later announces send its stats updated.
     started: AnnounceRequest,
     interval: Duration,
@@ -31,25 +30,28 @@ pub struct Announcer {
     last: Instant,
     /// When the next announce is due.
     next: Instant,
-    in_flight: Option<JoinHandle<Result<AnnounceResponse>>>,
+    /// A background announce. It works on a copy of the tiers and hands it
+    /// back, reordered to put the tracker that answered first.
+    in_flight: Option<JoinHandle<(Tiers, Result<AnnounceResponse>)>>,
 }
 
 impl Announcer {
-    /// Sends `request` as the `started` announce. Returns the announcer and
-    /// the peers the tracker sent back, which may be none.
+    /// Sends `request` as the `started` announce to the tracker `tiers`.
+    /// Returns the announcer and the peers the tracker sent back, which may
+    /// be none.
     pub async fn start(
-        trackers: Vec<String>,
+        tiers: Vec<Vec<String>>,
         request: AnnounceRequest,
     ) -> Result<(Self, Vec<SocketAddr>)> {
-        let mut announcer = Self::new(trackers, request, Instant::now());
-        let response = tracker::announce(&announcer.trackers, &announcer.started).await?;
+        let mut announcer = Self::new(Tiers::new(tiers), request, Instant::now());
+        let response = announcer.trackers.announce(&announcer.started).await?;
         announcer.schedule(&response);
         Ok((announcer, response.peers))
     }
 
-    fn new(trackers: Vec<String>, request: AnnounceRequest, now: Instant) -> Self {
+    fn new(trackers: Tiers, request: AnnounceRequest, now: Instant) -> Self {
         Self {
-            trackers: trackers.into(),
+            trackers,
             started: AnnounceRequest {
                 event: AnnounceEvent::Started,
                 ..request
@@ -103,11 +105,20 @@ impl Announcer {
             self.last = Instant::now();
         }
         let request = self.request(AnnounceEvent::Regular, downloaded.load(Ordering::Relaxed));
-        let trackers = Arc::clone(&self.trackers);
         let handle = self.in_flight.get_or_insert_with(|| {
-            tokio::spawn(async move { tracker::announce(&trackers, &request).await })
+            let mut trackers = self.trackers.clone();
+            tokio::spawn(async move {
+                let result = trackers.announce(&request).await;
+                (trackers, result)
+            })
         });
-        let result = handle.await.map_err(anyhow::Error::from).and_then(|r| r);
+        let result = match handle.await {
+            Ok((trackers, result)) => {
+                self.trackers = trackers;
+                result
+            }
+            Err(e) => Err(e.into()),
+        };
         self.in_flight = None;
         match result {
             Ok(response) => {
@@ -138,7 +149,7 @@ impl Announcer {
         let send = async {
             for &event in events {
                 let request = self.request(event, downloaded);
-                match tracker::announce(&self.trackers, &request).await {
+                match self.trackers.announce(&request).await {
                     Ok(_) => debug!(?event, "announced"),
                     Err(e) => warn!(?event, "announce failed: {e:#}"),
                 }
@@ -164,7 +175,8 @@ mod tests {
             left: 1000,
             event: AnnounceEvent::Regular,
         };
-        Announcer::new(vec!["http://t/announce".into()], request, now)
+        let trackers = Tiers::new(vec![vec!["http://t/announce".into()]]);
+        Announcer::new(trackers, request, now)
     }
 
     fn response(interval: Option<u64>, min_interval: Option<u64>) -> AnnounceResponse {

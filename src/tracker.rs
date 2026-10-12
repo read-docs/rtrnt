@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
+use rand::seq::SliceRandom;
 use serde::Deserialize;
 use serde_bencode::value::Value;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -72,28 +73,65 @@ pub struct AnnounceResponse {
     pub min_interval: Option<u64>,
 }
 
-/// Announces to each tracker in turn. When looking for peers, returns the
-/// first response with any, or an empty one if no tracker had peers; when
-/// only reporting (`completed`, `stopped`), returns the first success.
-pub async fn announce(trackers: &[String], request: &AnnounceRequest) -> Result<AnnounceResponse> {
-    if trackers.is_empty() {
-        bail!("torrent has no trackers");
-    }
-    let mut empty = None;
-    for tracker in trackers {
-        match announce_one(tracker, request).await {
-            Ok(response) if !response.peers.is_empty() || !request.event.wants_peers() => {
-                debug!(%tracker, event = ?request.event, peers = response.peers.len(), "announce succeeded");
-                return Ok(response);
-            }
-            Ok(response) => {
-                warn!(%tracker, "tracker returned no peers");
-                empty.get_or_insert(response);
-            }
-            Err(e) => warn!(%tracker, "announce failed: {e:#}"),
+/// A torrent's trackers in tiers (BEP 12). Tiers are tried in order, and the
+/// trackers within a tier one after another. The tracker that answers moves
+/// to the front of its tier, so it is asked first next time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tiers(Vec<Vec<String>>);
+
+impl Tiers {
+    /// Shuffles each tier, as BEP 12 asks, so clients spread their load
+    /// across a tier's trackers.
+    pub fn new(mut tiers: Vec<Vec<String>>) -> Self {
+        let mut rng = rand::rng();
+        for tier in &mut tiers {
+            tier.shuffle(&mut rng);
         }
+        Self(tiers)
     }
-    empty.ok_or_else(|| anyhow!("every tracker failed"))
+
+    /// Announces to each tracker in turn. When looking for peers, returns
+    /// the first response with any, or else the first empty one; when only
+    /// reporting (`completed`, `stopped`), returns the first success.
+    pub async fn announce(&mut self, request: &AnnounceRequest) -> Result<AnnounceResponse> {
+        self.announce_with(request, announce_one).await
+    }
+
+    async fn announce_with(
+        &mut self,
+        request: &AnnounceRequest,
+        mut announce_one: impl AsyncFnMut(&str, &AnnounceRequest) -> Result<AnnounceResponse>,
+    ) -> Result<AnnounceResponse> {
+        if self.0.iter().all(Vec::is_empty) {
+            bail!("torrent has no trackers");
+        }
+        let mut empty = None;
+        for tier in 0..self.0.len() {
+            for index in 0..self.0[tier].len() {
+                let tracker = &self.0[tier][index];
+                match announce_one(tracker, request).await {
+                    Ok(response) if !response.peers.is_empty() || !request.event.wants_peers() => {
+                        debug!(%tracker, event = ?request.event, peers = response.peers.len(), "announce succeeded");
+                        self.promote(tier, index);
+                        return Ok(response);
+                    }
+                    Ok(response) => {
+                        warn!(%tracker, "tracker returned no peers");
+                        empty.get_or_insert((tier, index, response));
+                    }
+                    Err(e) => warn!(%tracker, "announce failed: {e:#}"),
+                }
+            }
+        }
+        let (tier, index, response) = empty.ok_or_else(|| anyhow!("every tracker failed"))?;
+        self.promote(tier, index);
+        Ok(response)
+    }
+
+    /// Moves a tracker to the front of its tier, keeping the others' order.
+    fn promote(&mut self, tier: usize, index: usize) {
+        self.0[tier][..=index].rotate_right(1);
+    }
 }
 
 async fn announce_one(tracker: &str, request: &AnnounceRequest) -> Result<AnnounceResponse> {
@@ -337,6 +375,122 @@ mod tests {
             left: 3,
             event: AnnounceEvent::Started,
         }
+    }
+
+    fn tiers(tiers: &[&[&str]]) -> Tiers {
+        Tiers(
+            tiers
+                .iter()
+                .map(|tier| tier.iter().map(|t| t.to_string()).collect())
+                .collect(),
+        )
+    }
+
+    /// Announces `event` with canned answers: a tracker listed in `answers`
+    /// returns that many peers, any other fails. Also returns the trackers
+    /// asked, in order.
+    async fn announce_fake(
+        tiers: &mut Tiers,
+        event: AnnounceEvent,
+        answers: &[(&str, usize)],
+    ) -> (Result<AnnounceResponse>, Vec<String>) {
+        let mut asked = Vec::new();
+        let request = AnnounceRequest { event, ..request() };
+        let result = tiers
+            .announce_with(
+                &request,
+                async |tracker: &str, _: &AnnounceRequest| -> Result<AnnounceResponse> {
+                    asked.push(tracker.to_string());
+                    let &(_, peers) = answers
+                        .iter()
+                        .find(|(t, _)| *t == tracker)
+                        .ok_or_else(|| anyhow!("tracker down"))?;
+                    Ok(AnnounceResponse {
+                        peers: vec!["1.2.3.4:80".parse().unwrap(); peers],
+                        interval: None,
+                        min_interval: None,
+                    })
+                },
+            )
+            .await;
+        (result, asked)
+    }
+
+    #[tokio::test]
+    async fn the_tracker_that_answers_moves_to_the_front_of_its_tier() {
+        let mut t = tiers(&[&["a", "b", "c"], &["d"]]);
+        let (result, asked) = announce_fake(&mut t, AnnounceEvent::Started, &[("c", 1)]).await;
+        assert_eq!(result.unwrap().peers.len(), 1);
+        assert_eq!(asked, ["a", "b", "c"]);
+        assert_eq!(t, tiers(&[&["c", "a", "b"], &["d"]]));
+
+        let (_, asked) = announce_fake(&mut t, AnnounceEvent::Regular, &[("c", 1)]).await;
+        assert_eq!(asked, ["c"]);
+    }
+
+    #[tokio::test]
+    async fn later_tiers_are_tried_when_a_tier_fails() {
+        let mut t = tiers(&[&["a", "b"], &["c", "d"]]);
+        let (result, asked) = announce_fake(&mut t, AnnounceEvent::Started, &[("d", 2)]).await;
+        assert_eq!(result.unwrap().peers.len(), 2);
+        assert_eq!(asked, ["a", "b", "c", "d"]);
+        assert_eq!(t, tiers(&[&["a", "b"], &["d", "c"]]));
+    }
+
+    #[tokio::test]
+    async fn trackers_without_peers_are_skipped_only_when_looking_for_peers() {
+        let answers = [("b", 0), ("c", 3)];
+        let mut t = tiers(&[&["a", "b", "c"]]);
+        let (result, asked) = announce_fake(&mut t, AnnounceEvent::Regular, &answers).await;
+        assert_eq!(result.unwrap().peers.len(), 3);
+        assert_eq!(asked, ["a", "b", "c"]);
+        assert_eq!(t, tiers(&[&["c", "a", "b"]]));
+
+        let mut t = tiers(&[&["a", "b", "c"]]);
+        let (result, asked) = announce_fake(&mut t, AnnounceEvent::Stopped, &answers).await;
+        assert!(result.unwrap().peers.is_empty());
+        assert_eq!(asked, ["a", "b"]);
+        assert_eq!(t, tiers(&[&["b", "a", "c"]]));
+
+        // No tracker has peers: the first one that answered wins.
+        let mut t = tiers(&[&["a"], &["b", "c"]]);
+        let (result, _) =
+            announce_fake(&mut t, AnnounceEvent::Started, &[("c", 0), ("a", 0)]).await;
+        assert!(result.unwrap().peers.is_empty());
+        assert_eq!(t, tiers(&[&["a"], &["b", "c"]]));
+    }
+
+    #[tokio::test]
+    async fn fails_when_no_tracker_answers() {
+        let mut t = tiers(&[&["a"], &["b"]]);
+        let (result, asked) = announce_fake(&mut t, AnnounceEvent::Started, &[]).await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("every tracker failed")
+        );
+        assert_eq!(asked, ["a", "b"]);
+        assert_eq!(t, tiers(&[&["a"], &["b"]]));
+
+        for mut empty in [tiers(&[]), tiers(&[&[], &[]])] {
+            let (result, asked) = announce_fake(&mut empty, AnnounceEvent::Started, &[]).await;
+            assert!(result.unwrap_err().to_string().contains("no trackers"));
+            assert!(asked.is_empty());
+        }
+    }
+
+    #[test]
+    fn new_shuffles_within_tiers_only() {
+        let original = tiers(&[&["a", "b", "c"], &["d", "e"]]);
+        let mut orders = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let Tiers(mut shuffled) = Tiers::new(original.0.clone());
+            orders.insert(shuffled[0].clone());
+            shuffled.iter_mut().for_each(|tier| tier.sort());
+            assert_eq!(Tiers(shuffled), original);
+        }
+        assert!(orders.len() > 1, "tiers were never shuffled");
     }
 
     #[test]
