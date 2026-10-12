@@ -61,6 +61,7 @@ src/
 ├── bencode.rs   # Raw bencode scanning (info-hash span)
 ├── config.rs    # Config file loading and CLI > file > default precedence
 ├── download.rs  # Piece queue, peer workers, block pipelining
+├── extension.rs # Extension protocol (BEP 10) handshake
 ├── peer.rs      # Peer wire protocol: handshake, message encode/decode
 ├── peer_pool.rs # Known peers, retry backoff and bans
 ├── storage.rs   # Maps pieces onto files on disk (single and multi-file)

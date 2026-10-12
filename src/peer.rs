@@ -1,3 +1,4 @@
+use crate::extension::{self, ExtendedHandshake};
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::{Buf, BytesMut};
 use rand::Rng;
@@ -5,6 +6,7 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, Instant, timeout};
+use tracing::debug;
 
 /// Port we listen on for incoming peers unless told otherwise.
 pub const DEFAULT_LISTEN_PORT: u16 = 6881;
@@ -61,7 +63,14 @@ pub enum PeerMessage {
     Port {
         port: u16,
     },
-    /// A message type we don't implement (e.g. extensions); it is skipped.
+    /// A message of the extension protocol (BEP 10). `id` 0 is the extension
+    /// handshake; any other id is one the receiver chose for an extension.
+    Extended {
+        id: u8,
+        payload: Vec<u8>,
+    },
+    /// A message type we don't implement (e.g. the fast extension); it is
+    /// skipped.
     Unknown {
         id: u8,
     },
@@ -118,6 +127,11 @@ impl PeerMessage {
             PeerMessage::Port { port } => {
                 payload.push(9);
                 payload.extend_from_slice(&port.to_be_bytes());
+            }
+            PeerMessage::Extended { id, payload: body } => {
+                payload.push(20);
+                payload.push(*id);
+                payload.extend_from_slice(body);
             }
             PeerMessage::Unknown { id } => payload.push(*id),
         }
@@ -190,6 +204,15 @@ impl PeerMessage {
                     port: u16::from_be_bytes([body[0], body[1]]),
                 }
             }
+            20 => {
+                let Some((&id, payload)) = body.split_first() else {
+                    bail!("extended message has no extended id");
+                };
+                PeerMessage::Extended {
+                    id,
+                    payload: payload.to_vec(),
+                }
+            }
             id => PeerMessage::Unknown { id },
         };
         Ok(message)
@@ -204,28 +227,64 @@ fn be_u32(bytes: &[u8], at: usize) -> Result<u32> {
         .ok_or_else(|| anyhow!("message truncated"))
 }
 
+/// Our handshake.
 pub fn handshake_bytes(info_hash: &[u8; 20], peer_id: &[u8; 20]) -> [u8; 68] {
     let mut handshake = [0u8; 68];
     handshake[0] = PROTOCOL.len() as u8;
     handshake[1..20].copy_from_slice(PROTOCOL);
-    // bytes 20..28 are reserved extension bits, all zero
+    // Bytes 20..28 are reserved extension bits. We only set the extension
+    // protocol's (BEP 10).
+    handshake[20 + extension::RESERVED_BYTE] |= extension::RESERVED_BIT;
     handshake[28..48].copy_from_slice(info_hash);
     handshake[48..68].copy_from_slice(peer_id);
     handshake
 }
 
-/// Validates a handshake and returns the remote peer id.
-pub fn parse_handshake(handshake: &[u8; 68], info_hash: &[u8; 20]) -> Result<[u8; 20]> {
+/// What a peer told us in its handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Handshake {
+    pub peer_id: [u8; 20],
+    /// The extension bits the peer set.
+    pub reserved: [u8; 8],
+}
+
+impl Handshake {
+    /// Whether the peer supports the extension protocol (BEP 10).
+    pub fn supports_extensions(&self) -> bool {
+        self.reserved[extension::RESERVED_BYTE] & extension::RESERVED_BIT != 0
+    }
+}
+
+/// Validates a handshake and returns what the peer told us in it.
+pub fn parse_handshake(handshake: &[u8; 68], info_hash: &[u8; 20]) -> Result<Handshake> {
     if handshake[0] as usize != PROTOCOL.len() || &handshake[1..20] != PROTOCOL {
         bail!("peer does not speak the BitTorrent protocol");
     }
     if &handshake[28..48] != info_hash {
         bail!("info hash mismatch");
     }
-    let mut peer_id = [0u8; 20];
-    peer_id.copy_from_slice(&handshake[48..68]);
-    Ok(peer_id)
+    let mut parsed = Handshake {
+        peer_id: [0u8; 20],
+        reserved: [0u8; 8],
+    };
+    parsed.reserved.copy_from_slice(&handshake[20..28]);
+    parsed.peer_id.copy_from_slice(&handshake[48..68]);
+    Ok(parsed)
 }
+
+/// A peer sent something no honest peer would, such as a malformed
+/// extension handshake. Unlike a failed connection, this is no reason to try
+/// the peer again.
+#[derive(Debug)]
+pub struct ProtocolViolation(pub &'static str);
+
+impl std::fmt::Display for ProtocolViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ProtocolViolation {}
 
 pub struct PeerConnection {
     socket: TcpStream,
@@ -236,15 +295,22 @@ pub struct PeerConnection {
     peer_has: Vec<bool>,
     am_interested: bool,
     last_sent: Instant,
+    /// Whether both sides support the extension protocol (BEP 10).
+    extensions: bool,
+    /// The peer's extension handshake, once it has sent one.
+    peer_extensions: Option<ExtendedHandshake>,
 }
 
 impl PeerConnection {
-    /// Connects to `addr` and performs the handshake.
+    /// Connects to `addr` and performs the handshake, followed by the
+    /// extension handshake if the peer supports it. `listen_port` is the
+    /// port we accept incoming peers on, if any.
     pub async fn connect(
         addr: SocketAddr,
         info_hash: [u8; 20],
         peer_id: [u8; 20],
         num_pieces: usize,
+        listen_port: Option<u16>,
     ) -> Result<Self> {
         let mut socket = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
@@ -260,50 +326,103 @@ impl PeerConnection {
         })
         .await
         .context("handshake timed out")??;
-        let remote_id = parse_handshake(&response, &info_hash)?;
-        Ok(Self::new(socket, addr, remote_id, num_pieces))
+        let handshake = parse_handshake(&response, &info_hash)?;
+        let mut conn = Self::new(socket, addr, handshake, num_pieces);
+        conn.send_extension_handshake(listen_port).await?;
+        Ok(conn)
     }
 
     /// Performs the handshake on a connection that the peer at `addr` opened
     /// to us. The peer speaks first, and we answer only if it asks for our
-    /// torrent.
+    /// torrent. The extension handshake follows as in `connect`.
     pub async fn accept(
         mut socket: TcpStream,
         addr: SocketAddr,
         info_hash: [u8; 20],
         peer_id: [u8; 20],
         num_pieces: usize,
+        listen_port: Option<u16>,
     ) -> Result<Self> {
-        let remote_id = timeout(HANDSHAKE_TIMEOUT, async {
+        let handshake = timeout(HANDSHAKE_TIMEOUT, async {
             let mut handshake = [0u8; 68];
             socket.read_exact(&mut handshake).await?;
-            let remote_id = parse_handshake(&handshake, &info_hash)?;
+            let handshake = parse_handshake(&handshake, &info_hash)?;
             socket
                 .write_all(&handshake_bytes(&info_hash, &peer_id))
                 .await?;
-            anyhow::Ok(remote_id)
+            anyhow::Ok(handshake)
         })
         .await
         .context("handshake timed out")??;
         // Our own outgoing connection, to an address a tracker listed. Having
         // answered, the other end sees our id too and gives up on it.
-        if remote_id == peer_id {
+        if handshake.peer_id == peer_id {
             bail!("connected to ourselves");
         }
-        Ok(Self::new(socket, addr, remote_id, num_pieces))
+        let mut conn = Self::new(socket, addr, handshake, num_pieces);
+        conn.send_extension_handshake(listen_port).await?;
+        Ok(conn)
     }
 
-    fn new(socket: TcpStream, addr: SocketAddr, peer_id: [u8; 20], num_pieces: usize) -> Self {
+    fn new(socket: TcpStream, addr: SocketAddr, handshake: Handshake, num_pieces: usize) -> Self {
         Self {
             socket,
             read_buf: BytesMut::with_capacity(32 * 1024),
             addr,
-            peer_id,
+            peer_id: handshake.peer_id,
             peer_choking: true,
             peer_has: vec![false; num_pieces],
             am_interested: false,
             last_sent: Instant::now(),
+            // We always set the bit ourselves.
+            extensions: handshake.supports_extensions(),
+            peer_extensions: None,
         }
+    }
+
+    /// Sends our extension handshake if the peer supports the extension
+    /// protocol. It goes out right after the handshake, before anything else.
+    async fn send_extension_handshake(&mut self, listen_port: Option<u16>) -> Result<()> {
+        if !self.extensions {
+            return Ok(());
+        }
+        let payload = ExtendedHandshake::ours(listen_port, self.addr.ip()).encode()?;
+        self.send(&PeerMessage::Extended {
+            id: extension::HANDSHAKE_ID,
+            payload,
+        })
+        .await
+    }
+
+    /// Whether both sides support the extension protocol (BEP 10), so that
+    /// extended messages may be sent.
+    pub fn supports_extensions(&self) -> bool {
+        self.extensions
+    }
+
+    /// The peer's extension handshake, once it has sent one. Its `id` method
+    /// gives the id to send an extension's messages with.
+    pub fn peer_extensions(&self) -> Option<&ExtendedHandshake> {
+        self.peer_extensions.as_ref()
+    }
+
+    /// How many requests the peer queues before dropping more (its `reqq`),
+    /// if it told us.
+    pub fn request_limit(&self) -> Option<usize> {
+        let reqq = self.peer_extensions.as_ref()?.request_queue?;
+        usize::try_from(reqq).ok()
+    }
+
+    /// Sends `payload` as a message of the extension `name`, with the id the
+    /// peer asked for in its extension handshake. Fails if the peer has not
+    /// said it supports the extension.
+    pub async fn send_extended(&mut self, name: &str, payload: Vec<u8>) -> Result<()> {
+        let id = self
+            .peer_extensions
+            .as_ref()
+            .and_then(|handshake| handshake.id(name))
+            .ok_or_else(|| anyhow!("peer does not support the {name} extension"))?;
+        self.send(&PeerMessage::Extended { id, payload }).await
     }
 
     pub fn is_choked(&self) -> bool {
@@ -416,6 +535,25 @@ impl PeerConnection {
                     *has = bitfield[i / 8] & (0x80 >> (i % 8)) != 0;
                 }
             }
+            PeerMessage::Extended {
+                id: extension::HANDSHAKE_ID,
+                payload,
+            } => {
+                let handshake = ExtendedHandshake::decode(payload)
+                    .context(ProtocolViolation("malformed extension handshake"))?;
+                debug!(
+                    addr = %self.addr,
+                    client = handshake.client.as_deref().unwrap_or("unknown"),
+                    reqq = ?handshake.request_queue,
+                    extensions = ?handshake.extensions,
+                    "extension handshake"
+                );
+                // A peer may send it again to change what it supports.
+                match &mut self.peer_extensions {
+                    Some(known) => known.update(handshake),
+                    None => self.peer_extensions = Some(handshake),
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -459,7 +597,15 @@ mod tests {
                 length: 3,
             },
             PeerMessage::Port { port: 6881 },
-            PeerMessage::Unknown { id: 20 },
+            PeerMessage::Extended {
+                id: 0,
+                payload: b"de".to_vec(),
+            },
+            PeerMessage::Extended {
+                id: 3,
+                payload: vec![],
+            },
+            PeerMessage::Unknown { id: 21 },
         ];
         for message in messages {
             let frame = message.encode();
@@ -478,6 +624,7 @@ mod tests {
             &[7, 0, 0, 0, 0, 0, 0, 0],
             &[8],
             &[9, 1],
+            &[20],
         ];
         for case in cases {
             assert!(PeerMessage::decode(case).is_err(), "accepted {:?}", case);
@@ -492,12 +639,32 @@ mod tests {
         assert!(peer_id[8..].iter().all(u8::is_ascii_alphanumeric));
 
         let handshake = handshake_bytes(&info_hash, &peer_id);
-        assert_eq!(parse_handshake(&handshake, &info_hash).unwrap(), peer_id);
+        assert_eq!(handshake[20..28], [0, 0, 0, 0, 0, 0x10, 0, 0]);
+        let parsed = parse_handshake(&handshake, &info_hash).unwrap();
+        assert_eq!(parsed.peer_id, peer_id);
+        assert!(parsed.supports_extensions());
         assert!(parse_handshake(&handshake, &[4u8; 20]).is_err());
 
         let mut bad = handshake;
         bad[5] = b'x';
         assert!(parse_handshake(&bad, &info_hash).is_err());
+
+        // Other clients' bits are recorded, and the extension bit read alone.
+        let mut other = handshake;
+        other[20..28].copy_from_slice(&[0x80, 0, 0, 0, 0, 0xef, 0, 0x05]);
+        let parsed = parse_handshake(&other, &info_hash).unwrap();
+        assert_eq!(parsed.reserved, [0x80, 0, 0, 0, 0, 0xef, 0, 0x05]);
+        assert!(!parsed.supports_extensions());
+    }
+
+    /// A mock peer's handshake, with the extension protocol bit cleared
+    /// unless `extensions`.
+    fn remote_handshake(info_hash: &[u8; 20], extensions: bool) -> [u8; 68] {
+        let mut handshake = handshake_bytes(info_hash, &[1u8; 20]);
+        if !extensions {
+            handshake[20 + extension::RESERVED_BYTE] = 0;
+        }
+        handshake
     }
 
     #[tokio::test]
@@ -509,7 +676,8 @@ mod tests {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut handshake = [0u8; 68];
             socket.read_exact(&mut handshake).await.unwrap();
-            let reply = handshake_bytes(&info_hash, &[1u8; 20]);
+            // Without the extension protocol, so no extension handshake.
+            let reply = remote_handshake(&info_hash, false);
             socket.write_all(&reply).await.unwrap();
             let mut received = Vec::new();
             while let Ok(len) = socket.read_u32().await {
@@ -520,9 +688,10 @@ mod tests {
             received
         });
 
-        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1)
+        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1, Some(6881))
             .await
             .unwrap();
+        assert!(!conn.supports_extensions());
         conn.keep_alive().await.unwrap();
         conn.set_interested(false).await.unwrap();
         conn.set_interested(true).await.unwrap();
@@ -566,7 +735,7 @@ mod tests {
                 socket.read_exact(&mut reply).await.ok().map(|_| reply)
             });
             let (socket, from) = listener.accept().await.unwrap();
-            let result = PeerConnection::accept(socket, from, info_hash, ours, 1).await;
+            let result = PeerConnection::accept(socket, from, info_hash, ours, 1, None).await;
             assert_eq!(result.is_ok(), accepted, "{:?}", result.as_ref().err());
             if let Ok(conn) = &result {
                 assert_eq!(conn.peer_id, theirs);
@@ -579,5 +748,107 @@ mod tests {
                 assert_eq!(reply, handshake_bytes(&info_hash, &ours));
             }
         }
+    }
+
+    async fn read_message(socket: &mut TcpStream) -> PeerMessage {
+        let len = socket.read_u32().await.unwrap();
+        let mut payload = vec![0u8; len as usize];
+        socket.read_exact(&mut payload).await.unwrap();
+        PeerMessage::decode(&payload).unwrap()
+    }
+
+    #[tokio::test]
+    async fn exchanges_extension_handshakes() {
+        let info_hash = [5u8; 20];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let metadata_request = b"d8:msg_typei0e5:piecei0ee".to_vec();
+        let remote = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut handshake = [0u8; 68];
+            socket.read_exact(&mut handshake).await.unwrap();
+            assert!(
+                parse_handshake(&handshake, &info_hash)
+                    .unwrap()
+                    .supports_extensions()
+            );
+            let reply = remote_handshake(&info_hash, true);
+            socket.write_all(&reply).await.unwrap();
+            // Ours comes first.
+            let PeerMessage::Extended { id: 0, payload } = read_message(&mut socket).await else {
+                panic!("no extension handshake");
+            };
+            let ours = ExtendedHandshake::decode(&payload).unwrap();
+            let theirs = ExtendedHandshake {
+                extensions: [("ut_metadata".to_string(), 3)].into(),
+                client: Some("mock 1.0".into()),
+                request_queue: Some(7),
+                ..Default::default()
+            };
+            let message = PeerMessage::Extended {
+                id: 0,
+                payload: theirs.encode().unwrap(),
+            };
+            socket.write_all(&message.encode()).await.unwrap();
+            (ours, read_message(&mut socket).await)
+        });
+
+        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1, Some(6881))
+            .await
+            .unwrap();
+        assert!(conn.supports_extensions());
+        assert!(conn.peer_extensions().is_none());
+        assert_eq!(conn.request_limit(), None);
+        assert!(conn.send_extended("ut_metadata", vec![]).await.is_err());
+
+        let message = conn.receive().await.unwrap();
+        assert!(matches!(message, PeerMessage::Extended { id: 0, .. }));
+        assert_eq!(conn.request_limit(), Some(7));
+        let theirs = conn.peer_extensions().unwrap();
+        assert_eq!(theirs.client.as_deref(), Some("mock 1.0"));
+        assert_eq!(theirs.id("ut_metadata"), Some(3));
+        assert!(conn.send_extended("ut_pex", vec![]).await.is_err());
+        conn.send_extended("ut_metadata", metadata_request.clone())
+            .await
+            .unwrap();
+
+        let (ours, next) = remote.await.unwrap();
+        let localhost = "127.0.0.1".parse().unwrap();
+        assert_eq!(ours, ExtendedHandshake::ours(Some(6881), localhost));
+        assert_eq!(
+            next,
+            PeerMessage::Extended {
+                id: 3,
+                payload: metadata_request
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_extension_handshake_is_a_protocol_violation() {
+        let info_hash = [5u8; 20];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut handshake = [0u8; 68];
+            socket.read_exact(&mut handshake).await.unwrap();
+            let reply = remote_handshake(&info_hash, true);
+            socket.write_all(&reply).await.unwrap();
+            let message = PeerMessage::Extended {
+                id: 0,
+                payload: b"li7ee".to_vec(),
+            };
+            socket.write_all(&message.encode()).await.unwrap();
+            // Until the other end hangs up.
+            socket.read_to_end(&mut Vec::new()).await.unwrap();
+        });
+
+        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1, None)
+            .await
+            .unwrap();
+        let err = conn.receive().await.unwrap_err();
+        assert!(err.is::<ProtocolViolation>(), "{err:#}");
+        assert!(conn.peer_extensions().is_none());
     }
 }

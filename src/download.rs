@@ -25,8 +25,8 @@ const BLOCK_SIZE: u32 = 16 * 1024;
 /// Block requests in flight to a new peer, before its rate is known.
 const INITIAL_PIPELINE: usize = 4;
 const MIN_PIPELINE: usize = 2;
-/// Many clients drop requests beyond a few hundred queued. The extension
-/// handshake (BEP 10 `reqq`) would tell us a peer's real limit.
+/// Many clients drop requests beyond a few hundred queued. A peer that sends
+/// `reqq` in its extension handshake (BEP 10) gets at most that many.
 const MAX_PIPELINE: usize = 250;
 /// The pipeline holds about this much of a peer's measured throughput, so
 /// the peer never runs dry while our next requests are on their way.
@@ -262,6 +262,12 @@ pub async fn download_from_peers(
     // Incoming peers have no address we could ban in the pool.
     let mut banned_ips = HashSet::new();
 
+    // Told to peers in the extension handshake.
+    let listen_port = listener
+        .as_ref()
+        .and_then(|listener| listener.local_addr().ok())
+        .map(|addr| addr.port());
+
     let mut workers = JoinSet::new();
     // Starts a worker that connects to `addr`, or, given the socket the peer
     // connected to us on, answers its handshake.
@@ -280,6 +286,7 @@ pub async fn download_from_peers(
                 &connected,
                 addr,
                 socket,
+                listen_port,
                 &mut pieces,
             )
             .await;
@@ -327,7 +334,7 @@ pub async fn download_from_peers(
                 };
                 match result {
                     Ok(()) => debug!(%addr, "peer finished"),
-                    Err(e) if e.is::<Misbehaved>() => {
+                    Err(e) if e.is::<Misbehaved>() || e.is::<peer::ProtocolViolation>() => {
                         warn!(%addr, "banning peer: {e:#}");
                         if inbound {
                             banned_ips.insert(addr.ip());
@@ -544,8 +551,10 @@ impl Progress {
 
 /// Downloads from one peer until the torrent is complete, the queue is
 /// closed or the peer fails. Connects to `addr`, or with a `socket` the peer
-/// connected to us on, answers its handshake. `pieces_done` counts the
-/// pieces this peer delivered first, even on error.
+/// connected to us on, answers its handshake. `listen_port` is where we
+/// accept peers, if anywhere. `pieces_done` counts the pieces this peer
+/// delivered first, even on error.
+#[allow(clippy::too_many_arguments)]
 async fn peer_worker(
     session: &Session,
     queue: &PieceQueue,
@@ -553,6 +562,7 @@ async fn peer_worker(
     connected: &ConnectedPeers,
     addr: SocketAddr,
     socket: Option<TcpStream>,
+    listen_port: Option<u16>,
     pieces_done: &mut usize,
 ) -> Result<()> {
     let torrent = &session.torrent;
@@ -561,9 +571,10 @@ async fn peer_worker(
     let inbound = socket.is_some();
     let mut conn = match socket {
         Some(socket) => {
-            PeerConnection::accept(socket, addr, info_hash, peer_id, num_pieces).await?
+            PeerConnection::accept(socket, addr, info_hash, peer_id, num_pieces, listen_port)
+                .await?
         }
-        None => PeerConnection::connect(addr, info_hash, peer_id, num_pieces).await?,
+        None => PeerConnection::connect(addr, info_hash, peer_id, num_pieces, listen_port).await?,
     };
     if conn.peer_id == peer_id {
         // A tracker listed our own address.
@@ -716,8 +727,13 @@ async fn request_blocks<'q>(
         // the peer's speed.
         pipeline.restart(Instant::now());
     }
+    // A peer that told us its queue size would drop requests beyond it.
+    let depth = match conn.request_limit() {
+        Some(limit) => pipeline.depth().min(limit),
+        None => pipeline.depth(),
+    };
     let mut requests = Vec::new();
-    while in_flight + requests.len() < pipeline.depth() {
+    while in_flight + requests.len() < depth {
         let pos = match active.iter().position(ActivePiece::has_unrequested) {
             Some(pos) => pos,
             None => {
