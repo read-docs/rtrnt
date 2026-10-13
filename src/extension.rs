@@ -7,7 +7,7 @@
 //! receive that extension's messages under, plus a few facts about itself.
 //! Any other id is one the receiver picked in its own handshake.
 
-use crate::bencode;
+use crate::{bencode, pex};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_bencode::value::Value;
@@ -35,7 +35,24 @@ pub const UT_METADATA: &str = "ut_metadata";
 pub const UT_METADATA_ID: u8 = 2;
 /// The extensions we implement, each with the extended message id peers
 /// must send its messages to us with. Advertised in our handshake as `m`.
-pub const EXTENSIONS: &[(&str, u8)] = &[(UT_METADATA, UT_METADATA_ID)];
+pub const EXTENSIONS: &[(&str, u8)] = &[(pex::NAME, pex::ID), (UT_METADATA, UT_METADATA_ID)];
+/// Extensions that private torrents (BEP 27) must not use, which are left
+/// out of `m` for them.
+pub const PUBLIC_ONLY: &[&str] = &[pex::NAME];
+
+/// What our extension handshake says that depends on the torrent and on
+/// us, rather than being fixed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Advertised {
+    /// The port we accept incoming peers on, if any (`p`).
+    pub listen_port: Option<u16>,
+    /// The length of the info dictionary, if we have it to send
+    /// (`metadata_size`, BEP 9).
+    pub metadata_size: Option<u32>,
+    /// Whether the torrent is private (BEP 27), so that the extensions in
+    /// `PUBLIC_ONLY` are not offered.
+    pub private: bool,
+}
 
 /// An extension handshake. Every field is optional on the wire.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -74,13 +91,18 @@ struct Wire<'a> {
 }
 
 impl ExtendedHandshake {
-    /// Our handshake for the peer at `peer_ip`. `listen_port` is the port we
-    /// accept incoming peers on, if any, and `metadata_size` the length of
-    /// the info dictionary, if we have it to send.
-    pub fn ours(listen_port: Option<u16>, metadata_size: Option<u32>, peer_ip: IpAddr) -> Self {
+    /// Our handshake for the peer at `peer_ip`, saying what `advertised`
+    /// says.
+    pub fn ours(advertised: Advertised, peer_ip: IpAddr) -> Self {
+        let Advertised {
+            listen_port,
+            metadata_size,
+            private,
+        } = advertised;
         Self {
             extensions: EXTENSIONS
                 .iter()
+                .filter(|(name, _)| !(private && PUBLIC_ONLY.contains(name)))
                 .map(|&(name, id)| (name.to_string(), id))
                 .collect(),
             client: Some(CLIENT.to_string()),
@@ -194,7 +216,12 @@ mod tests {
     #[test]
     fn our_handshake_roundtrips() {
         let ip: IpAddr = "10.1.2.3".parse().unwrap();
-        let ours = ExtendedHandshake::ours(Some(6881), None, ip);
+        let advertised = Advertised {
+            listen_port: Some(6881),
+            ..Advertised::default()
+        };
+        let ours = ExtendedHandshake::ours(advertised, ip);
+        assert_eq!(ours.id(pex::NAME), Some(pex::ID));
         assert_eq!(ours.id(UT_METADATA), Some(UT_METADATA_ID));
         assert_eq!(ours.client.as_deref(), Some(CLIENT));
         assert!(CLIENT.starts_with("rtrnt "));
@@ -203,7 +230,7 @@ mod tests {
         assert_eq!(
             payload,
             format!(
-                "d1:md11:ut_metadatai2ee1:pi6881e4:reqqi500e1:v{}:{}6:yourip4:\x0a\x01\x02\x03e",
+                "d1:md11:ut_metadatai2e6:ut_pexi1ee1:pi6881e4:reqqi500e1:v{}:{}6:yourip4:\x0a\x01\x02\x03e",
                 CLIENT.len(),
                 CLIENT
             )
@@ -212,7 +239,11 @@ mod tests {
         assert_eq!(ExtendedHandshake::decode(&payload).unwrap(), ours);
 
         // With the metadata to send, its size goes out too.
-        let ours = ExtendedHandshake::ours(None, Some(5205), ip);
+        let advertised = Advertised {
+            metadata_size: Some(5205),
+            ..Advertised::default()
+        };
+        let ours = ExtendedHandshake::ours(advertised, ip);
         let payload = ours.encode().unwrap();
         let expected = b"13:metadata_sizei5205e";
         assert!(payload.windows(expected.len()).any(|w| w == expected));
@@ -237,9 +268,30 @@ mod tests {
     }
 
     #[test]
+    fn private_torrents_do_not_offer_peer_exchange() {
+        let ip: IpAddr = "10.1.2.3".parse().unwrap();
+        let private = Advertised {
+            private: true,
+            ..Advertised::default()
+        };
+        let ours = ExtendedHandshake::ours(private, ip);
+        assert_eq!(ours.id(pex::NAME), None);
+        // Magnet links for private torrents are rare, but the metadata may
+        // still be fetched from us.
+        assert_eq!(ours.id(UT_METADATA), Some(UT_METADATA_ID));
+        let public = ExtendedHandshake::ours(Advertised::default(), ip);
+        assert_eq!(
+            ours.extensions.len(),
+            public.extensions.len() - PUBLIC_ONLY.len()
+        );
+    }
+
+    #[test]
     fn ipv4_mapped_addresses_are_sent_as_ipv4() {
         let ip: IpAddr = "::ffff:10.1.2.3".parse().unwrap();
-        let payload = ExtendedHandshake::ours(None, None, ip).encode().unwrap();
+        let payload = ExtendedHandshake::ours(Advertised::default(), ip)
+            .encode()
+            .unwrap();
         let decoded = ExtendedHandshake::decode(&payload).unwrap();
         assert_eq!(decoded.your_ip, Some("10.1.2.3".parse().unwrap()));
         assert_eq!(decoded.listen_port, None);

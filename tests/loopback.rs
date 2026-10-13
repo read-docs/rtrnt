@@ -7,9 +7,12 @@ use rtrnt::download::{
     download_from_peers, listen,
 };
 use rtrnt::extension::{ExtendedHandshake, UT_METADATA, UT_METADATA_ID};
+use rtrnt::fast;
 use rtrnt::magnet::{self, MagnetLink, download_magnet};
 use rtrnt::metadata::{self, Message};
 use rtrnt::peer::{PeerMessage, generate_peer_id, handshake_bytes, parse_handshake};
+use rtrnt::pex::{self, PexMessage};
+use rtrnt::rate_limit::RateLimits;
 use rtrnt::storage::Storage;
 use rtrnt::torrent::{self, FileInfo, Info, TorrentFile};
 use rtrnt::tracker::{AnnounceEvent, AnnounceRequest, ScrapeStats, scrape, scrape_tiers};
@@ -59,6 +62,14 @@ fn make_torrent(data: &[u8]) -> (TorrentFile, [u8; 20]) {
     (torrent, info_hash)
 }
 
+/// A mock peer's handshake: ours, but without the fast extension (BEP 6),
+/// which mock peers only support where a test says so.
+fn mock_handshake(info_hash: &[u8; 20]) -> [u8; 68] {
+    let mut handshake = handshake_bytes(info_hash, &generate_peer_id());
+    handshake[20 + fast::RESERVED_BYTE] &= !fast::RESERVED_BIT;
+    handshake
+}
+
 /// Accepts one leecher, completes the handshake and advertises every piece.
 async fn accept_leecher(
     listener: &TcpListener,
@@ -80,10 +91,7 @@ async fn accept_partial(
     let mut handshake = [0u8; 68];
     socket.read_exact(&mut handshake).await.unwrap();
     parse_handshake(&handshake, &info_hash).unwrap();
-    socket
-        .write_all(&handshake_bytes(&info_hash, &generate_peer_id()))
-        .await
-        .unwrap();
+    socket.write_all(&mock_handshake(&info_hash)).await.unwrap();
     send_bitfield(&mut socket, num_pieces, has).await;
     socket
 }
@@ -112,10 +120,7 @@ async fn connect_partial(
 /// as a peer with no pieces (which need not send a bitfield).
 async fn connect_to(addr: SocketAddr, info_hash: [u8; 20]) -> TcpStream {
     let mut socket = TcpStream::connect(addr).await.unwrap();
-    socket
-        .write_all(&handshake_bytes(&info_hash, &generate_peer_id()))
-        .await
-        .unwrap();
+    socket.write_all(&mock_handshake(&info_hash)).await.unwrap();
     let mut handshake = [0u8; 68];
     socket.read_exact(&mut handshake).await.unwrap();
     parse_handshake(&handshake, &info_hash).unwrap();
@@ -272,6 +277,16 @@ fn seeding_session(
     out: &Path,
     seed: SeedLimits,
 ) -> Arc<Session> {
+    limited_session(torrent, info_hash, out, seed, RateLimits::default())
+}
+
+fn limited_session(
+    torrent: TorrentFile,
+    info_hash: [u8; 20],
+    out: &Path,
+    seed: SeedLimits,
+    rate_limits: RateLimits,
+) -> Arc<Session> {
     let storage = Arc::new(Storage::new(&torrent.info, out).unwrap());
     // What `make_torrent` hashed.
     let metadata = serde_bencode::to_bytes(&torrent.info).unwrap();
@@ -282,6 +297,7 @@ fn seeding_session(
         storage,
         seed,
         dht: None,
+        rate_limits,
         metadata: Some(metadata),
     })
 }
@@ -656,11 +672,8 @@ async fn never_exceeds_the_request_queue_a_peer_announces() {
                 .unwrap()
                 .supports_extensions()
         );
-        // `handshake_bytes` sets the extension protocol bit.
-        socket
-            .write_all(&handshake_bytes(&info_hash, &generate_peer_id()))
-            .await
-            .unwrap();
+        // `mock_handshake` sets the extension protocol bit.
+        socket.write_all(&mock_handshake(&info_hash)).await.unwrap();
         let theirs = ExtendedHandshake {
             client: Some("mock seeder".into()),
             request_queue: Some(REQQ as u32),
@@ -1499,6 +1512,8 @@ async fn seeds_a_download_that_is_already_complete() {
         },
         // Tests stay off the real internet.
         dht: false,
+        max_download_rate: 0,
+        max_upload_rate: 0,
     };
     tokio::time::timeout(
         Duration::from_secs(20),
@@ -1928,6 +1943,744 @@ async fn downloads_from_peers_that_connect_over_ipv4_and_ipv6() {
     assert_files_match(out.path(), &data);
 }
 
+/// Serves every block asked for to the leecher that connects on `listener`,
+/// as a seed, and returns how many block bytes it sent.
+async fn counting_seeder(
+    listener: TcpListener,
+    data: Arc<Vec<u8>>,
+    info_hash: [u8; 20],
+    num_pieces: usize,
+) -> u64 {
+    let mut socket = accept_leecher(&listener, info_hash, num_pieces).await;
+    send(&mut socket, PeerMessage::Unchoke).await;
+    let mut sent = 0;
+    while let Some(message) = read_message(&mut socket).await {
+        if let PeerMessage::Request {
+            index,
+            begin,
+            length,
+        } = message
+        {
+            send(&mut socket, piece(&data, index, begin, length)).await;
+            sent += u64::from(length);
+        }
+    }
+    sent
+}
+
+/// The rate limit used by the tests below, in KiB/s.
+const TEST_RATE_KIB: u64 = 32;
+
+/// The shortest time `bytes` can take at `TEST_RATE_KIB`, once the burst
+/// (one block, at this rate) has gone out at once, less a fifth so that a
+/// slow machine cannot make the test flaky.
+fn shortest_limited_time(bytes: u64) -> Duration {
+    let rate = (TEST_RATE_KIB * 1024) as f64;
+    Duration::from_secs_f64((bytes - u64::from(BLOCK)) as f64 / rate * 0.8)
+}
+
+/// With a download limit, two fast seeders share it: the download takes at
+/// least as long as the limit allows, and both get to send blocks.
+#[tokio::test]
+async fn download_rate_limit_is_shared_by_all_peers() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+
+    let mut addrs = Vec::new();
+    let mut seeders = Vec::new();
+    for _ in 0..2 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        addrs.push(listener.local_addr().unwrap());
+        let data = Arc::clone(&data);
+        seeders.push(tokio::spawn(counting_seeder(
+            listener, data, info_hash, num_pieces,
+        )));
+    }
+
+    let out = tempfile::tempdir().unwrap();
+    let limits = RateLimits::from_kib(TEST_RATE_KIB, 0);
+    let session = limited_session(
+        torrent,
+        info_hash,
+        out.path(),
+        SeedLimits::default(),
+        limits,
+    );
+    let start = std::time::Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        download_from_peers(
+            session,
+            &vec![false; num_pieces],
+            &addrs,
+            10,
+            Vec::new(),
+            None,
+            pending(),
+        ),
+    )
+    .await
+    .expect("download timed out")
+    .expect("download failed");
+    let elapsed = start.elapsed();
+    assert_files_match(out.path(), &data);
+
+    let total = data.len() as u64;
+    assert!(
+        elapsed >= shortest_limited_time(total),
+        "{total} bytes in {elapsed:?} at {TEST_RATE_KIB} KiB/s"
+    );
+    for seeder in seeders {
+        let sent = seeder.await.unwrap();
+        assert!(sent >= u64::from(BLOCK), "a seeder only sent {sent} bytes");
+    }
+}
+
+/// With an upload limit, a leecher that asks for the whole torrent at once
+/// gets it no faster than the limit allows.
+#[tokio::test]
+async fn upload_rate_limit_paces_the_blocks_we_send() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+    let out = tempfile::tempdir().unwrap();
+    write_files(out.path(), &data);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let our_addr = listener.local_addr().unwrap();
+    let leecher_data = Arc::clone(&data);
+    let leecher = tokio::spawn(async move {
+        let mut socket = connect_to(our_addr, info_hash).await;
+        leech_everything(&mut socket, &leecher_data).await;
+    });
+
+    // Seeding to a ratio of 1 ends the run once the leecher has everything.
+    let seed = SeedLimits {
+        ratio: 1.0,
+        time: Duration::ZERO,
+    };
+    let limits = RateLimits::from_kib(0, TEST_RATE_KIB);
+    let session = limited_session(torrent, info_hash, out.path(), seed, limits);
+    let start = std::time::Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        download_from_peers(
+            session,
+            &vec![true; num_pieces],
+            &[],
+            10,
+            vec![listener],
+            None,
+            pending(),
+        ),
+    )
+    .await
+    .expect("seeding did not stop")
+    .expect("seeding failed");
+    let elapsed = start.elapsed();
+    leecher.await.unwrap();
+
+    let total = data.len() as u64;
+    assert!(
+        elapsed >= shortest_limited_time(total),
+        "{total} bytes in {elapsed:?} at {TEST_RATE_KIB} KiB/s"
+    );
+}
+
+/// The torrent of `make_torrent`, marked private (BEP 27).
+fn make_private_torrent(data: &[u8]) -> (TorrentFile, [u8; 20]) {
+    let (mut torrent, _) = make_torrent(data);
+    torrent.info.private = Some(1);
+    let info_hash = sha1::Sha1::digest(serde_bencode::to_bytes(&torrent.info).unwrap()).into();
+    (torrent, info_hash)
+}
+
+/// Sends an extension handshake that offers peer exchange under `pex_id`,
+/// with `listen_port` as `p`.
+async fn send_pex_handshake(socket: &mut TcpStream, pex_id: u8, listen_port: Option<u16>) {
+    let theirs = ExtendedHandshake {
+        extensions: [(pex::NAME.to_string(), pex_id)].into(),
+        listen_port,
+        ..Default::default()
+    };
+    let payload = theirs.encode().unwrap();
+    send(socket, PeerMessage::Extended { id: 0, payload }).await;
+}
+
+/// Reads messages until an extended message with extended id `id`, and
+/// returns its payload. Fails if the client disconnects first, or if none
+/// comes within 5 s.
+async fn next_extended(socket: &mut TcpStream, id: u8) -> Vec<u8> {
+    let next = async {
+        loop {
+            match read_message(socket).await {
+                Some(PeerMessage::Extended { id: got, payload }) if got == id => return payload,
+                Some(_) => {}
+                None => panic!("client disconnected"),
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), next)
+        .await
+        .expect("no extended message")
+}
+
+/// L, our client, knows of one peer: H, our client too, which has nothing
+/// yet. H is connected to the seeder S, but S has nothing for H, only for
+/// the next peer to connect. H tells L about S through peer exchange (it
+/// knows where S listens, having connected to it), and L downloads
+/// everything from S.
+#[tokio::test]
+async fn downloads_from_a_peer_learned_through_pex() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+
+    let seeder = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seeder_addr = seeder.local_addr().unwrap();
+    let (h_connected, h_connected_rx) = oneshot::channel();
+    let seeder_data = Arc::clone(&data);
+    let seeder_task = tokio::spawn(async move {
+        let h = accept_partial(&seeder, info_hash, num_pieces, &[]).await;
+        h_connected.send(()).unwrap();
+        let mut l = accept_leecher(&seeder, info_hash, num_pieces).await;
+        send(&mut l, PeerMessage::Unchoke).await;
+        serve(l, &seeder_data).await;
+        drop(h);
+    });
+
+    let h_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let h_addr = h_listener.local_addr().unwrap();
+    let h_out = tempfile::tempdir().unwrap();
+    let h_session = session(torrent.clone(), info_hash, h_out.path());
+    let (stop_h, stop_h_rx) = oneshot::channel::<()>();
+    let h = tokio::spawn(async move {
+        let have = vec![false; num_pieces];
+        let stop = async {
+            let _ = stop_h_rx.await;
+        };
+        download_from_peers(
+            h_session,
+            &have,
+            &[seeder_addr],
+            10,
+            vec![h_listener],
+            None,
+            stop,
+        )
+        .await
+    });
+    h_connected_rx.await.unwrap();
+
+    let out = tempfile::tempdir().unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        download_from_peers(
+            session(torrent, info_hash, out.path()),
+            &vec![false; num_pieces],
+            &[h_addr],
+            10,
+            Vec::new(),
+            None,
+            pending(),
+        ),
+    )
+    .await
+    .expect("download timed out")
+    .expect("download failed");
+    assert_files_match(out.path(), &data);
+    seeder_task.await.unwrap();
+
+    stop_h.send(()).unwrap();
+    let err = h.await.unwrap().unwrap_err();
+    assert!(err.is::<Interrupted>(), "{err:#}");
+}
+
+/// Peers that support peer exchange hear about the other peers we are
+/// connected to whose listening address we know, with their flags, but
+/// never about themselves. X is a seed we connected to; Z, Y and W connect
+/// to us in turn, and only Y gives its listening port.
+#[tokio::test]
+async fn tells_peers_about_each_other_through_pex() {
+    init_tracing();
+    let data = test_data();
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+
+    // X never unchokes us, so the client stays connected without
+    // downloading anything.
+    let x = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let x_addr = x.local_addr().unwrap();
+    let (x_ready, x_ready_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut socket = accept_leecher(&x, info_hash, num_pieces).await;
+        // Interest shows that the client has seen X's bitfield.
+        while next_message(&mut socket).await != Some(PeerMessage::Interested) {}
+        x_ready.send(()).unwrap();
+        while read_message(&mut socket).await.is_some() {}
+    });
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let our_addr = listener.local_addr().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let session = session(torrent, info_hash, out.path());
+    let (stop, stop_rx) = oneshot::channel::<()>();
+    let client = tokio::spawn(async move {
+        let have = vec![false; num_pieces];
+        let stop = async {
+            let _ = stop_rx.await;
+        };
+        download_from_peers(session, &have, &[x_addr], 10, vec![listener], None, stop).await
+    });
+    x_ready_rx.await.unwrap();
+
+    let mut z = connect_to(our_addr, info_hash).await;
+    send_pex_handshake(&mut z, 9, None).await;
+    let x_flags = pex::FLAG_SEED | pex::FLAG_CONNECTABLE;
+    let to_z = PexMessage::decode(&next_extended(&mut z, 9).await).unwrap();
+    assert_eq!(to_z.added, [(x_addr, x_flags)]);
+
+    let y_listen = SocketAddr::from((Ipv4Addr::LOCALHOST, 5555));
+    let mut y = connect_to(our_addr, info_hash).await;
+    send_pex_handshake(&mut y, 7, Some(y_listen.port())).await;
+    let ours = ExtendedHandshake::decode(&next_extended(&mut y, 0).await).unwrap();
+    assert_eq!(ours.id(pex::NAME), Some(pex::ID));
+    let to_y = PexMessage::decode(&next_extended(&mut y, 7).await).unwrap();
+    assert_eq!(to_y.added, [(x_addr, x_flags)]);
+    assert!(to_y.dropped.is_empty());
+
+    let mut w = connect_to(our_addr, info_hash).await;
+    send_pex_handshake(&mut w, 8, None).await;
+    let mut to_w = PexMessage::decode(&next_extended(&mut w, 8).await).unwrap();
+    to_w.added.sort();
+    let mut expected = vec![(x_addr, x_flags), (y_listen, 0)];
+    expected.sort();
+    assert_eq!(to_w.added, expected);
+
+    stop.send(()).unwrap();
+    let err = client.await.unwrap().unwrap_err();
+    assert!(err.is::<Interrupted>(), "{err:#}");
+}
+
+/// Private torrents (BEP 27) never use peer exchange: we do not offer it,
+/// and a peer that sends a peer exchange message anyway is not listened to.
+#[tokio::test]
+async fn private_torrents_do_not_exchange_peers() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_private_torrent(&data);
+    assert!(torrent.is_private());
+    let num_pieces = torrent.num_pieces();
+
+    // Only the peer exchange message names it.
+    let decoy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let decoy_addr = decoy.local_addr().unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seeder_addr = listener.local_addr().unwrap();
+    let seeder_data = Arc::clone(&data);
+    let seeder = tokio::spawn(async move {
+        let mut socket = accept_leecher(&listener, info_hash, num_pieces).await;
+        let ours = ExtendedHandshake::decode(&next_extended(&mut socket, 0).await).unwrap();
+        assert_eq!(ours.id(pex::NAME), None);
+        send_pex_handshake(&mut socket, 3, None).await;
+        let message = PexMessage {
+            added: vec![(decoy_addr, pex::FLAG_CONNECTABLE)],
+            dropped: Vec::new(),
+        };
+        let payload = message.encode().unwrap();
+        send(
+            &mut socket,
+            PeerMessage::Extended {
+                id: pex::ID,
+                payload,
+            },
+        )
+        .await;
+        send(&mut socket, PeerMessage::Unchoke).await;
+        serve(socket, &seeder_data).await;
+    });
+
+    let out = tempfile::tempdir().unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        download_from_peers(
+            session(torrent, info_hash, out.path()),
+            &vec![false; num_pieces],
+            &[seeder_addr],
+            10,
+            Vec::new(),
+            None,
+            pending(),
+        ),
+    )
+    .await
+    .expect("download timed out")
+    .expect("download failed");
+    assert_files_match(out.path(), &data);
+    seeder.await.unwrap();
+    let connected = tokio::time::timeout(Duration::from_millis(200), decoy.accept()).await;
+    assert!(
+        connected.is_err(),
+        "connected to a peer named by peer exchange"
+    );
+}
+
+/// Accepts the client's connection as a peer that supports the fast
+/// extension (BEP 6), checking that the client does too.
+async fn accept_fast(listener: &TcpListener, info_hash: [u8; 20]) -> TcpStream {
+    let (mut socket, _) = listener.accept().await.unwrap();
+    let mut handshake = [0u8; 68];
+    socket.read_exact(&mut handshake).await.unwrap();
+    assert!(
+        parse_handshake(&handshake, &info_hash)
+            .unwrap()
+            .supports_fast()
+    );
+    socket
+        .write_all(&handshake_bytes(&info_hash, &generate_peer_id()))
+        .await
+        .unwrap();
+    socket
+}
+
+/// Connects to the client listening at `addr` as a peer that supports the
+/// fast extension (BEP 6), checking that the client does too.
+async fn connect_fast(addr: SocketAddr, info_hash: [u8; 20]) -> TcpStream {
+    let mut socket = TcpStream::connect(addr).await.unwrap();
+    socket
+        .write_all(&handshake_bytes(&info_hash, &generate_peer_id()))
+        .await
+        .unwrap();
+    let mut handshake = [0u8; 68];
+    socket.read_exact(&mut handshake).await.unwrap();
+    assert!(
+        parse_handshake(&handshake, &info_hash)
+            .unwrap()
+            .supports_fast()
+    );
+    socket
+}
+
+fn reject(index: u32, begin: u32, length: u32) -> PeerMessage {
+    PeerMessage::RejectRequest {
+        index,
+        begin,
+        length,
+    }
+}
+
+fn cancel(index: u32, begin: u32, length: u32) -> PeerMessage {
+    PeerMessage::Cancel {
+        index,
+        begin,
+        length,
+    }
+}
+
+/// Several messages encoded back to back, to send in one write.
+fn encode_all(messages: &[PeerMessage]) -> Vec<u8> {
+    messages.iter().flat_map(PeerMessage::encode).collect()
+}
+
+/// A fast peer (BEP 6) with no pieces connects to us while we download
+/// piece 1. It says Have None, and gets our Bitfield and then our allowed
+/// fast set, which in a torrent of three pieces is all of them. It gets an
+/// allowed fast block while still choked, and once unchoked, a Reject for a
+/// request it cancels before the block was sent.
+#[tokio::test]
+async fn serves_a_fast_peer_its_allowed_fast_pieces_while_choked() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+    let out = tempfile::tempdir().unwrap();
+    write_files(out.path(), &data);
+
+    let (release, release_rx) = oneshot::channel();
+    let seeder_addr = gated_seeder(Arc::clone(&data), info_hash, num_pieces, release_rx).await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let our_addr = listener.local_addr().unwrap();
+    let leecher_data = Arc::clone(&data);
+    let leecher = tokio::spawn(async move {
+        let data = &leecher_data;
+        let mut socket = connect_fast(our_addr, info_hash).await;
+        send(&mut socket, PeerMessage::HaveNone).await;
+        let bitfield = vec![0b1010_0000];
+        assert_eq!(
+            next_message(&mut socket).await,
+            Some(PeerMessage::Bitfield { bitfield })
+        );
+        let set = fast::allowed_fast_set(
+            IpAddr::from(Ipv4Addr::LOCALHOST),
+            &info_hash,
+            num_pieces as u32,
+            fast::ALLOWED_FAST_COUNT,
+        );
+        assert_eq!(set.len(), num_pieces);
+        for piece_index in set {
+            assert_eq!(
+                next_message(&mut socket).await,
+                Some(PeerMessage::AllowedFast { piece_index })
+            );
+        }
+
+        // Choked, and not even interested, but piece 0 is allowed fast.
+        send(&mut socket, request(0, 0, BLOCK)).await;
+        assert_eq!(
+            next_message(&mut socket).await,
+            Some(piece(data, 0, 0, BLOCK))
+        );
+
+        send(&mut socket, PeerMessage::Interested).await;
+        assert_eq!(next_message(&mut socket).await, Some(PeerMessage::Unchoke));
+        // The cancel arrives with the requests, before its block is sent.
+        let batch = [
+            request(2, 0, BLOCK),
+            request(0, BLOCK, BLOCK),
+            cancel(0, BLOCK, BLOCK),
+        ];
+        send_batch(&mut socket, &batch).await;
+        let answers = [
+            next_message(&mut socket).await.unwrap(),
+            next_message(&mut socket).await.unwrap(),
+        ];
+        for expected in [reject(0, BLOCK, BLOCK), piece(data, 2, 0, BLOCK)] {
+            assert!(answers.contains(&expected), "missing {expected:?}");
+        }
+
+        release.send(()).unwrap();
+        assert_eq!(
+            next_message(&mut socket).await,
+            Some(PeerMessage::Have { piece_index: 1 })
+        );
+    });
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        download_from_peers(
+            session(torrent, info_hash, out.path()),
+            &[true, false, true],
+            &[seeder_addr],
+            10,
+            vec![listener],
+            None,
+            pending(),
+        ),
+    )
+    .await
+    .expect("download timed out")
+    .expect("download failed");
+    leecher.await.unwrap();
+    assert_files_match(out.path(), &data);
+}
+
+/// The next message from a split-off reader, or `None` after `wait` of
+/// silence or once the client hangs up.
+async fn recv_within(
+    messages: &mut mpsc::UnboundedReceiver<PeerMessage>,
+    wait: Duration,
+) -> Option<PeerMessage> {
+    tokio::time::timeout(wait, messages.recv())
+        .await
+        .ok()
+        .flatten()
+}
+
+/// The whole download comes from a fast peer (BEP 6) that has every piece
+/// and puts the extension's rules to work:
+///
+/// - We have nothing yet, so it hears Have None.
+/// - While it chokes us we ask only for the piece it allows us fast. When
+///   it rejects one of those blocks anyway, we stop asking for the piece
+///   until unchoked, and let go of it once nothing of it is outstanding.
+/// - A choke no longer drops our requests: a block sent after the Choke is
+///   still taken, and the rest wait for their Rejects.
+/// - A block rejected while we are unchoked is asked for again.
+#[tokio::test]
+async fn downloads_from_a_fast_peer_that_chokes_and_rejects() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seeder_addr = listener.local_addr().unwrap();
+    let seeder_data = Arc::clone(&data);
+    let seeder = tokio::spawn(async move {
+        let data = &seeder_data;
+        let socket = accept_fast(&listener, info_hash).await;
+        // Read on a separate task, so waiting for the next message can time
+        // out without losing part of one.
+        let (mut reader, mut writer) = socket.into_split();
+        let (messages_tx, mut messages) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(message) = read_message(&mut reader).await {
+                if !matches!(
+                    message,
+                    PeerMessage::KeepAlive | PeerMessage::Extended { .. }
+                ) {
+                    let _ = messages_tx.send(message);
+                }
+            }
+        });
+        let long = Duration::from_secs(5);
+        let quiet = Duration::from_millis(300);
+
+        let hello = [
+            PeerMessage::HaveAll,
+            PeerMessage::AllowedFast { piece_index: 1 },
+        ];
+        writer.write_all(&encode_all(&hello)).await.unwrap();
+        // A seed gets no allowed fast set from us.
+        for expected in [PeerMessage::HaveNone, PeerMessage::Interested] {
+            assert_eq!(recv_within(&mut messages, long).await, Some(expected));
+        }
+        for expected in [request(1, 0, BLOCK), request(1, BLOCK, BLOCK)] {
+            assert_eq!(recv_within(&mut messages, long).await, Some(expected));
+        }
+        let answer = [reject(1, BLOCK, BLOCK), piece(data, 1, 0, BLOCK)];
+        writer.write_all(&encode_all(&answer)).await.unwrap();
+        assert_eq!(
+            recv_within(&mut messages, quiet).await,
+            None,
+            "asked for a rejected piece while choked"
+        );
+
+        // Unchoked: everything the pipeline allows is asked for.
+        let unchoke = PeerMessage::Unchoke.encode();
+        writer.write_all(&unchoke).await.unwrap();
+        let mut asked = Vec::new();
+        while let Some(message) = recv_within(&mut messages, quiet).await {
+            match message {
+                PeerMessage::Request {
+                    index,
+                    begin,
+                    length,
+                } => asked.push((index, begin, length)),
+                other => panic!("expected a request, got {other:?}"),
+            }
+        }
+        assert!(asked.len() >= 2, "asked for {asked:?}");
+        let mut answer = vec![PeerMessage::Choke];
+        for (i, &(index, begin, length)) in asked.iter().enumerate() {
+            answer.push(if i == 0 {
+                piece(data, index, begin, length)
+            } else {
+                reject(index, begin, length)
+            });
+        }
+        writer.write_all(&encode_all(&answer)).await.unwrap();
+        assert_eq!(
+            recv_within(&mut messages, quiet).await,
+            None,
+            "asked for a block while choked"
+        );
+
+        // Unchoked again: serves everything, but rejects the first request
+        // once, so it must be asked for again.
+        writer.write_all(&unchoke).await.unwrap();
+        let mut rejected = None;
+        let mut asked_again = false;
+        while let Some(message) = recv_within(&mut messages, long).await {
+            let PeerMessage::Request {
+                index,
+                begin,
+                length,
+            } = message
+            else {
+                continue;
+            };
+            let reply = match rejected {
+                None => {
+                    rejected = Some((index, begin, length));
+                    reject(index, begin, length)
+                }
+                Some(first) => {
+                    asked_again |= first == (index, begin, length);
+                    piece(data, index, begin, length)
+                }
+            };
+            writer.write_all(&reply.encode()).await.unwrap();
+        }
+        asked_again
+    });
+
+    let out = tempfile::tempdir().unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        download_from_peers(
+            session(torrent, info_hash, out.path()),
+            &vec![false; num_pieces],
+            &[seeder_addr],
+            10,
+            Vec::new(),
+            None,
+            pending(),
+        ),
+    )
+    .await
+    .expect("download timed out")
+    .expect("download failed");
+    assert_files_match(out.path(), &data);
+    assert!(seeder.await.unwrap(), "rejected block never asked again");
+}
+
+/// We have pieces 0 and 2, and the only peer is a fast peer (BEP 6) that
+/// has every piece and keeps us choked. Its request while we choke it gets
+/// a Reject rather than silence, and a Reject for a request we never sent
+/// gets it banned.
+#[tokio::test]
+async fn rejects_a_choked_fast_peer_and_bans_one_that_rejects_unsent_requests() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let out = tempfile::tempdir().unwrap();
+    write_files(out.path(), &data);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = listener.local_addr().unwrap();
+    let peer = tokio::spawn(async move {
+        let mut socket = accept_fast(&listener, info_hash).await;
+        send(&mut socket, PeerMessage::HaveAll).await;
+        let bitfield = vec![0b1010_0000];
+        assert_eq!(
+            next_message(&mut socket).await,
+            Some(PeerMessage::Bitfield { bitfield })
+        );
+        assert_eq!(
+            next_message(&mut socket).await,
+            Some(PeerMessage::Interested)
+        );
+        send(&mut socket, request(0, 0, BLOCK)).await;
+        assert_eq!(next_message(&mut socket).await, Some(reject(0, 0, BLOCK)));
+        send(&mut socket, reject(1, 0, BLOCK)).await;
+        assert_eq!(next_message(&mut socket).await, None, "not banned");
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        download_from_peers(
+            session(torrent, info_hash, out.path()),
+            &[true, false, true],
+            &[peer_addr],
+            10,
+            Vec::new(),
+            None,
+            pending(),
+        ),
+    )
+    .await
+    .expect("download timed out");
+    assert!(result.is_err(), "downloaded without a peer");
+    peer.await.unwrap();
+}
+
 /// The test torrent's info dict with an extra key we do not model, padded
 /// so that it takes two metadata pieces, and its info hash.
 fn padded_info(torrent: &TorrentFile) -> (Vec<u8>, [u8; 20]) {
@@ -1948,14 +2701,16 @@ const MOCK_UT_METADATA: u8 = 3;
 /// A peer with the whole torrent and its metadata, for magnet links: it
 /// accepts leechers one after the other, sends `metadata` through
 /// `ut_metadata` (each piece with a byte flipped if `corrupt`), and blocks
-/// of `data`. Counts the connections it takes and the blocks it is asked
-/// for.
+/// of `data`. With `fast` it supports the fast extension (BEP 6), and says
+/// Have All rather than sending a bitfield. Counts the connections it takes
+/// and the blocks it is asked for.
 fn magnet_seeder(
     listener: TcpListener,
     info_hash: [u8; 20],
     metadata: Vec<u8>,
     data: Arc<Vec<u8>>,
     corrupt: bool,
+    fast: bool,
 ) -> (Arc<AtomicUsize>, Arc<AtomicUsize>) {
     let connections = Arc::new(AtomicUsize::new(0));
     let blocks = Arc::new(AtomicUsize::new(0));
@@ -1970,10 +2725,12 @@ fn magnet_seeder(
             socket.read_exact(&mut handshake).await.unwrap();
             let handshake = parse_handshake(&handshake, &info_hash).unwrap();
             assert!(handshake.supports_extensions());
-            socket
-                .write_all(&handshake_bytes(&info_hash, &generate_peer_id()))
-                .await
-                .unwrap();
+            let reply = if fast {
+                handshake_bytes(&info_hash, &generate_peer_id())
+            } else {
+                mock_handshake(&info_hash)
+            };
+            socket.write_all(&reply).await.unwrap();
             let theirs = ExtendedHandshake {
                 extensions: [(UT_METADATA.to_string(), MOCK_UT_METADATA)].into(),
                 metadata_size: Some(metadata.len() as u32),
@@ -1981,7 +2738,11 @@ fn magnet_seeder(
             };
             let payload = theirs.encode().unwrap();
             send(&mut socket, PeerMessage::Extended { id: 0, payload }).await;
-            send_bitfield(&mut socket, num_pieces, &all).await;
+            if fast {
+                send(&mut socket, PeerMessage::HaveAll).await;
+            } else {
+                send_bitfield(&mut socket, num_pieces, &all).await;
+            }
             send(&mut socket, PeerMessage::Unchoke).await;
             while let Some(message) = read_message(&mut socket).await {
                 match message {
@@ -2022,7 +2783,9 @@ fn magnet_seeder(
 /// A magnet link names a lying peer (`x.pe`) and a tracker that knows an
 /// honest one. With room for one peer, the liar is asked first, sends
 /// metadata that fails the hash check and is banned; the honest peer's
-/// metadata passes, and the download carries on over the same connection.
+/// metadata passes, and the download carries on over the same connection,
+/// on which its Have All (fast extension) came before we knew the number of
+/// pieces.
 /// The metadata is saved, so a second run neither fetches it again nor
 /// contacts the tracker, and `--check` can use it.
 #[tokio::test]
@@ -2035,12 +2798,24 @@ async fn downloads_a_magnet_link_banning_a_peer_with_bad_metadata() {
 
     let liar = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let liar_addr = liar.local_addr().unwrap();
-    let (liar_connections, liar_blocks) =
-        magnet_seeder(liar, info_hash, info.clone(), Arc::clone(&data), true);
+    let (liar_connections, liar_blocks) = magnet_seeder(
+        liar,
+        info_hash,
+        info.clone(),
+        Arc::clone(&data),
+        true,
+        false,
+    );
     let honest = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let honest_addr = honest.local_addr().unwrap();
-    let (honest_connections, honest_blocks) =
-        magnet_seeder(honest, info_hash, info.clone(), Arc::clone(&data), false);
+    let (honest_connections, honest_blocks) = magnet_seeder(
+        honest,
+        info_hash,
+        info.clone(),
+        Arc::clone(&data),
+        false,
+        true,
+    );
     let (tracker_url, mut queries) = mock_tracker(vec![honest_addr]).await;
 
     let hex: String = info_hash.iter().map(|b| format!("{b:02x}")).collect();
@@ -2054,6 +2829,8 @@ async fn downloads_a_magnet_link_banning_a_peer_with_bad_metadata() {
         seed: SeedLimits::default(),
         // Tests stay off the real internet.
         dht: false,
+        max_download_rate: 0,
+        max_upload_rate: 0,
     };
     tokio::time::timeout(
         Duration::from_secs(30),
@@ -2135,12 +2912,7 @@ async fn serves_metadata_to_a_magnet_client() {
         };
         let payload = theirs.encode().unwrap();
         send(&mut socket, PeerMessage::Extended { id: 0, payload }).await;
-        let ours = loop {
-            if let Some(PeerMessage::Extended { id: 0, payload }) = next_extended(&mut socket).await
-            {
-                break ExtendedHandshake::decode(&payload).unwrap();
-            }
-        };
+        let ours = ExtendedHandshake::decode(&next_extended(&mut socket, 0).await).unwrap();
         let size = ours.metadata_size.expect("no metadata_size") as usize;
         let id = ours.id(UT_METADATA).expect("no ut_metadata");
         let pieces = size.div_ceil(METADATA_PIECE_LEN) as u32;
@@ -2153,13 +2925,7 @@ async fn serves_metadata_to_a_magnet_client() {
         send_batch(&mut socket, &requests).await;
         let mut metadata = Vec::new();
         for _ in 0..=pieces {
-            let Some(PeerMessage::Extended {
-                id: MOCK_UT_METADATA,
-                payload,
-            }) = next_extended(&mut socket).await
-            else {
-                panic!("no ut_metadata reply");
-            };
+            let payload = next_extended(&mut socket, MOCK_UT_METADATA).await;
             match Message::decode(&payload).unwrap().unwrap() {
                 Message::Data {
                     piece,
@@ -2204,26 +2970,9 @@ async fn serves_metadata_to_a_magnet_client() {
     assert_eq!(<[u8; 20]>::from(sha1::Sha1::digest(&metadata)), info_hash);
 }
 
-/// Reads the next extended message, skipping everything else, or `None`
-/// once the client disconnects. Fails if nothing comes for 5 s.
-async fn next_extended(socket: &mut TcpStream) -> Option<PeerMessage> {
-    let next = async {
-        loop {
-            match read_message(socket).await {
-                Some(message @ PeerMessage::Extended { .. }) => return Some(message),
-                Some(_) => {}
-                None => return None,
-            }
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), next)
-        .await
-        .expect("client went silent")
-}
-
 /// One rtrnt seeds a torrent, another downloads it from a magnet link that
 /// names only the first one's address: the metadata and then the data come
-/// over the same connection.
+/// over the same connection, with the fast extension on both sides.
 #[tokio::test]
 async fn downloads_a_magnet_link_from_another_rtrnt() {
     init_tracing();
@@ -2257,6 +3006,8 @@ async fn downloads_a_magnet_link_from_another_rtrnt() {
         listen_port: 0,
         seed: SeedLimits::default(),
         dht: false,
+        max_download_rate: 0,
+        max_upload_rate: 0,
     };
     tokio::time::timeout(
         Duration::from_secs(20),

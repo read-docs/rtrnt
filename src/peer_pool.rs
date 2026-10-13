@@ -50,6 +50,12 @@ impl PeerPool {
         self.ready.pop_front()
     }
 
+    /// How many peers wait to be tried for the first time or after a
+    /// backoff that is over, not counting those still backing off.
+    pub(crate) fn ready_len(&self) -> usize {
+        self.ready.len()
+    }
+
     /// When the next peer in backoff becomes ready.
     pub(crate) fn next_retry(&self) -> Option<Instant> {
         self.retrying.iter().map(|&(at, _)| at).min()
@@ -103,7 +109,9 @@ mod tests {
         let mut pool = PeerPool::default();
         pool.add([addr(1), addr(2), addr(1)]);
         pool.add([addr(2), addr(3)]);
+        assert_eq!(pool.ready_len(), 3);
         assert_eq!(drain(&mut pool, now), [addr(1), addr(2), addr(3)]);
+        assert_eq!(pool.ready_len(), 0);
         // Re-announced peers that are already connected are not duplicated.
         pool.add([addr(1), addr(3)]);
         assert_eq!(pool.next(now), None);

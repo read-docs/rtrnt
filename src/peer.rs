@@ -1,4 +1,5 @@
-use crate::extension::{self, ExtendedHandshake};
+use crate::extension::{self, Advertised, ExtendedHandshake};
+use crate::fast;
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::{Buf, BytesMut};
 use rand::Rng;
@@ -75,14 +76,46 @@ pub enum PeerMessage {
         id: u8,
         payload: Vec<u8>,
     },
-    /// A message type we don't implement (e.g. the fast extension); it is
-    /// skipped.
+    /// Fast extension (BEP 6): the receiver might like to download this
+    /// piece. Only a hint.
+    SuggestPiece {
+        piece_index: u32,
+    },
+    /// Fast extension: the sender has every piece. Stands in for a Bitfield.
+    HaveAll,
+    /// Fast extension: the sender has no piece. Stands in for a Bitfield.
+    HaveNone,
+    /// Fast extension: the sender will not serve this request.
+    RejectRequest {
+        index: u32,
+        begin: u32,
+        length: u32,
+    },
+    /// Fast extension: the sender serves requests for this piece even while
+    /// it chokes the receiver (once it has the piece).
+    AllowedFast {
+        piece_index: u32,
+    },
+    /// A message type we don't implement; it is skipped.
     Unknown {
         id: u8,
     },
 }
 
 impl PeerMessage {
+    /// Whether this is one of the fast extension's messages, which only
+    /// peers that both support it may send.
+    pub fn is_fast(&self) -> bool {
+        matches!(
+            self,
+            PeerMessage::SuggestPiece { .. }
+                | PeerMessage::HaveAll
+                | PeerMessage::HaveNone
+                | PeerMessage::RejectRequest { .. }
+                | PeerMessage::AllowedFast { .. }
+        )
+    }
+
     /// Serializes the message, including its 4-byte length prefix.
     pub fn encode(&self) -> Vec<u8> {
         let mut payload = Vec::new();
@@ -133,6 +166,26 @@ impl PeerMessage {
             PeerMessage::Port { port } => {
                 payload.push(9);
                 payload.extend_from_slice(&port.to_be_bytes());
+            }
+            PeerMessage::SuggestPiece { piece_index } => {
+                payload.push(0x0d);
+                payload.extend_from_slice(&piece_index.to_be_bytes());
+            }
+            PeerMessage::HaveAll => payload.push(0x0e),
+            PeerMessage::HaveNone => payload.push(0x0f),
+            PeerMessage::RejectRequest {
+                index,
+                begin,
+                length,
+            } => {
+                payload.push(0x10);
+                payload.extend_from_slice(&index.to_be_bytes());
+                payload.extend_from_slice(&begin.to_be_bytes());
+                payload.extend_from_slice(&length.to_be_bytes());
+            }
+            PeerMessage::AllowedFast { piece_index } => {
+                payload.push(0x11);
+                payload.extend_from_slice(&piece_index.to_be_bytes());
             }
             PeerMessage::Extended { id, payload: body } => {
                 payload.push(20);
@@ -210,6 +263,28 @@ impl PeerMessage {
                     port: u16::from_be_bytes([body[0], body[1]]),
                 }
             }
+            0x0d => {
+                expect_len(4)?;
+                PeerMessage::SuggestPiece {
+                    piece_index: be_u32(body, 0)?,
+                }
+            }
+            0x0e => expect_len(0).map(|_| PeerMessage::HaveAll)?,
+            0x0f => expect_len(0).map(|_| PeerMessage::HaveNone)?,
+            0x10 => {
+                expect_len(12)?;
+                PeerMessage::RejectRequest {
+                    index: be_u32(body, 0)?,
+                    begin: be_u32(body, 4)?,
+                    length: be_u32(body, 8)?,
+                }
+            }
+            0x11 => {
+                expect_len(4)?;
+                PeerMessage::AllowedFast {
+                    piece_index: be_u32(body, 0)?,
+                }
+            }
             20 => {
                 let Some((&id, payload)) = body.split_first() else {
                     bail!("extended message has no extended id");
@@ -249,9 +324,11 @@ pub fn handshake_bytes(info_hash: &[u8; 20], peer_id: &[u8; 20]) -> [u8; 68] {
     handshake[0] = PROTOCOL.len() as u8;
     handshake[1..20].copy_from_slice(PROTOCOL);
     // Bytes 20..28 are reserved extension bits. We set the extension
-    // protocol's (BEP 10) and the DHT's (BEP 5).
+    // protocol's (BEP 10), the DHT's (BEP 5) and the fast extension's
+    // (BEP 6).
     handshake[20 + extension::RESERVED_BYTE] |= extension::RESERVED_BIT;
     handshake[27] |= RESERVED_DHT;
+    handshake[20 + fast::RESERVED_BYTE] |= fast::RESERVED_BIT;
     handshake[28..48].copy_from_slice(info_hash);
     handshake[48..68].copy_from_slice(peer_id);
     handshake
@@ -275,6 +352,11 @@ impl Handshake {
     /// message.
     pub fn supports_dht(&self) -> bool {
         self.reserved[7] & RESERVED_DHT != 0
+    }
+
+    /// Whether the peer supports the fast extension (BEP 6).
+    pub fn supports_fast(&self) -> bool {
+        self.reserved[fast::RESERVED_BYTE] & fast::RESERVED_BIT != 0
     }
 }
 
@@ -328,6 +410,11 @@ pub struct PeerConnection {
     extensions: bool,
     /// The peer's extension handshake, once it has sent one.
     peer_extensions: Option<ExtendedHandshake>,
+    /// Whether both sides support the fast extension (BEP 6).
+    fast: bool,
+    /// Pieces the peer said it serves us even while it chokes us (Allowed
+    /// Fast).
+    allowed_fast: Vec<bool>,
     /// Set while the number of pieces is unknown, because the torrent's
     /// metadata is still being fetched (BEP 9).
     deferred: Option<DeferredPieces>,
@@ -336,22 +423,25 @@ pub struct PeerConnection {
 /// What a peer said about its pieces before we knew how many there are.
 #[derive(Debug, Default)]
 struct DeferredPieces {
-    bitfield: Option<Vec<u8>>,
+    /// The last Bitfield, Have All or Have None.
+    pieces: Option<PeerMessage>,
     haves: Vec<u32>,
+    allowed_fast: Vec<u32>,
 }
 
 impl PeerConnection {
     /// Connects to `addr` and performs the handshake, followed by the
-    /// extension handshake if the peer supports it. `listen_port` is the
-    /// port we accept incoming peers on, if any, and `metadata_size` the
-    /// length of the info dictionary, if we can send it (BEP 9).
+    /// extension handshake if the peer supports it, which says what
+    /// `advertised` says: the port we accept incoming peers on, the size of
+    /// the metadata we can send (BEP 9), and whether the torrent is private,
+    /// which leaves out the extensions such torrents must not use (see
+    /// `extension::PUBLIC_ONLY`).
     pub async fn connect(
         addr: SocketAddr,
         info_hash: [u8; 20],
         peer_id: [u8; 20],
         num_pieces: usize,
-        listen_port: Option<u16>,
-        metadata_size: Option<u32>,
+        advertised: Advertised,
     ) -> Result<Self> {
         let mut socket = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
@@ -369,8 +459,7 @@ impl PeerConnection {
         .context("handshake timed out")??;
         let handshake = parse_handshake(&response, &info_hash)?;
         let mut conn = Self::new(socket, addr, handshake, num_pieces);
-        conn.send_extension_handshake(listen_port, metadata_size)
-            .await?;
+        conn.send_extension_handshake(advertised).await?;
         Ok(conn)
     }
 
@@ -383,8 +472,7 @@ impl PeerConnection {
         info_hash: [u8; 20],
         peer_id: [u8; 20],
         num_pieces: usize,
-        listen_port: Option<u16>,
-        metadata_size: Option<u32>,
+        advertised: Advertised,
     ) -> Result<Self> {
         let handshake = timeout(HANDSHAKE_TIMEOUT, async {
             let mut handshake = [0u8; 68];
@@ -403,8 +491,7 @@ impl PeerConnection {
             bail!("connected to ourselves");
         }
         let mut conn = Self::new(socket, addr, handshake, num_pieces);
-        conn.send_extension_handshake(listen_port, metadata_size)
-            .await?;
+        conn.send_extension_handshake(advertised).await?;
         Ok(conn)
     }
 
@@ -424,6 +511,9 @@ impl PeerConnection {
             // We always set the bit ourselves.
             extensions: handshake.supports_extensions(),
             peer_extensions: None,
+            // We always set this bit too.
+            fast: handshake.supports_fast(),
+            allowed_fast: vec![false; num_pieces],
             deferred: None,
         }
     }
@@ -432,16 +522,11 @@ impl PeerConnection {
     /// protocol. It goes out right after the handshake, before anything else,
     /// and may be sent again later to change what it says, such as once we
     /// have the metadata to send (`metadata_size`).
-    pub async fn send_extension_handshake(
-        &mut self,
-        listen_port: Option<u16>,
-        metadata_size: Option<u32>,
-    ) -> Result<()> {
+    pub async fn send_extension_handshake(&mut self, advertised: Advertised) -> Result<()> {
         if !self.extensions {
             return Ok(());
         }
-        let payload =
-            ExtendedHandshake::ours(listen_port, metadata_size, self.addr.ip()).encode()?;
+        let payload = ExtendedHandshake::ours(advertised, self.addr.ip()).encode()?;
         self.send(&PeerMessage::Extended {
             id: extension::HANDSHAKE_ID,
             payload,
@@ -481,24 +566,28 @@ impl PeerConnection {
     }
 
     /// For a torrent whose metadata is still being fetched (BEP 9), so that
-    /// the number of pieces is unknown: the peer's Bitfield and Have
-    /// messages are kept aside until `set_piece_count`. Call before
-    /// receiving anything.
+    /// the number of pieces is unknown: the peer's Bitfield, Have, and fast
+    /// extension Have All, Have None and Allowed Fast messages are kept
+    /// aside until `set_piece_count`. Call before receiving anything.
     pub fn defer_pieces(&mut self) {
         self.deferred = Some(DeferredPieces::default());
     }
 
     /// Sets the number of pieces, once the metadata is known, and applies
-    /// the Bitfield and Have messages kept aside since `defer_pieces`. Fails
-    /// if the bitfield does not fit that many pieces.
+    /// the messages kept aside since `defer_pieces`. Fails if the bitfield
+    /// does not fit that many pieces.
     pub fn set_piece_count(&mut self, num_pieces: usize) -> Result<()> {
         let deferred = self.deferred.take().unwrap_or_default();
         self.peer_has = vec![false; num_pieces];
-        if let Some(bitfield) = deferred.bitfield {
-            self.apply(&PeerMessage::Bitfield { bitfield })?;
+        self.allowed_fast = vec![false; num_pieces];
+        if let Some(pieces) = deferred.pieces {
+            self.apply(&pieces)?;
         }
         for piece_index in deferred.haves {
             self.apply(&PeerMessage::Have { piece_index })?;
+        }
+        for piece_index in deferred.allowed_fast {
+            self.apply(&PeerMessage::AllowedFast { piece_index })?;
         }
         Ok(())
     }
@@ -506,6 +595,27 @@ impl PeerConnection {
     /// Whether the peer runs a DHT node, and so wants our `Port` message.
     pub fn supports_dht(&self) -> bool {
         self.dht
+    }
+
+    /// Whether both sides support the fast extension (BEP 6), so that its
+    /// messages may be sent and every request gets a Piece or a Reject.
+    pub fn supports_fast(&self) -> bool {
+        self.fast
+    }
+
+    /// Pieces the peer said it serves us even while it chokes us. It may
+    /// not have them yet.
+    pub fn allowed_fast(&self) -> &[bool] {
+        &self.allowed_fast
+    }
+
+    /// Stops counting piece `index` as allowed fast, say because the peer
+    /// rejected a request for it while choking us after all. A later
+    /// Allowed Fast for it counts again.
+    pub fn disallow_fast(&mut self, index: u32) {
+        if let Some(allowed) = self.allowed_fast.get_mut(index as usize) {
+            *allowed = false;
+        }
     }
 
     pub fn is_choked(&self) -> bool {
@@ -566,7 +676,8 @@ impl PeerConnection {
 
     /// Sends Choke or Unchoke if our choke state changed. A choked peer's
     /// pending requests are dropped, and it knows to ask again once
-    /// unchoked.
+    /// unchoked; with the fast extension, the caller rejects them after
+    /// this.
     pub async fn set_choking(&mut self, choking: bool) -> Result<()> {
         if choking != self.am_choking {
             let message = if choking {
@@ -623,15 +734,26 @@ impl PeerConnection {
     }
 
     fn apply(&mut self, message: &PeerMessage) -> Result<()> {
+        if message.is_fast() && !self.fast {
+            bail!(ProtocolViolation(
+                "fast extension message without the fast extension"
+            ));
+        }
         if let Some(deferred) = &mut self.deferred {
             match message {
-                PeerMessage::Bitfield { bitfield } => {
-                    deferred.bitfield = Some(bitfield.clone());
+                PeerMessage::Bitfield { .. } | PeerMessage::HaveAll | PeerMessage::HaveNone => {
+                    deferred.pieces = Some(message.clone());
                     return Ok(());
                 }
                 PeerMessage::Have { piece_index } => {
                     if deferred.haves.len() < MAX_DEFERRED_HAVES {
                         deferred.haves.push(*piece_index);
+                    }
+                    return Ok(());
+                }
+                PeerMessage::AllowedFast { piece_index } => {
+                    if deferred.allowed_fast.len() < MAX_DEFERRED_HAVES {
+                        deferred.allowed_fast.push(*piece_index);
                     }
                     return Ok(());
                 }
@@ -659,6 +781,14 @@ impl PeerConnection {
                 }
                 for (i, has) in self.peer_has.iter_mut().enumerate() {
                     *has = bitfield[i / 8] & (0x80 >> (i % 8)) != 0;
+                }
+            }
+            PeerMessage::HaveAll => self.peer_has.fill(true),
+            PeerMessage::HaveNone => self.peer_has.fill(false),
+            PeerMessage::AllowedFast { piece_index } => {
+                // Like Have, an index past the end is ignored.
+                if let Some(allowed) = self.allowed_fast.get_mut(*piece_index as usize) {
+                    *allowed = true;
                 }
             }
             PeerMessage::Extended {
@@ -731,6 +861,15 @@ mod tests {
                 id: 3,
                 payload: vec![],
             },
+            PeerMessage::SuggestPiece { piece_index: 7 },
+            PeerMessage::HaveAll,
+            PeerMessage::HaveNone,
+            PeerMessage::RejectRequest {
+                index: 1,
+                begin: 16384,
+                length: 16384,
+            },
+            PeerMessage::AllowedFast { piece_index: 9 },
             PeerMessage::Unknown { id: 21 },
         ];
         for message in messages {
@@ -751,6 +890,11 @@ mod tests {
             &[8],
             &[9, 1],
             &[20],
+            &[0x0d, 0, 0, 0],
+            &[0x0e, 0],
+            &[0x0f, 0],
+            &[0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            &[0x11, 0, 0, 0, 0, 0],
         ];
         for case in cases {
             assert!(PeerMessage::decode(case).is_err(), "accepted {:?}", case);
@@ -765,11 +909,12 @@ mod tests {
         assert!(peer_id[8..].iter().all(u8::is_ascii_alphanumeric));
 
         let handshake = handshake_bytes(&info_hash, &peer_id);
-        assert_eq!(handshake[20..28], [0, 0, 0, 0, 0, 0x10, 0, 0x01]);
+        assert_eq!(handshake[20..28], [0, 0, 0, 0, 0, 0x10, 0, 0x05]);
         let parsed = parse_handshake(&handshake, &info_hash).unwrap();
         assert_eq!(parsed.peer_id, peer_id);
         assert!(parsed.supports_extensions());
         assert!(parsed.supports_dht());
+        assert!(parsed.supports_fast());
         assert!(parse_handshake(&handshake, &[4u8; 20]).is_err());
 
         let mut bad = handshake;
@@ -778,10 +923,20 @@ mod tests {
 
         // Other clients' bits are recorded, and the extension bit read alone.
         let mut other = handshake;
-        other[20..28].copy_from_slice(&[0x80, 0, 0, 0, 0, 0xef, 0, 0x05]);
+        other[20..28].copy_from_slice(&[0x80, 0, 0, 0, 0, 0xef, 0, 0x0b]);
         let parsed = parse_handshake(&other, &info_hash).unwrap();
-        assert_eq!(parsed.reserved, [0x80, 0, 0, 0, 0, 0xef, 0, 0x05]);
+        assert_eq!(parsed.reserved, [0x80, 0, 0, 0, 0, 0xef, 0, 0x0b]);
         assert!(!parsed.supports_extensions());
+        assert!(!parsed.supports_fast());
+        assert!(parsed.supports_dht());
+    }
+
+    /// What our extension handshake says when we listen on `port`.
+    fn listening(port: Option<u16>) -> Advertised {
+        Advertised {
+            listen_port: port,
+            ..Advertised::default()
+        }
     }
 
     /// A mock peer's handshake, with the extension protocol bit cleared
@@ -815,9 +970,10 @@ mod tests {
             received
         });
 
-        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1, Some(6881), None)
-            .await
-            .unwrap();
+        let mut conn =
+            PeerConnection::connect(addr, info_hash, [2u8; 20], 1, listening(Some(6881)))
+                .await
+                .unwrap();
         assert!(!conn.supports_extensions());
         assert!(conn.supports_dht());
         conn.keep_alive().await.unwrap();
@@ -853,9 +1009,11 @@ mod tests {
     }
 
     /// Connects to a mock peer that answers the handshake, sends
-    /// `messages`, and returns everything it receives until we hang up.
+    /// `messages`, and returns everything it receives until we hang up. The
+    /// mock supports the fast extension if `fast`.
     async fn mock_peer(
         num_pieces: usize,
+        fast: bool,
         messages: Vec<PeerMessage>,
     ) -> (PeerConnection, tokio::task::JoinHandle<Vec<PeerMessage>>) {
         let info_hash = [5u8; 20];
@@ -866,7 +1024,10 @@ mod tests {
             let mut handshake = [0u8; 68];
             socket.read_exact(&mut handshake).await.unwrap();
             // Without the extension protocol, so no extension handshake.
-            let reply = remote_handshake(&info_hash, false);
+            let mut reply = remote_handshake(&info_hash, false);
+            if !fast {
+                reply[20 + fast::RESERVED_BYTE] &= !fast::RESERVED_BIT;
+            }
             socket.write_all(&reply).await.unwrap();
             for message in messages {
                 socket.write_all(&message.encode()).await.unwrap();
@@ -879,7 +1040,7 @@ mod tests {
             }
             received
         });
-        let conn = PeerConnection::connect(addr, info_hash, [2u8; 20], num_pieces, None, None)
+        let conn = PeerConnection::connect(addr, info_hash, [2u8; 20], num_pieces, listening(None))
             .await
             .unwrap();
         (conn, remote)
@@ -895,7 +1056,8 @@ mod tests {
             PeerMessage::Interested,
             PeerMessage::NotInterested,
         ];
-        let (mut conn, remote) = mock_peer(3, messages).await;
+        let (mut conn, remote) = mock_peer(3, false, messages).await;
+        assert!(!conn.supports_fast());
         assert!(conn.am_choking());
         assert!(!conn.peer_interested());
         conn.receive().await.unwrap();
@@ -930,7 +1092,7 @@ mod tests {
             // Out of range once the count is known, so ignored.
             PeerMessage::Have { piece_index: 99 },
         ];
-        let (mut conn, _remote) = mock_peer(0, messages).await;
+        let (mut conn, _remote) = mock_peer(0, false, messages).await;
         conn.defer_pieces();
         for _ in 0..3 {
             conn.receive().await.unwrap();
@@ -944,10 +1106,27 @@ mod tests {
         let messages = vec![PeerMessage::Bitfield {
             bitfield: vec![0xff],
         }];
-        let (mut conn, _remote) = mock_peer(0, messages).await;
+        let (mut conn, _remote) = mock_peer(0, false, messages).await;
         conn.defer_pieces();
         conn.receive().await.unwrap();
         assert!(conn.set_piece_count(10).is_err());
+
+        // The fast extension's messages wait too.
+        let messages = vec![
+            PeerMessage::AllowedFast { piece_index: 1 },
+            PeerMessage::HaveNone,
+            PeerMessage::HaveAll,
+            PeerMessage::AllowedFast { piece_index: 7 },
+        ];
+        let (mut conn, _remote) = mock_peer(0, true, messages).await;
+        conn.defer_pieces();
+        for _ in 0..4 {
+            conn.receive().await.unwrap();
+        }
+        assert!(conn.peer_has().is_empty() && conn.allowed_fast().is_empty());
+        conn.set_piece_count(3).unwrap();
+        assert_eq!(conn.peer_has(), [true; 3]);
+        assert_eq!(conn.allowed_fast(), [false, true, false]);
     }
 
     #[tokio::test]
@@ -972,7 +1151,8 @@ mod tests {
                 socket.read_exact(&mut reply).await.ok().map(|_| reply)
             });
             let (socket, from) = listener.accept().await.unwrap();
-            let result = PeerConnection::accept(socket, from, info_hash, ours, 1, None, None).await;
+            let result =
+                PeerConnection::accept(socket, from, info_hash, ours, 1, listening(None)).await;
             assert_eq!(result.is_ok(), accepted, "{:?}", result.as_ref().err());
             if let Ok(conn) = &result {
                 assert_eq!(conn.peer_id, theirs);
@@ -1031,9 +1211,10 @@ mod tests {
             (ours, read_message(&mut socket).await)
         });
 
-        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1, Some(6881), None)
-            .await
-            .unwrap();
+        let mut conn =
+            PeerConnection::connect(addr, info_hash, [2u8; 20], 1, listening(Some(6881)))
+                .await
+                .unwrap();
         assert!(conn.supports_extensions());
         assert!(conn.peer_extensions().is_none());
         assert_eq!(conn.request_limit(), None);
@@ -1052,7 +1233,10 @@ mod tests {
 
         let (ours, next) = remote.await.unwrap();
         let localhost = "127.0.0.1".parse().unwrap();
-        assert_eq!(ours, ExtendedHandshake::ours(Some(6881), None, localhost));
+        assert_eq!(
+            ours,
+            ExtendedHandshake::ours(listening(Some(6881)), localhost)
+        );
         assert_eq!(
             next,
             PeerMessage::Extended {
@@ -1082,11 +1266,56 @@ mod tests {
             socket.read_to_end(&mut Vec::new()).await.unwrap();
         });
 
-        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1, None, None)
+        let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1, listening(None))
             .await
             .unwrap();
         let err = conn.receive().await.unwrap_err();
         assert!(err.is::<ProtocolViolation>(), "{err:#}");
         assert!(conn.peer_extensions().is_none());
+    }
+
+    #[tokio::test]
+    async fn tracks_have_all_have_none_and_allowed_fast() {
+        let messages = vec![
+            PeerMessage::HaveAll,
+            PeerMessage::AllowedFast { piece_index: 1 },
+            // Past the end: ignored.
+            PeerMessage::AllowedFast { piece_index: 3 },
+            PeerMessage::SuggestPiece { piece_index: 2 },
+            PeerMessage::HaveNone,
+        ];
+        let (mut conn, _remote) = mock_peer(3, true, messages).await;
+        assert!(conn.supports_fast());
+        conn.receive().await.unwrap();
+        assert_eq!(conn.peer_has(), [true; 3]);
+        conn.receive().await.unwrap();
+        conn.receive().await.unwrap();
+        assert_eq!(conn.allowed_fast(), [false, true, false]);
+        conn.receive().await.unwrap();
+        assert_eq!(conn.receive().await.unwrap(), PeerMessage::HaveNone);
+        assert_eq!(conn.peer_has(), [false; 3]);
+    }
+
+    #[tokio::test]
+    async fn fast_messages_without_the_fast_extension_are_a_protocol_violation() {
+        let fast_messages = [
+            PeerMessage::HaveAll,
+            PeerMessage::HaveNone,
+            PeerMessage::SuggestPiece { piece_index: 0 },
+            PeerMessage::AllowedFast { piece_index: 0 },
+            PeerMessage::RejectRequest {
+                index: 0,
+                begin: 0,
+                length: 16384,
+            },
+        ];
+        for message in fast_messages {
+            assert!(message.is_fast());
+            let (mut conn, _remote) = mock_peer(3, false, vec![message.clone()]).await;
+            let err = conn.receive().await.unwrap_err();
+            assert!(err.is::<ProtocolViolation>(), "{message:?}: {err:#}");
+            assert_eq!(conn.peer_has(), [false; 3]);
+        }
+        assert!(!PeerMessage::Choke.is_fast());
     }
 }

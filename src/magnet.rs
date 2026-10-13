@@ -13,6 +13,7 @@
 use crate::announcer::{Announcer, Transferred};
 use crate::dht::{Dht, DhtSearch};
 use crate::download::{self, DownloadConfig, Session, StartPeers};
+use crate::extension::Advertised;
 use crate::metadata::MetadataFetch;
 use crate::peer;
 use crate::peer_pool::PeerPool;
@@ -331,6 +332,7 @@ pub async fn download_magnet(
             storage,
             seed: config.seed,
             dht,
+            rate_limits: download::rate_limits(config),
             metadata: Some(fetched.metadata),
         });
         let candidates = verify::candidates(&session.torrent, &session.storage)?;
@@ -360,10 +362,14 @@ pub async fn download_magnet(
 
     // The peers we fetched the metadata from carry on into the download.
     let num_pieces = session.torrent.num_pieces();
-    let metadata_size = session
-        .metadata
-        .as_ref()
-        .and_then(|metadata| u32::try_from(metadata.len()).ok());
+    let advertised = Advertised {
+        listen_port,
+        metadata_size: session
+            .metadata
+            .as_ref()
+            .and_then(|metadata| u32::try_from(metadata.len()).ok()),
+        private: session.torrent.is_private(),
+    };
     let mut connections = Vec::new();
     for (mut conn, inbound) in fetched.connections {
         let addr = conn.addr;
@@ -372,10 +378,7 @@ pub async fn download_magnet(
             continue;
         }
         // Now that we have the metadata, peers may fetch it from us too.
-        if let Err(e) = conn
-            .send_extension_handshake(listen_port, metadata_size)
-            .await
-        {
+        if let Err(e) = conn.send_extension_handshake(advertised).await {
             debug!(%addr, "dropping peer: {e:#}");
             continue;
         }

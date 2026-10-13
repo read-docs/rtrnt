@@ -29,7 +29,7 @@ pub struct Info {
     pub piece_length: u64,
     pub pieces: ByteBuf,
     /// `1` for a private torrent (BEP 27): its peers come from its trackers
-    /// only, never from the DHT.
+    /// only, never from the DHT or peer exchange.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub private: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

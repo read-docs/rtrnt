@@ -16,7 +16,7 @@ use crate::announcer::{Announcer, Transferred};
 use crate::bencode;
 use crate::dht::DhtSearch;
 use crate::download::{self, ConnectedPeers, Misbehaved};
-use crate::extension::{UT_METADATA, UT_METADATA_ID};
+use crate::extension::{Advertised, UT_METADATA, UT_METADATA_ID};
 use crate::magnet::FetchInterrupted;
 use crate::peer::{PeerConnection, PeerMessage, ProtocolViolation};
 use crate::peer_pool::PeerPool;
@@ -676,12 +676,18 @@ async fn fetch_from_peer(
     listen_port: Option<u16>,
 ) -> Result<PeerConnection> {
     let inbound = socket.is_some();
+    // Whether the torrent is private is not known yet, but magnet links for
+    // private torrents are not a thing in practice.
+    let advertised = Advertised {
+        listen_port,
+        ..Advertised::default()
+    };
     // With 0 pieces for now; their number comes with the metadata.
     let mut conn = match socket {
         Some(socket) => {
-            PeerConnection::accept(socket, addr, info_hash, peer_id, 0, listen_port, None).await?
+            PeerConnection::accept(socket, addr, info_hash, peer_id, 0, advertised).await?
         }
-        None => PeerConnection::connect(addr, info_hash, peer_id, 0, listen_port, None).await?,
+        None => PeerConnection::connect(addr, info_hash, peer_id, 0, advertised).await?,
     };
     conn.defer_pieces();
     if conn.peer_id == peer_id {
@@ -691,6 +697,12 @@ async fn fetch_from_peer(
     let Some(_connected) = shared.connected.register(conn.peer_id) else {
         bail!("already connected to this peer");
     };
+    // We have no piece yet, which the fast extension (BEP 6) wants said
+    // first thing. Pieces we turn out to have once the metadata is known
+    // follow as Have messages.
+    if conn.supports_fast() {
+        conn.send(&PeerMessage::HaveNone).await?;
+    }
     debug!(%addr, inbound, "connected, fetching metadata");
     let result = fetch_pieces(shared, &mut conn).await;
     shared.lock().leave(addr);
