@@ -1,10 +1,12 @@
 use crate::announcer::{Announcer, Transferred};
 use crate::choker::Choker;
+use crate::client::Client;
 use crate::dht::{Dht, DhtSearch};
 use crate::extension::{self, Advertised};
 use crate::fast;
+use crate::listener::{Listener, Registration};
 use crate::metadata;
-use crate::peer::{self, PeerConnection, PeerMessage};
+use crate::peer::{self, Incoming, PeerConnection, PeerMessage};
 use crate::peer_pool::PeerPool;
 use crate::pex::{self, PeerExchange};
 use crate::rate_limit::{Allowance, RateLimits};
@@ -13,7 +15,7 @@ use crate::torrent::{self, TorrentFile};
 use crate::tracker::{AnnounceEvent, AnnounceRequest};
 use crate::verify;
 use anyhow::{Result, anyhow, bail};
-use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
+use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressStyle};
 use rand::Rng;
 use sha1::Digest;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
@@ -27,7 +29,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 const BLOCK_SIZE: u32 = 16 * 1024;
 /// Block requests in flight to a new peer, before its rate is known.
@@ -130,25 +132,34 @@ pub struct Session {
     /// Our DHT node, if any: searched for peers, and told about peers' DHT
     /// nodes, whose ports they send us.
     pub dht: Option<Dht>,
-    /// How fast block data may move each way, shared by every peer.
-    pub rate_limits: RateLimits,
+    /// How fast block data may move each way, shared by every peer (of
+    /// every torrent in the session).
+    pub rate_limits: Arc<RateLimits>,
     /// The torrent's info dictionary exactly as encoded, if we have it, for
     /// peers that fetch it by magnet link (BEP 9).
     pub metadata: Option<Vec<u8>>,
+    /// Where the torrent's progress bars go, next to those of the other
+    /// torrents in the session.
+    pub bars: MultiProgress,
 }
 
-/// Downloads the torrent at `torrent_path` and seeds it for as long as
-/// `config.seed` says, stopping early (see `download_from_peers`) if
-/// `shutdown` resolves. It is first polled once the tracker has answered,
-/// so a signal handler behind it is only installed then.
+/// Downloads the torrent at `torrent_path` and seeds it for as long as the
+/// client's `seed` setting says, stopping early (see `download_from_peers`)
+/// if `shutdown` resolves. It is first polled once the tracker has
+/// answered, so a signal handler behind it is only installed then.
+///
+/// The torrent shares the client's listening port, DHT node and rate limits
+/// with the client's other torrents, and fails if the client is running it
+/// already.
 ///
 /// A download that is already complete on disk exits at once, unless it is
 /// to be seeded.
 pub async fn download_file(
     torrent_path: &Path,
-    config: &DownloadConfig,
+    client: &Client,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
+    let config = client.config();
     let torrent::Metainfo {
         torrent,
         info_hash,
@@ -161,20 +172,22 @@ pub async fn download_file(
         info_hash = %hex(&info_hash),
         "loaded torrent"
     );
+    let _claim = client.claim(info_hash)?;
 
     // Before announcing, so a bad output directory does not leave the
     // tracker without a `stopped`.
     let storage = Arc::new(Storage::new(&torrent.info, &config.output_dir)?);
-    let dht = start_dht(&torrent, config).await;
+    let dht = start_dht(&torrent, client).await;
     let session = Arc::new(Session {
         torrent,
         info_hash,
-        peer_id: peer::generate_peer_id(),
+        peer_id: client.peer_id(),
         storage,
         seed: config.seed,
         dht,
-        rate_limits: rate_limits(config),
+        rate_limits: client.rate_limits(),
         metadata: Some(info_bytes),
+        bars: client.bars().clone(),
     });
 
     let candidates = verify::candidates(&session.torrent, &session.storage)?;
@@ -187,14 +200,8 @@ pub async fn download_file(
         }
     }
 
-    let listeners = listen(config.listen_port).await;
-    let port = match listeners.first().map(TcpListener::local_addr) {
-        Some(Ok(addr)) => {
-            info!(port = addr.port(), "listening for peers");
-            addr.port()
-        }
-        _ => config.listen_port,
-    };
+    let incoming = client.listener().await.register(info_hash)?;
+    let port = incoming.port().unwrap_or(config.listen_port);
     let request = AnnounceRequest {
         info_hash,
         peer_id: session.peer_id,
@@ -226,12 +233,14 @@ pub async fn download_file(
         info!(peers = peers.len(), "tracker announce succeeded");
     }
 
-    download_from_peers(
+    let mut start = StartPeers::default();
+    start.pool.add(peers);
+    download_with(
         session,
         &have,
-        &peers,
+        start,
         config.max_peers,
-        listeners,
+        incoming,
         announcer,
         shutdown,
     )
@@ -240,33 +249,17 @@ pub async fn download_file(
     Ok(())
 }
 
-/// The session's rate limits, as `config` sets them, logged if any.
-pub(crate) fn rate_limits(config: &DownloadConfig) -> RateLimits {
-    if config.max_download_rate > 0 || config.max_upload_rate > 0 {
-        info!(
-            download = config.max_download_rate,
-            upload = config.max_upload_rate,
-            "rate limits in KiB/s (0: unlimited)"
-        );
-    }
-    RateLimits::from_kib(config.max_download_rate, config.max_upload_rate)
-}
-
-/// Starts our DHT node, unless disabled or the torrent is private. It tries
-/// the TCP listening port for UDP too, and bootstraps once the download
-/// looks for peers, or within a minute.
-async fn start_dht(torrent: &TorrentFile, config: &DownloadConfig) -> Option<Dht> {
-    if !config.dht {
+/// The client's DHT node, unless disabled or the torrent is private. It
+/// bootstraps once a download looks for peers, or within a minute.
+async fn start_dht(torrent: &TorrentFile, client: &Client) -> Option<Dht> {
+    if !client.config().dht {
         return None;
     }
     if torrent.is_private() {
         info!("private torrent: not using the DHT");
         return None;
     }
-    Dht::bind(config.listen_port)
-        .await
-        .inspect_err(|e| warn!("cannot start the DHT: {e:#}"))
-        .ok()
+    client.dht().await
 }
 
 /// Listens for incoming peers on `port`, or on a free port if that one is
@@ -325,8 +318,9 @@ pub async fn check_file(torrent_path: &Path, output_dir: &Path) -> Result<()> {
         storage,
         seed: SeedLimits::default(),
         dht: None,
-        rate_limits: RateLimits::default(),
+        rate_limits: Arc::default(),
         metadata: None,
+        bars: MultiProgress::new(),
     });
     let have = hash_pieces(&session, pieces).await?;
 
@@ -349,22 +343,25 @@ pub(crate) async fn hash_pieces(session: &Arc<Session>, pieces: Vec<usize>) -> R
         .iter()
         .map(|&index| torrent.piece_len(index))
         .sum::<Result<u64>>()?;
-    let bar = ProgressBar::new(total);
-    if let Ok(style) =
-        ProgressStyle::with_template("checking {bar:40.cyan/blue} {bytes}/{total_bytes} eta {eta}")
-    {
+    let bar = session.bars.add(ProgressBar::new(total));
+    let style = ProgressStyle::with_template(
+        "checking {prefix} {bar:40.cyan/blue} {bytes}/{total_bytes} eta {eta}",
+    );
+    if let Ok(style) = style {
         bar.set_style(style);
     }
+    bar.set_prefix(bar_label(&torrent.info.name));
 
-    let session = Arc::clone(session);
+    let blocking = Arc::clone(session);
     let check_bar = bar.clone();
     let have = tokio::task::spawn_blocking(move || {
-        verify::verify(&session.torrent, &session.storage, &pieces, &|len| {
+        verify::verify(&blocking.torrent, &blocking.storage, &pieces, &|len| {
             check_bar.inc(len)
         })
     })
     .await??;
     bar.finish_and_clear();
+    session.bars.remove(&bar);
 
     let done = have.iter().filter(|&&have| have).count();
     info!(done, pieces = have.len(), "checked data on disk");
@@ -428,8 +425,9 @@ pub async fn download_from_peers(
 ) -> Result<()> {
     let mut start = StartPeers::default();
     start.pool.add(peers.iter().copied());
+    let incoming = Listener::start(listeners).register(session.info_hash)?;
     download_with(
-        session, have, start, max_peers, listeners, announcer, shutdown,
+        session, have, start, max_peers, incoming, announcer, shutdown,
     )
     .await
 }
@@ -447,13 +445,14 @@ pub(crate) struct StartPeers {
 }
 
 /// `download_from_peers`, starting with the peers in `start`, some of them
-/// perhaps already connected.
+/// perhaps already connected, and taking the peers that connect to us from
+/// `incoming`.
 pub(crate) async fn download_with(
     session: Arc<Session>,
     have: &[bool],
     start: StartPeers,
     max_peers: usize,
-    listeners: Vec<TcpListener>,
+    mut incoming: Registration,
     mut announcer: Option<Announcer>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
@@ -467,7 +466,12 @@ pub(crate) async fn download_with(
     let (pex, mut pex_peers) = PeerExchange::new(!torrent.is_private());
     let swarm = Arc::new(Swarm {
         queue: PieceQueue::new(have).seeding(seed.enabled()),
-        progress: Progress::new(torrent.length(), verified_bytes(torrent, have)?),
+        progress: Progress::new(
+            &session.bars,
+            &torrent.info.name,
+            torrent.length(),
+            verified_bytes(torrent, have)?,
+        ),
         connected: ConnectedPeers::default(),
         choker: Choker::default(),
         pex,
@@ -486,10 +490,7 @@ pub(crate) async fn download_with(
     } = start;
 
     // Told to peers in the extension handshake.
-    let listen_port = listeners
-        .first()
-        .and_then(|listener| listener.local_addr().ok())
-        .map(|addr| addr.port());
+    let listen_port = incoming.port();
 
     let mut workers = JoinSet::new();
     // Starts a worker that connects to `addr`, or, given the socket the peer
@@ -499,7 +500,7 @@ pub(crate) async fn download_with(
         let session = Arc::clone(&session);
         let swarm = Arc::clone(&swarm);
         let inbound = link.is_inbound();
-        workers.spawn(async move {
+        let worker = async move {
             let mut pieces = 0;
             let result = peer_worker(&session, &swarm, addr, link, listen_port, &mut pieces).await;
             WorkerExit {
@@ -508,7 +509,8 @@ pub(crate) async fn download_with(
                 pieces,
                 result,
             }
-        });
+        };
+        workers.spawn(worker.in_current_span());
     };
     for (conn, inbound) in connections {
         spawn(
@@ -621,14 +623,15 @@ pub(crate) async fn download_with(
                     }
                 }
             }
-            (socket, addr) = accept(&listeners) => {
+            peer = incoming.next() => {
+                let addr = peer.addr;
                 if workers.len() >= max_peers {
                     debug!(%addr, "turning away incoming peer: too many peers");
                 } else if banned_ips.contains(&addr.ip()) {
                     debug!(%addr, "turning away banned peer");
                 } else {
                     asked = None;
-                    spawn(&mut workers, addr, Link::Accepted(socket));
+                    spawn(&mut workers, addr, Link::Accepted(peer));
                 }
             }
             () = sleep_until_some(retry_at) => {}
@@ -665,7 +668,7 @@ pub(crate) async fn download_with(
     // connecting are cut short. A worker writing a piece finishes the write
     // first, and even if aborted, the write runs on to the end on the
     // blocking pool. New peers are refused meanwhile.
-    drop(listeners);
+    drop(incoming);
     queue.close();
     let drain = async { while workers.join_next().await.is_some() {} };
     if tokio::time::timeout(SHUTDOWN_GRACE, drain).await.is_err() {
@@ -698,8 +701,9 @@ pub(crate) async fn download_with(
 enum Link {
     /// By connecting to it.
     Connect,
-    /// Over a socket it connected to us on, before the handshake.
-    Accepted(TcpStream),
+    /// Over a connection it opened to us, with its handshake read but not
+    /// answered.
+    Accepted(Incoming),
     /// Over a connection already open, such as one the metadata of a magnet
     /// link came over.
     Open {
@@ -879,15 +883,17 @@ struct Progress {
 }
 
 impl Progress {
-    /// A bar for `total` bytes, of which `done` were already on disk.
-    fn new(total: u64, done: u64) -> Self {
-        let bar = ProgressBar::new(total);
+    /// A bar in `bars` for `total` bytes of the torrent called `name`, of
+    /// which `done` were already on disk.
+    fn new(bars: &MultiProgress, name: &str, total: u64, done: u64) -> Self {
+        let bar = bars.add(ProgressBar::new(total));
         let style = ProgressStyle::with_template(
-            "{bar:40.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec} eta {eta} {msg}",
+            "{prefix} {bar:40.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec} eta {eta} {msg}",
         );
         if let Ok(style) = style {
             bar.set_style(style);
         }
+        bar.set_prefix(bar_label(name));
         // Moving the bar records `done` as a step, and resetting the ETA
         // drops it again, so data from disk does not count towards the rate.
         bar.set_position(done);
@@ -950,8 +956,8 @@ async fn peer_worker(
         private: torrent.is_private(),
     };
     let mut conn = match link {
-        Link::Accepted(socket) => {
-            PeerConnection::accept(socket, addr, info_hash, peer_id, num_pieces, advertised).await?
+        Link::Accepted(incoming) => {
+            PeerConnection::answer(incoming, peer_id, num_pieces, advertised).await?
         }
         Link::Connect => {
             PeerConnection::connect(addr, info_hash, peer_id, num_pieces, advertised).await?
@@ -2215,6 +2221,20 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Width of the torrent name in front of each progress bar.
+const BAR_LABEL_WIDTH: usize = 20;
+
+/// The torrent name `name` as shown in front of its progress bars: cut short
+/// or padded, so the bars of several torrents line up.
+fn bar_label(name: &str) -> String {
+    if name.chars().count() <= BAR_LABEL_WIDTH {
+        return format!("{name:<BAR_LABEL_WIDTH$}");
+    }
+    let mut label: String = name.chars().take(BAR_LABEL_WIDTH - 1).collect();
+    label.push('…');
+    label
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2230,6 +2250,14 @@ mod tests {
 
     fn availability(queue: &PieceQueue) -> Vec<u32> {
         queue.lock().availability.clone()
+    }
+
+    #[test]
+    fn bar_labels_line_up() {
+        assert_eq!(bar_label("a.iso"), format!("{:<20}", "a.iso"));
+        let long = bar_label("ubuntu-24.04-desktop-amd64.iso");
+        assert_eq!(long, "ubuntu-24.04-deskto…");
+        assert_eq!(bar_label("żółw-ąęść-łódź-źdźbło-x").chars().count(), 20);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 /// Used when the tracker does not say how often to announce.
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -160,10 +160,11 @@ impl Announcer {
         let request = self.request(event, transferred.load());
         let handle = self.in_flight.get_or_insert_with(|| {
             let mut trackers = self.trackers.clone();
-            tokio::spawn(async move {
+            let announce = async move {
                 let result = trackers.announce(&request).await;
                 (trackers, request.event, result)
-            })
+            };
+            tokio::spawn(announce.in_current_span())
         });
         let (event, result) = match handle.await {
             Ok((trackers, event, result)) => {

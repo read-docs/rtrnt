@@ -3,11 +3,13 @@
 pub mod announcer;
 pub mod bencode;
 mod choker;
+pub mod client;
 pub mod config;
 pub mod dht;
 pub mod download;
 pub mod extension;
 pub mod fast;
+pub mod listener;
 pub mod magnet;
 pub mod metadata;
 pub mod peer;

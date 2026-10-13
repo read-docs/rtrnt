@@ -17,8 +17,9 @@ use crate::bencode;
 use crate::dht::DhtSearch;
 use crate::download::{self, ConnectedPeers, Misbehaved};
 use crate::extension::{Advertised, UT_METADATA, UT_METADATA_ID};
+use crate::listener::Registration;
 use crate::magnet::FetchInterrupted;
-use crate::peer::{PeerConnection, PeerMessage, ProtocolViolation};
+use crate::peer::{Incoming, PeerConnection, PeerMessage, ProtocolViolation};
 use crate::peer_pool::PeerPool;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_bencode::value::Value;
@@ -27,11 +28,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 /// Length of every metadata piece but the last.
 pub const PIECE_LEN: usize = 16 * 1024;
@@ -414,8 +414,8 @@ pub(crate) struct MetadataFetch<'a> {
     pub peer_id: [u8; 20],
     /// Most peers connected at once.
     pub max_peers: usize,
-    /// Where peers connect to us, which may send the metadata too.
-    pub listeners: &'a [TcpListener],
+    /// The peers that connect to us, which may send the metadata too.
+    pub incoming: &'a mut Registration,
     /// Re-announced to on its interval, for more peers.
     pub announcer: &'a mut Option<Announcer>,
     /// Searched for more peers.
@@ -513,7 +513,7 @@ impl MetadataFetch<'_> {
             info_hash,
             peer_id,
             max_peers,
-            listeners,
+            incoming,
             announcer,
             mut dht,
         } = self;
@@ -522,10 +522,7 @@ impl MetadataFetch<'_> {
             changed: Notify::new(),
             connected: ConnectedPeers::default(),
         });
-        let listen_port = listeners
-            .first()
-            .and_then(|listener| listener.local_addr().ok())
-            .map(|addr| addr.port());
+        let listen_port = incoming.port();
         let mut peers = Peers {
             pool,
             banned_ips: HashSet::new(),
@@ -533,18 +530,19 @@ impl MetadataFetch<'_> {
             outbound: HashSet::new(),
         };
         let mut workers = JoinSet::new();
-        let spawn = |workers: &mut JoinSet<WorkerExit>, addr, socket: Option<TcpStream>| {
+        let spawn = |workers: &mut JoinSet<WorkerExit>, addr, peer: Option<Incoming>| {
             let shared = Arc::clone(&shared);
-            let inbound = socket.is_some();
-            workers.spawn(async move {
+            let inbound = peer.is_some();
+            let worker = async move {
                 let result =
-                    fetch_from_peer(&shared, info_hash, peer_id, addr, socket, listen_port).await;
+                    fetch_from_peer(&shared, info_hash, peer_id, addr, peer, listen_port).await;
                 WorkerExit {
                     addr,
                     inbound,
                     result,
                 }
-            });
+            };
+            workers.spawn(worker.in_current_span());
         };
         // Nothing is downloaded while fetching the metadata.
         let transferred = Transferred::default();
@@ -594,14 +592,15 @@ impl MetadataFetch<'_> {
                     Ok(exit) => peers.record(exit),
                     Err(e) => warn!("peer task failed: {e}"),
                 },
-                (socket, addr) = download::accept(listeners) => {
+                peer = incoming.next() => {
+                    let addr = peer.addr;
                     if workers.len() >= max_peers {
                         debug!(%addr, "turning away incoming peer: too many peers");
                     } else if peers.banned_ips.contains(&addr.ip()) {
                         debug!(%addr, "turning away banned peer");
                     } else {
                         asked = None;
-                        spawn(&mut workers, addr, Some(socket));
+                        spawn(&mut workers, addr, Some(peer));
                     }
                 }
                 () = download::sleep_until_some(retry_at) => {}
@@ -663,7 +662,7 @@ impl MetadataFetch<'_> {
     }
 }
 
-/// Connects to `addr`, or with a `socket` the peer connected to us on,
+/// Connects to `addr`, or, given the connection the peer opened to us,
 /// answers its handshake, and fetches metadata pieces from it until the
 /// metadata is complete. Returns the connection then, for the download to
 /// carry on with.
@@ -672,10 +671,10 @@ async fn fetch_from_peer(
     info_hash: [u8; 20],
     peer_id: [u8; 20],
     addr: SocketAddr,
-    socket: Option<TcpStream>,
+    peer: Option<Incoming>,
     listen_port: Option<u16>,
 ) -> Result<PeerConnection> {
-    let inbound = socket.is_some();
+    let inbound = peer.is_some();
     // Whether the torrent is private is not known yet, but magnet links for
     // private torrents are not a thing in practice.
     let advertised = Advertised {
@@ -683,10 +682,8 @@ async fn fetch_from_peer(
         ..Advertised::default()
     };
     // With 0 pieces for now; their number comes with the metadata.
-    let mut conn = match socket {
-        Some(socket) => {
-            PeerConnection::accept(socket, addr, info_hash, peer_id, 0, advertised).await?
-        }
+    let mut conn = match peer {
+        Some(peer) => PeerConnection::answer(peer, peer_id, 0, advertised).await?,
         None => PeerConnection::connect(addr, info_hash, peer_id, 0, advertised).await?,
     };
     conn.defer_pieces();

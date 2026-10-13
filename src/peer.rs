@@ -377,6 +377,37 @@ pub fn parse_handshake(handshake: &[u8; 68], info_hash: &[u8; 20]) -> Result<Han
     Ok(parsed)
 }
 
+/// A connection a peer opened to us, whose handshake we have read but not
+/// answered yet.
+#[derive(Debug)]
+pub struct Incoming {
+    pub socket: TcpStream,
+    pub addr: SocketAddr,
+    /// The torrent the peer asked for.
+    pub info_hash: [u8; 20],
+    pub handshake: Handshake,
+}
+
+impl Incoming {
+    /// Reads the handshake of the peer that connected to us from `addr`,
+    /// which says which torrent it wants.
+    pub async fn read(mut socket: TcpStream, addr: SocketAddr) -> Result<Self> {
+        let mut bytes = [0u8; 68];
+        timeout(HANDSHAKE_TIMEOUT, socket.read_exact(&mut bytes))
+            .await
+            .context("handshake timed out")??;
+        let mut info_hash = [0u8; 20];
+        info_hash.copy_from_slice(&bytes[28..48]);
+        let handshake = parse_handshake(&bytes, &info_hash)?;
+        Ok(Self {
+            socket,
+            addr,
+            info_hash,
+            handshake,
+        })
+    }
+}
+
 /// A peer sent something no honest peer would, such as a malformed
 /// extension handshake. Unlike a failed connection, this is no reason to try
 /// the peer again.
@@ -467,22 +498,39 @@ impl PeerConnection {
     /// to us. The peer speaks first, and we answer only if it asks for our
     /// torrent. The extension handshake follows as in `connect`.
     pub async fn accept(
-        mut socket: TcpStream,
+        socket: TcpStream,
         addr: SocketAddr,
         info_hash: [u8; 20],
         peer_id: [u8; 20],
         num_pieces: usize,
         advertised: Advertised,
     ) -> Result<Self> {
-        let handshake = timeout(HANDSHAKE_TIMEOUT, async {
-            let mut handshake = [0u8; 68];
-            socket.read_exact(&mut handshake).await?;
-            let handshake = parse_handshake(&handshake, &info_hash)?;
-            socket
-                .write_all(&handshake_bytes(&info_hash, &peer_id))
-                .await?;
-            anyhow::Ok(handshake)
-        })
+        let incoming = Incoming::read(socket, addr).await?;
+        if incoming.info_hash != info_hash {
+            bail!("info hash mismatch");
+        }
+        Self::answer(incoming, peer_id, num_pieces, advertised).await
+    }
+
+    /// Answers the handshake of a peer that connected to us, which we have
+    /// read, with ours for the torrent it asked for. The extension handshake
+    /// follows as in `connect`.
+    pub async fn answer(
+        incoming: Incoming,
+        peer_id: [u8; 20],
+        num_pieces: usize,
+        advertised: Advertised,
+    ) -> Result<Self> {
+        let Incoming {
+            mut socket,
+            addr,
+            info_hash,
+            handshake,
+        } = incoming;
+        timeout(
+            HANDSHAKE_TIMEOUT,
+            socket.write_all(&handshake_bytes(&info_hash, &peer_id)),
+        )
         .await
         .context("handshake timed out")??;
         // Our own outgoing connection, to an address a tracker listed. Having

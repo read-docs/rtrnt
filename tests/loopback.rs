@@ -1,6 +1,8 @@
 //! End-to-end downloads from mock seeders (and a mock tracker) over loopback.
 
+use indicatif::MultiProgress;
 use rtrnt::announcer::Announcer;
+use rtrnt::client::Client;
 use rtrnt::dht::Dht;
 use rtrnt::download::{
     DownloadConfig, Interrupted, SeedLimits, Session, check_file, download_file,
@@ -33,12 +35,17 @@ const PIECE_LENGTH: u64 = 32 * 1024;
 const FILES: &[(&str, usize)] = &[("a.bin", 40_000), ("empty.bin", 0), ("b.bin", 50_123)];
 
 fn make_torrent(data: &[u8]) -> (TorrentFile, [u8; 20]) {
+    make_named_torrent(data, "multi")
+}
+
+/// `make_torrent`, with its files in the directory `name`.
+fn make_named_torrent(data: &[u8], name: &str) -> (TorrentFile, [u8; 20]) {
     let pieces: Vec<u8> = data
         .chunks(PIECE_LENGTH as usize)
         .flat_map(|chunk| sha1::Sha1::digest(chunk).to_vec())
         .collect();
     let info = Info {
-        name: "multi".into(),
+        name: name.into(),
         piece_length: PIECE_LENGTH,
         pieces: ByteBuf::from(pieces),
         private: None,
@@ -297,15 +304,26 @@ fn limited_session(
         storage,
         seed,
         dht: None,
-        rate_limits,
+        rate_limits: Arc::new(rate_limits),
         metadata: Some(metadata),
+        bars: MultiProgress::new(),
     })
 }
 
+/// A client with the settings in `config`, for a test.
+fn client(config: DownloadConfig) -> Client {
+    Client::new(config, MultiProgress::new())
+}
+
 fn assert_files_match(out: &Path, data: &[u8]) {
+    assert_named_files_match(out, "multi", data);
+}
+
+/// `assert_files_match` for a torrent made by `make_named_torrent`.
+fn assert_named_files_match(out: &Path, torrent: &str, data: &[u8]) {
     let mut offset = 0;
     for (name, len) in FILES {
-        let written = std::fs::read(out.join("multi/dir").join(name)).unwrap();
+        let written = std::fs::read(out.join(torrent).join("dir").join(name)).unwrap();
         assert_eq!(written, data[offset..offset + len], "{name} differs");
         offset += len;
     }
@@ -1517,7 +1535,7 @@ async fn seeds_a_download_that_is_already_complete() {
     };
     tokio::time::timeout(
         Duration::from_secs(20),
-        download_file(&torrent_path, &config, pending()),
+        download_file(&torrent_path, &client(config), pending()),
     )
     .await
     .expect("seeding did not stop")
@@ -1535,6 +1553,130 @@ async fn seeds_a_download_that_is_already_complete() {
             ["stopped".into(), zero.clone(), total, zero],
         ]
     );
+}
+
+/// Two torrents in one client share one listening port: both trackers hear
+/// the same port, and the seeder of each, connecting to it, is handed to
+/// the torrent it asks for. The trackers list only a dead peer, so every
+/// byte comes over the shared port.
+#[tokio::test]
+async fn two_torrents_share_one_listening_port() {
+    init_tracing();
+    let out = tempfile::tempdir().unwrap();
+    let dead_addr: SocketAddr = {
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        dead.local_addr().unwrap()
+    };
+    let mut paths = Vec::new();
+    let mut seeders = Vec::new();
+    let mut datas = Vec::new();
+    for (name, salt) in [("first", 0u8), ("second", 7)] {
+        let data: Arc<Vec<u8>> = Arc::new(test_data().iter().map(|b| b ^ salt).collect());
+        let (mut torrent, info_hash) = make_named_torrent(&data, name);
+        let num_pieces = torrent.num_pieces();
+        let (tracker_url, mut queries) = mock_tracker(vec![dead_addr]).await;
+        torrent.announce = Some(tracker_url);
+        let path = out.path().join(format!("{name}.torrent"));
+        std::fs::write(&path, serde_bencode::to_bytes(&torrent).unwrap()).unwrap();
+        paths.push(path);
+
+        let seeder_data = Arc::clone(&data);
+        seeders.push(tokio::spawn(async move {
+            let started = queries.recv().await.unwrap();
+            let port: u16 = query_param(&started, "port").unwrap().parse().unwrap();
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            let mut socket = connect_to_leecher(addr, info_hash, num_pieces).await;
+            send(&mut socket, PeerMessage::Unchoke).await;
+            serve(socket, &seeder_data).await;
+            port
+        }));
+        datas.push((name, data));
+    }
+
+    let client = client(DownloadConfig {
+        output_dir: out.path().to_path_buf(),
+        max_peers: 10,
+        listen_port: 0,
+        seed: SeedLimits::default(),
+        dht: false,
+        max_download_rate: 0,
+        max_upload_rate: 0,
+    });
+    let (first, second) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(
+            download_file(&paths[0], &client, pending()),
+            download_file(&paths[1], &client, pending()),
+        )
+    })
+    .await
+    .expect("downloads timed out");
+    first.expect("first download failed");
+    second.expect("second download failed");
+    for (name, data) in &datas {
+        assert_named_files_match(out.path(), name, data);
+    }
+
+    let mut ports = Vec::new();
+    for seeder in seeders {
+        ports.push(seeder.await.unwrap());
+    }
+    assert_eq!(ports[0], ports[1], "the torrents announced different ports");
+    assert_eq!(Some(ports[0]), client.listener().await.port());
+}
+
+/// The same torrent twice in one client: the second is refused while the
+/// first runs.
+#[tokio::test]
+async fn a_client_runs_a_torrent_once() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (mut torrent, info_hash) = make_torrent(&data);
+    let (tracker_url, _queries) = mock_tracker(Vec::new()).await;
+    torrent.announce = Some(tracker_url);
+    let out = tempfile::tempdir().unwrap();
+    write_files(out.path(), &data);
+    let path = out.path().join("multi.torrent");
+    std::fs::write(&path, serde_bencode::to_bytes(&torrent).unwrap()).unwrap();
+
+    let client = client(DownloadConfig {
+        output_dir: out.path().to_path_buf(),
+        max_peers: 10,
+        listen_port: 0,
+        // Seeds until stopped, so it is still running when the second
+        // starts.
+        seed: SeedLimits {
+            ratio: 0.0,
+            time: Duration::from_secs(3600),
+        },
+        dht: false,
+        max_download_rate: 0,
+        max_upload_rate: 0,
+    });
+    let (stop, stop_rx) = oneshot::channel::<()>();
+    let first = download_file(&path, &client, async {
+        stop_rx.await.ok();
+    });
+    let second = async {
+        // Wait until the first has claimed the torrent.
+        while client.claim(info_hash).is_ok() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let err = download_file(&path, &client, pending()).await.unwrap_err();
+        stop.send(()).unwrap();
+        err
+    };
+    let (first, err) = tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .expect("timed out");
+    first.expect("first run failed");
+    assert!(
+        err.to_string().contains("already being downloaded"),
+        "{err:#}"
+    );
+    // Once done, the torrent may run again.
+    assert!(client.claim(info_hash).is_ok());
 }
 
 /// With only a time limit and nobody to upload to, seeding lasts until the
@@ -2832,9 +2974,10 @@ async fn downloads_a_magnet_link_banning_a_peer_with_bad_metadata() {
         max_download_rate: 0,
         max_upload_rate: 0,
     };
+    let client = client(config);
     tokio::time::timeout(
         Duration::from_secs(30),
-        download_magnet(&link, &config, pending()),
+        download_magnet(&link, &client, pending()),
     )
     .await
     .expect("download timed out")
@@ -2874,7 +3017,7 @@ async fn downloads_a_magnet_link_banning_a_peer_with_bad_metadata() {
 
     tokio::time::timeout(
         Duration::from_secs(10),
-        download_magnet(&link, &config, pending()),
+        download_magnet(&link, &client, pending()),
     )
     .await
     .expect("second run timed out")
@@ -3009,9 +3152,10 @@ async fn downloads_a_magnet_link_from_another_rtrnt() {
         max_download_rate: 0,
         max_upload_rate: 0,
     };
+    let client = client(config);
     tokio::time::timeout(
         Duration::from_secs(20),
-        download_magnet(&link, &config, pending()),
+        download_magnet(&link, &client, pending()),
     )
     .await
     .expect("download timed out")

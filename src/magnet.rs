@@ -11,11 +11,11 @@
 //! them, uses that instead of asking peers again.
 
 use crate::announcer::{Announcer, Transferred};
-use crate::dht::{Dht, DhtSearch};
-use crate::download::{self, DownloadConfig, Session, StartPeers};
+use crate::client::Client;
+use crate::dht::DhtSearch;
+use crate::download::{self, Session, StartPeers};
 use crate::extension::Advertised;
 use crate::metadata::MetadataFetch;
-use crate::peer;
 use crate::peer_pool::PeerPool;
 use crate::storage::Storage;
 use crate::torrent;
@@ -25,7 +25,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
 
 /// `left` told to trackers while the torrent's size is unknown; libtorrent
@@ -230,14 +229,18 @@ pub async fn saved_torrent(link: &MagnetLink, output_dir: &Path) -> Option<PathB
 /// (see `MetadataFetch`) and saved, and the download carries on over the
 /// connections already open. Trackers hear a `left` of 16 KiB until the
 /// size is known.
+///
+/// As in `download_file`, the torrent shares the client's listening port,
+/// DHT node and rate limits with the client's other torrents.
 pub async fn download_magnet(
     link: &MagnetLink,
-    config: &DownloadConfig,
+    client: &Client,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
+    let config = client.config();
     if let Some(path) = saved_torrent(link, &config.output_dir).await {
         info!(path = %path.display(), "using metadata saved by an earlier run");
-        return download::download_file(&path, config, shutdown).await;
+        return download::download_file(&path, client, shutdown).await;
     }
     let info_hash = link.info_hash;
     info!(
@@ -246,17 +249,11 @@ pub async fn download_magnet(
         trackers = link.trackers.len(),
         "fetching metadata for magnet link"
     );
-    let peer_id = peer::generate_peer_id();
-    let dht = if config.dht {
-        Dht::bind(config.listen_port)
-            .await
-            .inspect_err(|e| warn!("cannot start the DHT: {e:#}"))
-            .ok()
-    } else {
-        None
-    };
-    let listeners = download::listen(config.listen_port).await;
-    let listen_port = listening_port(&listeners);
+    let _claim = client.claim(info_hash)?;
+    let peer_id = client.peer_id();
+    let dht = client.dht().await;
+    let mut incoming = client.listener().await.register(info_hash)?;
+    let listen_port = incoming.port();
     let tiers = link.tracker_tiers();
     let mut pool = PeerPool::default();
     pool.add(link.peers.iter().copied());
@@ -289,7 +286,7 @@ pub async fn download_magnet(
         info_hash,
         peer_id,
         max_peers: config.max_peers,
-        listeners: &listeners,
+        incoming: &mut incoming,
         announcer: &mut announcer,
         dht: dht
             .clone()
@@ -332,8 +329,9 @@ pub async fn download_magnet(
             storage,
             seed: config.seed,
             dht,
-            rate_limits: download::rate_limits(config),
+            rate_limits: client.rate_limits(),
             metadata: Some(fetched.metadata),
+            bars: client.bars().clone(),
         });
         let candidates = verify::candidates(&session.torrent, &session.storage)?;
         let have = download::hash_pieces(&session, candidates).await?;
@@ -394,20 +392,13 @@ pub async fn download_magnet(
         &have,
         start,
         config.max_peers,
-        listeners,
+        incoming,
         announcer,
         shutdown,
     )
     .await?;
     info!(output = %config.output_dir.display(), "done");
     Ok(())
-}
-
-/// The port the first of `listeners` is bound to, if any.
-fn listening_port(listeners: &[TcpListener]) -> Option<u16> {
-    let port = listeners.first()?.local_addr().ok()?.port();
-    info!(port, "listening for peers");
-    Some(port)
 }
 
 /// Saves fetched metadata as a `.torrent` file, so the next run with the

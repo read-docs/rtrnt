@@ -1,36 +1,46 @@
-use anyhow::{Context, bail};
+use anyhow::bail;
 use clap::Parser;
-use rtrnt::download::{self, Interrupted};
+use indicatif::MultiProgress;
+use rtrnt::client::Client;
+use rtrnt::download::{self, DownloadConfig, Interrupted};
 use rtrnt::magnet::{self, FetchInterrupted, MagnetLink};
 use rtrnt::{config, torrent, tracker};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use tokio::sync::oneshot;
-use tracing::{info, warn};
+use std::sync::{Arc, Once};
+use tokio::sync::watch;
+use tokio::task::JoinSet;
+use tracing::{Instrument, Span, error, info, info_span, warn};
 use tracing_subscriber::EnvFilter;
 
-/// Download a torrent from the terminal.
+/// Download torrents from the terminal.
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
-    /// Path to the .torrent file, or a magnet link
-    /// (magnet:?xt=urn:btih:...)
-    #[arg(required_unless_present = "print_config", value_parser = parse_source)]
-    torrent: Option<Source>,
+    /// Path to a .torrent file, or a magnet link (magnet:?xt=urn:btih:...);
+    /// several are downloaded at once
+    #[arg(
+        required_unless_present = "print_config",
+        value_parser = parse_source,
+        value_name = "TORRENT"
+    )]
+    torrents: Vec<Source>,
     // Settings that the config file can also set have no clap default, so
     // an unset flag falls back to the file. The defaults live in
     // `rtrnt::config` and are spelled out in the help (checked by a test).
     /// Directory to save the downloaded files in [default: .]
     #[arg(short, long)]
     output: Option<PathBuf>,
-    /// Maximum number of peers to download from at once [default: 30]
+    /// Maximum number of peers to download from at once, for each torrent
+    /// [default: 30]
     #[arg(long)]
     max_peers: Option<usize>,
     /// Port to listen on for incoming peers (0 picks a free one; so does a
     /// port that is taken) [default: 6881]
     #[arg(short, long)]
     port: Option<u16>,
-    /// Verify an existing download against the torrent instead of
+    /// Verify existing downloads against their torrents instead of
     /// downloading; exits with an error unless every piece is intact
     #[arg(long)]
     check: bool,
@@ -41,9 +51,9 @@ struct Args {
     /// Print the effective settings and where each one came from, then exit
     #[arg(long)]
     print_config: bool,
-    /// Ask every tracker of the torrent how many seeders and leechers it
+    /// Ask every tracker of each torrent how many seeders and leechers it
     /// knows of instead of downloading; exits with an error unless one
-    /// answers
+    /// answers for each torrent
     #[arg(long, conflicts_with = "check")]
     scrape: bool,
     /// Once the download is complete, keep seeding until we have uploaded
@@ -63,12 +73,12 @@ struct Args {
     /// says `dht = false`
     #[arg(long, overrides_with = "no_dht")]
     dht: bool,
-    /// Most piece data to download per second in KiB, across all peers
-    /// (0: unlimited) [default: 0]
+    /// Most piece data to download per second in KiB, across all peers of
+    /// all torrents (0: unlimited) [default: 0]
     #[arg(long, value_name = "KIB/S")]
     max_download_rate: Option<u64>,
-    /// Most piece data to upload per second in KiB, across all peers (0:
-    /// unlimited) [default: 0]
+    /// Most piece data to upload per second in KiB, across all peers of all
+    /// torrents (0: unlimited) [default: 0]
     #[arg(long, value_name = "KIB/S")]
     max_upload_rate: Option<u64>,
 }
@@ -92,7 +102,24 @@ enum Source {
     Magnet(Box<MagnetLink>),
 }
 
-/// Parses the torrent argument: a magnet link if it starts with `magnet:`,
+impl Source {
+    /// A short name for the torrent, for logs and headings: the file's
+    /// name, or the magnet link's `dn` or else its info hash.
+    fn label(&self) -> String {
+        match self {
+            Source::File(path) => path.file_name().map_or_else(
+                || path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            ),
+            Source::Magnet(link) => link
+                .name
+                .clone()
+                .unwrap_or_else(|| link.info_hash.iter().map(|b| format!("{b:02x}")).collect()),
+        }
+    }
+}
+
+/// Parses a torrent argument: a magnet link if it starts with `magnet:`,
 /// otherwise the path of a .torrent file.
 fn parse_source(arg: &str) -> Result<Source, String> {
     if magnet::is_magnet(arg) {
@@ -117,11 +144,13 @@ const EXIT_INTERRUPTED: u8 = 130;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
+    let bars = MultiProgress::new();
+    let log_bars = bars.clone();
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
-        .with_writer(std::io::stderr)
+        .with_writer(move || LogLine::new(log_bars.clone()))
         .init();
 
     let args = Args::parse();
@@ -144,48 +173,155 @@ async fn main() -> anyhow::Result<ExitCode> {
         info!(path = %path.display(), "loaded config file");
     }
     let config = config::resolve(cli, file.options);
-    // clap requires the torrent unless --print-config is given.
-    let torrent = args.torrent.context("no torrent given")?;
+    // clap requires a torrent unless --print-config is given.
+    if args.torrents.is_empty() {
+        bail!("no torrent given");
+    }
 
-    if args.check {
-        let path = match &torrent {
-            Source::File(path) => path.clone(),
-            // The metadata saved when the magnet link was downloaded.
-            Source::Magnet(link) => match magnet::saved_torrent(link, &config.output_dir).await {
-                Some(path) => path,
-                None => bail!(
-                    "--check needs the torrent's metadata, and {} was not saved by a download \
-                     of this magnet link; download it first, or pass the .torrent file",
-                    link.saved_torrent_path(&config.output_dir).display()
-                ),
-            },
-        };
-        download::check_file(&path, &config.output_dir).await?;
-        return Ok(ExitCode::SUCCESS);
-    }
-    if args.scrape {
-        let (tiers, info_hash) = match &torrent {
-            Source::File(path) => {
-                let (torrent, info_hash) = torrent::load_file(path).await?;
-                (torrent.tracker_tiers(), info_hash)
+    if args.check || args.scrape {
+        let (config, check_mode) = (&config, args.check);
+        return each_in_turn(&args.torrents, |source| async move {
+            if check_mode {
+                check(source, config).await
+            } else {
+                scrape_source(source).await
             }
-            Source::Magnet(link) => (link.tracker_tiers(), link.info_hash),
-        };
-        scrape(&tiers, info_hash).await?;
+        })
+        .await;
+    }
+    download_all(args.torrents, Client::new(config, bars)).await
+}
+
+/// Runs `run` on each torrent in turn. With several, each one's output is
+/// headed by its name, and one that fails is logged and the rest still run;
+/// the exit code is then a failure if any failed.
+async fn each_in_turn<'a, F, Fut>(torrents: &'a [Source], run: F) -> anyhow::Result<ExitCode>
+where
+    F: Fn(&'a Source) -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    if let [torrent] = torrents {
+        run(torrent).await?;
         return Ok(ExitCode::SUCCESS);
     }
-    let result = match &torrent {
-        Source::File(path) => download::download_file(path, &config, ctrl_c()).await,
-        Source::Magnet(link) => magnet::download_magnet(link, &config, ctrl_c()).await,
-    };
-    match result {
-        Ok(()) => Ok(ExitCode::SUCCESS),
-        Err(e) if e.is::<Interrupted>() || e.is::<FetchInterrupted>() => {
-            warn!("{e}; run again to resume");
-            Ok(ExitCode::from(EXIT_INTERRUPTED))
+    let mut failed = 0;
+    for (i, torrent) in torrents.iter().enumerate() {
+        if i > 0 {
+            println!();
         }
-        Err(e) => Err(e),
+        println!("{}:", torrent.label());
+        if let Err(e) = run(torrent).await {
+            error!(torrent = %torrent.label(), "{e:#}");
+            failed += 1;
+        }
     }
+    if failed > 0 {
+        error!("{failed} of {} torrents failed", torrents.len());
+        return Ok(ExitCode::FAILURE);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Verifies the download of `source` in the output directory.
+async fn check(source: &Source, config: &DownloadConfig) -> anyhow::Result<()> {
+    let path = match source {
+        Source::File(path) => path.clone(),
+        // The metadata saved when the magnet link was downloaded.
+        Source::Magnet(link) => match magnet::saved_torrent(link, &config.output_dir).await {
+            Some(path) => path,
+            None => bail!(
+                "--check needs the torrent's metadata, and {} was not saved by a download \
+                 of this magnet link; download it first, or pass the .torrent file",
+                link.saved_torrent_path(&config.output_dir).display()
+            ),
+        },
+    };
+    download::check_file(&path, &config.output_dir).await
+}
+
+/// Scrapes the trackers of `source` (see `scrape`).
+async fn scrape_source(source: &Source) -> anyhow::Result<()> {
+    let (tiers, info_hash) = match source {
+        Source::File(path) => {
+            let (torrent, info_hash) = torrent::load_file(path).await?;
+            (torrent.tracker_tiers(), info_hash)
+        }
+        Source::Magnet(link) => (link.tracker_tiers(), link.info_hash),
+    };
+    scrape(&tiers, info_hash).await
+}
+
+/// How the download of one torrent ended.
+enum Outcome {
+    Done,
+    Interrupted,
+    Failed(anyhow::Error),
+}
+
+/// Downloads (and seeds) every torrent in `torrents` at once through
+/// `client`, until each is done. One that fails does not stop the others,
+/// and Ctrl-C stops them all. With several, each one's logs carry its name.
+///
+/// A single torrent's failure is returned as the error; with several, each
+/// failure is logged and the exit code is a failure. Otherwise the exit code
+/// says whether Ctrl-C cut a download short.
+async fn download_all(torrents: Vec<Source>, client: Client) -> anyhow::Result<ExitCode> {
+    let client = Arc::new(client);
+    let shutdown = Shutdown::new();
+    let several = torrents.len() > 1;
+    let mut tasks = JoinSet::new();
+    for source in torrents {
+        let span = if several {
+            info_span!("torrent", name = %source.label())
+        } else {
+            Span::none()
+        };
+        let client = Arc::clone(&client);
+        let stop = Arc::clone(&shutdown).signal();
+        let download = async move {
+            let result = match &source {
+                Source::File(path) => download::download_file(path, &client, stop).await,
+                Source::Magnet(link) => magnet::download_magnet(link, &client, stop).await,
+            };
+            match result {
+                Ok(()) => Outcome::Done,
+                Err(e) if e.is::<Interrupted>() || e.is::<FetchInterrupted>() => {
+                    warn!("{e}; run again to resume");
+                    Outcome::Interrupted
+                }
+                Err(e) => {
+                    if several {
+                        error!("{e:#}");
+                    }
+                    Outcome::Failed(e)
+                }
+            }
+        };
+        tasks.spawn(download.instrument(span));
+    }
+
+    let total = tasks.len();
+    let mut failed = Vec::new();
+    let mut interrupted = false;
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Outcome::Done) => {}
+            Ok(Outcome::Interrupted) => interrupted = true,
+            Ok(Outcome::Failed(e)) => failed.push(e),
+            Err(e) => failed.push(e.into()),
+        }
+    }
+    if !failed.is_empty() {
+        if !several && let Some(e) = failed.pop() {
+            return Err(e);
+        }
+        error!("{} of {total} torrents failed", failed.len());
+        return Ok(ExitCode::FAILURE);
+    }
+    if interrupted {
+        return Ok(ExitCode::from(EXIT_INTERRUPTED));
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Scrapes every tracker in `tiers` (a torrent's, or a magnet link's `tr`
@@ -208,30 +344,89 @@ async fn scrape(tiers: &[Vec<String>], info_hash: [u8; 20]) -> anyhow::Result<()
     Ok(())
 }
 
-/// Resolves on the first Ctrl-C. A second one, or one that comes once
-/// nobody waits for this any more, exits at once.
-///
-/// Until this is first polled, Ctrl-C keeps its default behavior of
-/// killing the process.
-async fn ctrl_c() {
-    let (first, first_rx) = oneshot::channel();
-    tokio::spawn(async move {
+/// Ctrl-C, for every torrent of the session.
+struct Shutdown {
+    /// Set by the first Ctrl-C.
+    stop: watch::Sender<bool>,
+    handler: Once,
+}
+
+impl Shutdown {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            stop: watch::Sender::new(false),
+            handler: Once::new(),
+        })
+    }
+
+    /// Resolves on the first Ctrl-C, or at once if it has come already. A
+    /// second one, or one that comes while no torrent waits for this, exits
+    /// at once.
+    ///
+    /// Until a torrent first polls this, Ctrl-C keeps its default behavior
+    /// of killing the process.
+    async fn signal(self: Arc<Self>) {
+        let mut stop = self.stop.subscribe();
+        let handler = Arc::clone(&self);
+        self.handler.call_once(move || {
+            tokio::spawn(handler.handle_ctrl_c());
+        });
+        // Fails only once the sender is gone, but `self` holds it.
+        let _ = stop.wait_for(|&stop| stop).await;
+    }
+
+    async fn handle_ctrl_c(self: Arc<Self>) {
         if let Err(e) = tokio::signal::ctrl_c().await {
             warn!("cannot listen for Ctrl-C: {e}");
             return;
         }
-        if first.send(()).is_err() {
+        if self.stop.receiver_count() == 0 {
             std::process::exit(EXIT_INTERRUPTED.into());
         }
+        self.stop.send_replace(true);
+        info!("stopping, press Ctrl-C again to quit at once");
         if tokio::signal::ctrl_c().await.is_ok() {
             std::process::exit(EXIT_INTERRUPTED.into());
         }
-    });
-    if first_rx.await.is_err() {
-        // Not listening for Ctrl-C, so it never comes.
-        std::future::pending().await
     }
-    info!("stopping, press Ctrl-C again to quit at once");
+}
+
+/// One log event, written to stderr once complete, with the progress bars
+/// hidden meanwhile and drawn again below it.
+struct LogLine {
+    bars: MultiProgress,
+    line: Vec<u8>,
+}
+
+impl LogLine {
+    fn new(bars: MultiProgress) -> Self {
+        Self {
+            bars,
+            line: Vec::new(),
+        }
+    }
+}
+
+impl Write for LogLine {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.line.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for LogLine {
+    fn drop(&mut self) {
+        if !self.line.is_empty() {
+            // Nowhere to report a failure to write a log line.
+            let _ = self
+                .bars
+                .suspend(|| std::io::stderr().write_all(&self.line));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -251,19 +446,33 @@ mod tests {
         let hash = "c12fe1c06bba254a9dc9f519b335aa7c1367a88a";
         let args = Args::try_parse_from(["rtrnt", "file.torrent"]).unwrap();
         assert!(
-            matches!(args.torrent, Some(Source::File(path)) if path == Path::new("file.torrent"))
+            matches!(&args.torrents[..], [Source::File(path)] if path == Path::new("file.torrent"))
         );
         let link = format!("magnet:?xt=urn:btih:{hash}&tr=udp%3A%2F%2Ft%3A1");
         let args = Args::try_parse_from(["rtrnt", &link, "--scrape"]).unwrap();
-        let Some(Source::Magnet(link)) = args.torrent else {
+        let [Source::Magnet(link)] = &args.torrents[..] else {
             panic!("not parsed as a magnet link");
         };
         assert_eq!(link.trackers, ["udp://t:1"]);
+        assert_eq!(args.torrents[0].label(), hash);
         let err = Args::try_parse_from(["rtrnt", "magnet:?dn=x"])
             .err()
             .unwrap()
             .to_string();
         assert!(err.contains("no info hash"), "{err}");
+    }
+
+    #[test]
+    fn takes_several_torrents() {
+        let hash = "c12fe1c06bba254a9dc9f519b335aa7c1367a88a";
+        let link = format!("magnet:?xt=urn:btih:{hash}&dn=Some+Name");
+        let args = Args::try_parse_from(["rtrnt", "dir/a.torrent", &link, "b.torrent", "-o", "x"])
+            .unwrap();
+        let labels: Vec<_> = args.torrents.iter().map(Source::label).collect();
+        assert_eq!(labels, ["a.torrent", "Some Name", "b.torrent"]);
+        assert!(Args::try_parse_from(["rtrnt"]).is_err());
+        let args = Args::try_parse_from(["rtrnt", "--print-config"]).unwrap();
+        assert!(args.torrents.is_empty());
     }
 
     /// The defaults are written into the help by hand, since clap does not

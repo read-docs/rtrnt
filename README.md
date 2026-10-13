@@ -21,11 +21,14 @@ A terminal-based BitTorrent client written in Rust.
 ```sh
 cargo run --release -- path/to/file.torrent -o ~/Downloads
 cargo run --release -- 'magnet:?xt=urn:btih:...&tr=udp://tracker.example:1337' -o ~/Downloads
+cargo run --release -- first.torrent second.torrent 'magnet:?xt=urn:btih:...' -o ~/Downloads
 ```
+
+Give several torrents and they are downloaded at once, each with its own progress bar, sharing one listening port, one DHT node and the rate limits. One that fails does not stop the others, Ctrl-C stops them all, and the run ends when every one is done (and seeded, with `--seed-ratio` or `--seed-time`). With `--check` or `--scrape`, each torrent is handled in turn under its name.
 
 A magnet link works wherever a .torrent file does. The torrent's metadata is fetched from peers found through the link's trackers (`tr`), its peers (`x.pe`) and the DHT, then the download carries on with the same peers. The metadata is saved as `<info hash>.torrent` in the output directory, so running the same link again resumes without fetching it, and `--check` uses that file (it fails without it). `--scrape` asks the link's trackers.
 
-Options: `-o, --output <DIR>` (default `.`), `--max-peers <N>` (default 30), `-p, --port <PORT>` to listen on for incoming peers over IPv4 and IPv6 (default 6881), `--no-dht` to find peers through trackers only (`--dht` turns the DHT back on if the config file turned it off), `--check` to verify a finished download (for a magnet link, against the saved `.torrent`), `--scrape` to print each tracker's seeder, leecher and completed counts without downloading (a magnet link's `tr` trackers), `--seed-ratio <RATIO>` and `--seed-time <MINUTES>` to keep seeding once the download is complete, until we have uploaded that many times the torrent's size or for that long, whichever comes first (both default to 0, which exits at completion), and `--max-download-rate <KIB/S>` and `--max-upload-rate <KIB/S>` to limit how fast piece data moves each way, in KiB per second across all peers (both default to 0, unlimited). The limits count piece data only, not protocol messages or TCP/IP headers, so the traffic on the wire is slightly higher. Without `--no-dht`, peers are also looked up in the BitTorrent DHT (on UDP, same port), so torrents without trackers download too. Connected peers that support peer exchange also tell us about more peers, and we tell them about ours (never for private torrents). Set `RUST_LOG=debug` for per-peer logs.
+Options: `-o, --output <DIR>` (default `.`), `--max-peers <N>` per torrent (default 30), `-p, --port <PORT>` to listen on for incoming peers over IPv4 and IPv6 (default 6881), `--no-dht` to find peers through trackers only (`--dht` turns the DHT back on if the config file turned it off), `--check` to verify a finished download (for a magnet link, against the saved `.torrent`), `--scrape` to print each tracker's seeder, leecher and completed counts without downloading (a magnet link's `tr` trackers), `--seed-ratio <RATIO>` and `--seed-time <MINUTES>` to keep seeding once the download is complete, until we have uploaded that many times the torrent's size or for that long, whichever comes first (both default to 0, which exits at completion), and `--max-download-rate <KIB/S>` and `--max-upload-rate <KIB/S>` to limit how fast piece data moves each way, in KiB per second across all peers of all torrents (both default to 0, unlimited). The limits count piece data only, not protocol messages or TCP/IP headers, so the traffic on the wire is slightly higher. Without `--no-dht`, peers are also looked up in the BitTorrent DHT (on UDP, same port), so torrents without trackers download too. Connected peers that support peer exchange also tell us about more peers, and we tell them about ours (never for private torrents). Set `RUST_LOG=debug` for per-peer logs.
 
 ### Config file
 
@@ -68,6 +71,7 @@ src/
 ├── announcer.rs # Re-announces and completed/stopped events
 ├── bencode.rs   # Raw bencode scanning (info-hash span)
 ├── choker.rs    # Choking algorithm: who may download from us
+├── client.rs    # What the torrents of a session share: port, DHT, rate limits, bars
 ├── config.rs    # Config file loading and CLI > file > default precedence
 ├── dht/         # Trackerless peer discovery (BEP 5)
 │   ├── mod.rs     # DHT node: UDP socket, queries and answers, lookups
@@ -80,6 +84,7 @@ src/
 ├── download.rs  # Piece queue, peer workers, block pipelining, seeding
 ├── extension.rs # Extension protocol (BEP 10) handshake
 ├── fast.rs      # Fast extension (BEP 6): allowed fast set, Have All/Have None
+├── listener.rs  # Incoming peers, handed to the torrent their handshake asks for
 ├── magnet.rs    # Magnet links (BEP 9): parsing, metadata fetch, then download
 ├── metadata.rs  # ut_metadata messages, assembling and serving the info dict
 ├── peer.rs      # Peer wire protocol: handshake, message encode/decode

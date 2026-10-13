@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
-use tracing::{info, warn};
+use tracing::{Instrument, info, warn};
 
 /// Time between lookups. Each one announces us again too, well within the
 /// 30 minutes nodes keep an announce.
@@ -61,7 +61,8 @@ impl DhtSearch {
         let handle = self.in_flight.get_or_insert_with(|| {
             let dht = self.dht.clone();
             let (info_hash, port) = (self.info_hash, self.announce_port);
-            tokio::spawn(async move { dht.get_peers(info_hash, port).await })
+            let lookup = async move { dht.get_peers(info_hash, port).await };
+            tokio::spawn(lookup.in_current_span())
         });
         let peers = handle.await.unwrap_or_else(|e| {
             warn!("DHT lookup failed: {e}");
