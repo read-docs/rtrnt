@@ -14,3 +14,4 @@ pub mod stats;
 pub mod storage;
 pub mod torrent;
 pub mod tracker;
+pub mod tui;
