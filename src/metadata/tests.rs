@@ -1,4 +1,8 @@
+use super::assembly::{Added, Assembly};
 use super::*;
+use crate::download::Misbehaved;
+use sha1::Digest;
+use std::net::SocketAddr;
 
 fn peer(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
