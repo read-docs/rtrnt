@@ -87,8 +87,13 @@ impl Storage {
                 .truncate(false)
                 .open(&file.path)
                 .with_context(|| format!("failed to create {}", file.path.display()))?;
-            file.found = Some(handle.metadata()?.len());
-            handle.set_len(file.length)?;
+            let found = handle.metadata()?.len();
+            file.found = Some(found);
+            // Resizing to the same size would still bump the modification
+            // time, which the resume file goes by.
+            if found != file.length {
+                handle.set_len(file.length)?;
+            }
         }
         Ok(Self::with_files(info, files, true))
     }

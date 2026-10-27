@@ -10,6 +10,7 @@ use crate::peer::{self, Incoming, PeerConnection, PeerMessage};
 use crate::peer_pool::PeerPool;
 use crate::pex::{self, PeerExchange};
 use crate::rate_limit::{Allowance, RateLimits};
+use crate::resume::{self, Target};
 use crate::storage::Storage;
 use crate::torrent::{self, TorrentFile};
 use crate::tracker::{AnnounceEvent, AnnounceRequest};
@@ -76,6 +77,8 @@ const DHT_LOOKUPS_WHEN_OUT: u8 = 2;
 /// this many wait there, so peers that flood us with addresses cannot grow
 /// it without bound.
 const MAX_PEX_BACKLOG: usize = 500;
+/// How often the resume file is saved while pieces complete.
+const RESUME_SAVE_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct DownloadConfig {
     pub output_dir: PathBuf,
@@ -91,6 +94,12 @@ pub struct DownloadConfig {
     /// Most block data to upload per second, in KiB, across all peers; 0
     /// for no limit.
     pub max_upload_rate: u64,
+    /// Directory the resume files (see `resume`) are kept in, or `None` to
+    /// keep none.
+    pub resume_dir: Option<PathBuf>,
+    /// Whether to ignore the resume files and hash the data on disk, as
+    /// without one.
+    pub recheck: bool,
 }
 
 /// How long to keep seeding once every piece is done. Seeding stops at
@@ -141,6 +150,9 @@ pub struct Session {
     /// Where the torrent's progress bars go, next to those of the other
     /// torrents in the session.
     pub bars: MultiProgress,
+    /// Where the torrent's resume file is saved while it downloads, if it
+    /// has one.
+    pub resume: Option<Target>,
 }
 
 /// Downloads the torrent at `torrent_path` and seeds it for as long as the
@@ -188,10 +200,10 @@ pub async fn download_file(
         rate_limits: client.rate_limits(),
         metadata: Some(info_bytes),
         bars: client.bars().clone(),
+        resume: Target::new(config, info_hash),
     });
 
-    let candidates = verify::candidates(&session.torrent, &session.storage)?;
-    let have = hash_pieces(&session, candidates).await?;
+    let have = resume::initial_pieces(&session, config).await?;
     let left = session.torrent.length() - verified_bytes(&session.torrent, &have)?;
     if left == 0 {
         info!(output = %config.output_dir.display(), "already complete");
@@ -321,6 +333,7 @@ pub async fn check_file(torrent_path: &Path, output_dir: &Path) -> Result<()> {
         rate_limits: Arc::default(),
         metadata: None,
         bars: MultiProgress::new(),
+        resume: None,
     });
     let have = hash_pieces(&session, pieces).await?;
 
@@ -538,6 +551,10 @@ pub(crate) async fn download_with(
     let downloading = !queue.is_done();
     // When we finished downloading and started seeding.
     let mut seeding_since = None;
+    // Pieces completed this session as of the last save of the resume file,
+    // and when the next one is due.
+    let mut saved = 0;
+    let mut next_save = Instant::now() + RESUME_SAVE_INTERVAL;
     loop {
         if queue.is_done() {
             let since = match seeding_since {
@@ -655,6 +672,10 @@ pub(crate) async fn download_with(
             () = &mut choking => {}
             () = queue.wait_for(|| queue.is_done()), if seeding_since.is_none() => {}
             () = tokio::time::sleep(SEED_CHECK), if seeding_since.is_some() => {}
+            () = tokio::time::sleep_until(next_save), if session.resume.is_some() => {
+                save_resume(&session, queue, &mut saved).await;
+                next_save = Instant::now() + RESUME_SAVE_INTERVAL;
+            }
             () = &mut shutdown => {
                 info!("interrupted, stopping");
                 interrupted = true;
@@ -674,6 +695,9 @@ pub(crate) async fn download_with(
     if tokio::time::timeout(SHUTDOWN_GRACE, drain).await.is_err() {
         workers.shutdown().await;
     }
+
+    // Every finished write is in the files now.
+    save_resume(&session, queue, &mut saved).await;
 
     let remaining = queue.remaining();
     if remaining == 0 {
@@ -695,6 +719,22 @@ pub(crate) async fn download_with(
         bail!("download incomplete: {remaining} of {num_pieces} pieces missing and no peers left");
     }
     Ok(())
+}
+
+/// Saves the torrent's resume file if a piece was completed since the last
+/// save, which had `saved` completions.
+async fn save_resume(session: &Session, queue: &PieceQueue, saved: &mut usize) {
+    let Some(resume) = &session.resume else {
+        return;
+    };
+    let completed = queue.completed_count();
+    if completed == *saved {
+        return;
+    }
+    // Before the files are looked at, so that a piece completed meanwhile
+    // is at worst missing from the file.
+    resume.save(&session.storage, queue.have_bitfield()).await;
+    *saved = completed;
 }
 
 /// How a peer worker reaches its peer.
@@ -2059,6 +2099,11 @@ impl PieceQueue {
         self.lock().completed.len()
     }
 
+    /// Which pieces are verified and on disk.
+    fn have_bitfield(&self) -> Vec<bool> {
+        self.lock().have.clone()
+    }
+
     fn remaining(&self) -> usize {
         self.lock().remaining
     }
@@ -2760,6 +2805,7 @@ mod tests {
         assert_eq!(queue.completed_since(seen), [a]);
         assert_eq!(queue.completed_since(0), [b, a]);
         assert_eq!(queue.completed_count(), 2);
+        assert_eq!(queue.have_bitfield(), [0, 1, 2].map(|i| i == a || i == b));
         assert!(queue.completed_since(5).is_empty());
         assert!(!queue.has(3));
         drop(seed);

@@ -51,6 +51,10 @@ struct Args {
     /// Print the effective settings and where each one came from, then exit
     #[arg(long)]
     print_config: bool,
+    /// Ignore the resume files and hash the data already on disk, as for a
+    /// torrent that has none
+    #[arg(long)]
+    recheck: bool,
     /// Ask every tracker of each torrent how many seeders and leechers it
     /// knows of instead of downloading; exits with an error unless one
     /// answers for each torrent
@@ -172,7 +176,8 @@ async fn main() -> anyhow::Result<ExitCode> {
     if let Some(path) = &file.path {
         info!(path = %path.display(), "loaded config file");
     }
-    let config = config::resolve(cli, file.options);
+    let mut config = config::resolve(cli, file.options);
+    config.recheck = args.recheck;
     // clap requires a torrent unless --print-config is given.
     if args.torrents.is_empty() {
         bail!("no torrent given");
@@ -524,6 +529,20 @@ mod tests {
         assert_eq!(dht(&["--dht"]), Some(true));
         assert_eq!(dht(&["--dht", "--no-dht"]), Some(false));
         assert_eq!(dht(&["--no-dht", "--dht"]), Some(true));
+    }
+
+    #[test]
+    fn recheck_is_off_unless_asked_for() {
+        assert!(
+            !Args::try_parse_from(["rtrnt", "x.torrent"])
+                .unwrap()
+                .recheck
+        );
+        assert!(
+            Args::try_parse_from(["rtrnt", "x.torrent", "--recheck"])
+                .unwrap()
+                .recheck
+        );
     }
 
     #[test]

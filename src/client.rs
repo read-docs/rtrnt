@@ -154,6 +154,8 @@ mod tests {
             dht,
             max_download_rate: 64,
             max_upload_rate: 0,
+            resume_dir: None,
+            recheck: false,
         };
         Client::new(config, MultiProgress::new())
     }

@@ -8,6 +8,7 @@
 
 use crate::download::{DownloadConfig, SeedLimits};
 use crate::peer;
+use crate::resume;
 use anyhow::{Context, Result, bail};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer};
@@ -108,6 +109,11 @@ impl Options {
             dht: self.dht.unwrap_or(DEFAULT_DHT),
             max_download_rate: self.max_download_rate.unwrap_or(DEFAULT_MAX_DOWNLOAD_RATE),
             max_upload_rate: self.max_upload_rate.unwrap_or(DEFAULT_MAX_UPLOAD_RATE),
+            resume_dir: resume::default_dir(
+                std::env::var_os("XDG_STATE_HOME"),
+                std::env::home_dir().as_deref(),
+            ),
+            recheck: false,
         }
     }
 }

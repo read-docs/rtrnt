@@ -16,6 +16,7 @@ pub mod peer;
 mod peer_pool;
 pub mod pex;
 pub mod rate_limit;
+pub mod resume;
 pub mod storage;
 pub mod torrent;
 pub mod tracker;

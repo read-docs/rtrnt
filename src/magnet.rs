@@ -17,10 +17,10 @@ use crate::download::{self, Session, StartPeers};
 use crate::extension::Advertised;
 use crate::metadata::MetadataFetch;
 use crate::peer_pool::PeerPool;
+use crate::resume::{self, Target};
 use crate::storage::Storage;
 use crate::torrent;
 use crate::tracker::{AnnounceEvent, AnnounceRequest};
-use crate::verify;
 use anyhow::{Context, Result, anyhow, bail};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -332,9 +332,9 @@ pub async fn download_magnet(
             rate_limits: client.rate_limits(),
             metadata: Some(fetched.metadata),
             bars: client.bars().clone(),
+            resume: Target::new(config, info_hash),
         });
-        let candidates = verify::candidates(&session.torrent, &session.storage)?;
-        let have = download::hash_pieces(&session, candidates).await?;
+        let have = resume::initial_pieces(&session, config).await?;
         let left = session.torrent.length() - download::verified_bytes(&session.torrent, &have)?;
         anyhow::Ok((session, have, left))
     };
