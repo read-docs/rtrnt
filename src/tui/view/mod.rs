@@ -6,6 +6,7 @@ mod files;
 mod header;
 mod info;
 mod keybar;
+mod log;
 mod peers;
 mod pieces;
 mod torrents;
@@ -27,6 +28,9 @@ pub const MIN_WIDTH: u16 = 60;
 pub const MIN_HEIGHT: u16 = 16;
 /// Most torrent rows shown at once.
 const MAX_TORRENT_ROWS: u16 = 10;
+/// Fewest lines left to the detail panel, borders included, for the log to
+/// show.
+const MIN_DETAIL: u16 = 7;
 
 /// Draws the whole screen.
 pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App) {
@@ -39,16 +43,26 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App) {
     let rows = app.visible(snapshot).len() as u16;
     // Rows, heading and borders, leaving the detail panel at least half.
     let torrents = (rows.clamp(1, MAX_TORRENT_ROWS) + 3).min((area.height - 2) / 2);
-    let [header, torrents_area, detail_area, keybar] = Layout::vertical([
+    // The log, if it leaves the detail panel room for a few rows.
+    let log = if app.show_log && area.height >= torrents + log::HEIGHT + MIN_DETAIL + 2 {
+        log::HEIGHT
+    } else {
+        0
+    };
+    let [header, torrents_area, detail_area, log_area, keybar] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(torrents),
         Constraint::Fill(1),
+        Constraint::Length(log),
         Constraint::Length(1),
     ])
     .areas(area);
     header::draw(frame, snapshot, app, header);
     torrents::draw(frame, snapshot, app, torrents_area);
     detail::draw(frame, snapshot, app, detail_area);
+    if log > 0 {
+        log::draw(frame, snapshot, app, log_area);
+    }
     keybar::draw(frame, snapshot, app, keybar);
 }
 
@@ -310,9 +324,12 @@ mod screen_tests {
         terminal.backend().buffer().clone()
     }
 
+    /// An app showing `snapshot`, without the log, so the detail panel
+    /// has the room the tests expect; the log has a test of its own.
     pub(crate) fn app(snapshot: &Snapshot) -> App {
         let mut app = App::new(Theme::default());
         app.ensure_selection(snapshot);
+        app.show_log = false;
         app
     }
 
@@ -559,6 +576,49 @@ mod screen_tests {
             lines[10]
         );
         assert!(lines[12].starts_with("│ size          not known yet"));
+    }
+
+    #[test]
+    fn the_log_sits_under_the_detail_panel() {
+        let snapshot = demo::fixture();
+        let mut app = app(&snapshot);
+        app.show_log = true;
+        let buffer = render(100, 32, &snapshot, &app);
+        let lines = text(&buffer, buffer.area);
+        assert!(lines[24].starts_with("╰────"), "{}", lines[24]);
+        assert!(lines[25].starts_with("╭ Log ─"), "{}", lines[25]);
+        // The newest four lines, oldest first.
+        assert!(
+            lines[26].contains(" INFO  Big Buck Bunny     metadata 3/7 pieces from 4 peers"),
+            "{}",
+            lines[26]
+        );
+        assert!(
+            lines[27].contains(" WARN  debian-13.7.0-amd… banning peer: too many corrupt pieces"),
+            "{}",
+            lines[27]
+        );
+        assert!(
+            lines[29].contains(" INFO  debian-13.7.0-amd… tracker announce succeeded peers=50")
+        );
+        assert!(lines[30].starts_with("╰────"));
+        let theme = Theme::default();
+        let warn = lines[27].find("WARN").unwrap();
+        let x = lines[27][..warn].chars().count() as u16;
+        assert_eq!(buffer[(x, 27)].fg, theme.warn());
+        assert_eq!(buffer[(x + 6, 27)].fg, theme.name());
+        assert_eq!(buffer[(2, 27)].fg, theme.dim());
+        assert!(lines[31].contains("l log"));
+
+        // At 80x24 it still fits, and on a short screen it gives way.
+        let buffer = render(80, 24, &snapshot, &app);
+        assert!(text(&buffer, buffer.area)[17].starts_with("╭ Log ─"));
+        let buffer = render(80, 20, &snapshot, &app);
+        assert!(
+            !text(&buffer, buffer.area)
+                .iter()
+                .any(|line| line.starts_with("╭ Log"))
+        );
     }
 
     #[test]

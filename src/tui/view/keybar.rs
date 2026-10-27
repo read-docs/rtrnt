@@ -33,6 +33,7 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
                 ("↑↓", "select"),
                 ("tab", "panel"),
                 ("1-5", "view"),
+                ("l", "log"),
                 ("q", "quit"),
             ],
         ));
