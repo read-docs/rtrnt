@@ -99,6 +99,40 @@ fn nothing_to_check_in_a_new_download() {
     assert_eq!(have, [false, false, false]);
 }
 
+#[test]
+fn a_cancelled_check_hashes_nothing_more_and_fails() {
+    let data = b"abcdefghijk";
+    let torrent = torrent(data);
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a"), &data[..6]).unwrap();
+    std::fs::write(root.join("b"), &data[6..]).unwrap();
+    let storage = Storage::new(&torrent.info, dir.path()).unwrap();
+
+    // Cancelled before it starts: no piece is read.
+    let checked = AtomicU64::new(0);
+    let on_checked = |len| {
+        checked.fetch_add(len, Ordering::Relaxed);
+    };
+    let result = verify(
+        &torrent,
+        &storage,
+        &[0, 1, 2],
+        &AtomicBool::new(true),
+        &on_checked,
+    );
+    assert!(result.is_err());
+    assert_eq!(checked.load(Ordering::Relaxed), 0);
+
+    // Cancelled while hashing: the pieces already hashed are not reported.
+    let cancel = AtomicBool::new(false);
+    let result = verify(&torrent, &storage, &[0, 1, 2], &cancel, &|_| {
+        cancel.store(true, Ordering::Relaxed);
+    });
+    assert!(result.is_err());
+}
+
 /// Writes the files, checks them read-only and returns the report.
 fn check(a: Option<&[u8]>, b: Option<&[u8]>) -> (Report, PathBuf) {
     let torrent = torrent(b"abcdefghijk");
