@@ -1,6 +1,6 @@
 use clap::Parser;
 use rtrnt::config;
-use rtrnt::magnet::{self, MagnetLink};
+use rtrnt::source::Source;
 use std::path::PathBuf;
 
 /// Download torrents from the terminal.
@@ -110,40 +110,9 @@ impl Args {
     }
 }
 
-/// What to download.
-#[derive(Clone)]
-pub(crate) enum Source {
-    File(PathBuf),
-    Magnet(Box<MagnetLink>),
-}
-
-impl Source {
-    /// A short name for the torrent, for logs and headings: the file's
-    /// name, or the magnet link's `dn` or else its info hash.
-    pub(crate) fn label(&self) -> String {
-        match self {
-            Source::File(path) => path.file_name().map_or_else(
-                || path.display().to_string(),
-                |name| name.to_string_lossy().into_owned(),
-            ),
-            Source::Magnet(link) => link
-                .name
-                .clone()
-                .unwrap_or_else(|| link.info_hash.iter().map(|b| format!("{b:02x}")).collect()),
-        }
-    }
-}
-
-/// Parses a torrent argument: a magnet link if it starts with `magnet:`,
-/// otherwise the path of a .torrent file.
+/// Parses a torrent argument (see `Source::parse`).
 fn parse_source(arg: &str) -> Result<Source, String> {
-    if magnet::is_magnet(arg) {
-        MagnetLink::parse(arg)
-            .map(|link| Source::Magnet(Box::new(link)))
-            .map_err(|e| format!("{e:#}"))
-    } else {
-        Ok(Source::File(arg.into()))
-    }
+    Source::parse(arg).map_err(|e| format!("{e:#}"))
 }
 
 /// Parses `--seed-ratio`, which must be a finite number, 0 or more.

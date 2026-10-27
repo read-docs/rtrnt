@@ -402,12 +402,12 @@ fn a_small_terminal_gets_a_note() {
 }
 
 #[test]
-fn the_key_bar_says_when_everything_has_finished() {
+fn the_key_bar_says_when_nothing_is_running() {
     let mut snapshot = demo::fixture();
     snapshot.finished = true;
     let app = app(&snapshot);
     let buffer = render(100, 32, &snapshot, &app);
-    assert!(text(&buffer, buffer.area)[31].starts_with(" all torrents finished, press q to exit"));
+    assert!(text(&buffer, buffer.area)[31].starts_with(" nothing running, press q to exit"));
 }
 
 #[test]

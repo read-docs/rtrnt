@@ -33,7 +33,7 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
         ))
     } else if snapshot.finished {
         Line::from(Span::styled(
-            " all torrents finished, press q to exit",
+            " nothing running, press q to exit",
             Style::new().fg(theme.warn()).add_modifier(Modifier::BOLD),
         ))
     } else {

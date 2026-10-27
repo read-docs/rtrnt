@@ -4,14 +4,16 @@ mod shutdown;
 
 use anyhow::bail;
 use clap::Parser;
-use cli::{Args, Source};
+use cli::Args;
 use indicatif::{MultiProgress, ProgressDrawTarget};
 use log_line::LogLine;
 use rtrnt::client::Client;
-use rtrnt::download::{self, DownloadConfig, Interrupted};
-use rtrnt::magnet::{self, FetchInterrupted};
+use rtrnt::download::{self, DownloadConfig};
+use rtrnt::magnet;
+use rtrnt::manager::{Command, EXIT_INTERRUPTED, Manager};
+use rtrnt::source::Source;
 use rtrnt::tui::log_buffer::LogBuffer;
-use rtrnt::tui::{self, Command, SessionFeed};
+use rtrnt::tui::{self, SessionFeed};
 use rtrnt::{config, torrent, tracker};
 use shutdown::Shutdown;
 use std::io::IsTerminal;
@@ -19,14 +21,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinSet;
-use tracing::{Instrument, Span, error, info, info_span, warn};
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-
-/// Exit code for a run stopped by Ctrl-C (128 + SIGINT).
-const EXIT_INTERRUPTED: u8 = 130;
 
 /// How far back the warnings and errors printed after the UI closes go.
 const PROBLEMS_SHOWN_AFTER_UI: Duration = Duration::from_secs(10);
@@ -102,37 +100,39 @@ async fn main() -> anyhow::Result<ExitCode> {
     }
     let client = Arc::new(Client::new(config, bars));
     let shutdown = Shutdown::new();
+    // Every torrent runs at once until it is done, and Ctrl-C stops them all.
+    let mut manager = Manager::new(Arc::clone(&client), {
+        let shutdown = Arc::clone(&shutdown);
+        move || Arc::clone(&shutdown).signal()
+    });
+    manager.start(args.torrents).await;
+    let (commands, commands_rx) = mpsc::unbounded_channel();
     if !use_tui {
-        return download_all(args.torrents, client, shutdown).await;
+        // Nothing sends commands, so the run ends with the last torrent.
+        drop(commands);
+        return manager.run(commands_rx).await;
     }
-    with_tui(args.torrents, client, shutdown, logs).await
+    let finished = manager.idle();
+    let run = manager.run(commands_rx);
+    with_tui(run, finished, commands, client, shutdown, logs).await
 }
 
-/// `download_all`, shown in the terminal UI. Leaving the UI before every
-/// torrent has stopped exits at once, as a second Ctrl-C does.
+/// Shows `run`, the manager's run, in the terminal UI, which sends it
+/// `commands` until the user leaves; the run goes on until then. Leaving the
+/// UI before every torrent has stopped exits at once, as a second Ctrl-C
+/// does.
 async fn with_tui(
-    torrents: Vec<Source>,
+    run: impl Future<Output = anyhow::Result<ExitCode>> + Send + 'static,
+    finished: watch::Receiver<bool>,
+    commands: mpsc::UnboundedSender<Command>,
     client: Arc<Client>,
     shutdown: Arc<Shutdown>,
     logs: LogBuffer,
 ) -> anyhow::Result<ExitCode> {
-    let (finished, finished_rx) = watch::channel(false);
-    let downloads = tokio::spawn({
-        let (client, shutdown) = (Arc::clone(&client), Arc::clone(&shutdown));
-        async move {
-            let result = download_all(torrents, client, shutdown).await;
-            finished.send_replace(true);
-            result
-        }
-    });
-    let stop = {
-        let shutdown = Arc::clone(&shutdown);
-        move || shutdown.request_stop()
-    };
-    let (commands, commands_rx) = mpsc::unbounded_channel();
-    tokio::spawn(run_commands(Arc::clone(&client), commands_rx));
+    let downloads = tokio::spawn(run);
+    let stop = move || shutdown.request_stop();
     let feed = SessionFeed::new(Arc::clone(client.stats()), logs.clone(), stop, commands);
-    let exit = tui::run(feed, finished_rx).await;
+    let exit = tui::run(feed, finished).await;
     // The terminal is back to normal: say what went wrong lately, which the
     // UI showed but which is gone with it.
     for line in logs.problems_since(SystemTime::now(), PROBLEMS_SHOWN_AFTER_UI) {
@@ -147,28 +147,6 @@ async fn with_tui(
         }
     }
     downloads.await?
-}
-
-/// Carries out what the UI asks of `client`, until the UI is gone.
-async fn run_commands(client: Arc<Client>, mut commands: mpsc::UnboundedReceiver<Command>) {
-    let limit = |kib: u64| match kib {
-        0 => "none".to_string(),
-        kib => format!("{kib} KiB/s"),
-    };
-    while let Some(command) = commands.recv().await {
-        match command {
-            Command::SetRateLimits(down, up) => {
-                client.set_rate_limits(down, up);
-                client.stats().notice(format!(
-                    "rate limits: download {}, upload {}",
-                    limit(down),
-                    limit(up)
-                ));
-            }
-            // The feed stops the torrents itself.
-            Command::Stop => {}
-        }
-    }
 }
 
 /// Runs `run` on each torrent in turn. With several, each one's output is
@@ -228,81 +206,6 @@ async fn scrape_source(source: &Source) -> anyhow::Result<()> {
         Source::Magnet(link) => (link.tracker_tiers(), link.info_hash),
     };
     scrape(&tiers, info_hash).await
-}
-
-/// How the download of one torrent ended.
-enum Outcome {
-    Done,
-    Interrupted,
-    Failed(anyhow::Error),
-}
-
-/// Downloads (and seeds) every torrent in `torrents` at once through
-/// `client`, until each is done. One that fails does not stop the others,
-/// and Ctrl-C stops them all. With several, each one's logs carry its name.
-///
-/// A single torrent's failure is returned as the error; with several, each
-/// failure is logged and the exit code is a failure. Otherwise the exit code
-/// says whether Ctrl-C cut a download short.
-async fn download_all(
-    torrents: Vec<Source>,
-    client: Arc<Client>,
-    shutdown: Arc<Shutdown>,
-) -> anyhow::Result<ExitCode> {
-    let several = torrents.len() > 1;
-    let mut tasks = JoinSet::new();
-    for source in torrents {
-        let span = if several {
-            info_span!("torrent", name = %source.label())
-        } else {
-            Span::none()
-        };
-        let client = Arc::clone(&client);
-        let stop = Arc::clone(&shutdown).signal();
-        let download = async move {
-            let result = match &source {
-                Source::File(path) => download::download_file(path, &client, stop).await,
-                Source::Magnet(link) => magnet::download_magnet(link, &client, stop).await,
-            };
-            match result {
-                Ok(()) => Outcome::Done,
-                Err(e) if e.is::<Interrupted>() || e.is::<FetchInterrupted>() => {
-                    warn!("{e}; run again to resume");
-                    Outcome::Interrupted
-                }
-                Err(e) => {
-                    if several {
-                        error!("{e:#}");
-                    }
-                    Outcome::Failed(e)
-                }
-            }
-        };
-        tasks.spawn(download.instrument(span));
-    }
-
-    let total = tasks.len();
-    let mut failed = Vec::new();
-    let mut interrupted = false;
-    while let Some(joined) = tasks.join_next().await {
-        match joined {
-            Ok(Outcome::Done) => {}
-            Ok(Outcome::Interrupted) => interrupted = true,
-            Ok(Outcome::Failed(e)) => failed.push(e),
-            Err(e) => failed.push(e.into()),
-        }
-    }
-    if !failed.is_empty() {
-        if !several && let Some(e) = failed.pop() {
-            return Err(e);
-        }
-        error!("{} of {total} torrents failed", failed.len());
-        return Ok(ExitCode::FAILURE);
-    }
-    if interrupted {
-        return Ok(ExitCode::from(EXIT_INTERRUPTED));
-    }
-    Ok(ExitCode::SUCCESS)
 }
 
 /// Scrapes every tracker in `tiers` (a torrent's, or a magnet link's `tr`

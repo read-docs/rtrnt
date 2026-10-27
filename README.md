@@ -95,7 +95,7 @@ See [ROADMAP.md](ROADMAP.md) for what's done and what's next.
 
 ```
 src/
-├── main.rs        # CLI entry point: runs each torrent, prints the result
+├── main.rs        # CLI entry point: hands the torrents to the manager, prints the result
 ├── cli.rs         # Command-line arguments (clap)
 ├── shutdown.rs    # Ctrl-C handling: first stops gracefully, second exits
 ├── log_line.rs    # Log output that does not break the progress bars
@@ -126,6 +126,7 @@ src/
 ├── magnet.rs      # Magnet links (BEP 9): parsing, metadata fetch, then download
 ├── magnet/
 │   └── metadata.rs  # ut_metadata: messages, assembling and fetching the info dict
+├── manager.rs     # The session's torrents: starts each, tracks its state, exit code
 ├── peer.rs        # Peer wire protocol
 ├── peer/
 │   ├── message.rs   # Message encode/decode
@@ -136,6 +137,7 @@ src/
 │   └── pex.rs       # Peer exchange (BEP 11): telling peers about each other
 ├── rate_limit.rs  # Upload and download rate limits (shared token buckets)
 ├── resume.rs      # Resume files: what was on disk last time
+├── source.rs      # What to download: a .torrent file or a magnet link
 ├── stats.rs       # Counters the engine publishes for the UI: torrents, peers, trackers
 ├── stats/
 │   ├── torrent.rs   # One torrent: state, pieces, trackers, peer sources

@@ -138,20 +138,28 @@ pub async fn download_file(
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let metainfo = torrent::load_metainfo(torrent_path).await?;
+    download_metainfo(metainfo, client, shutdown).await
+}
+
+/// `download_file` for a torrent file loaded already.
+pub async fn download_metainfo(
+    metainfo: torrent::Metainfo,
+    client: &Client,
+    shutdown: impl Future<Output = ()>,
+) -> Result<()> {
     let stats = client.stats().add_torrent(
         metainfo.info_hash,
         &metainfo.torrent.info.name,
         &client.config().output_dir,
     );
     stats.set_torrent(&metainfo.torrent);
-    let result = download_metainfo(metainfo, client, &stats, shutdown).await;
+    let result = download_loaded(metainfo, client, &stats, shutdown).await;
     stats.finish(&result);
     result
 }
 
-/// `download_file` for a torrent loaded already, publishing its progress
-/// in `stats`.
-async fn download_metainfo(
+/// `download_metainfo`, publishing its progress in `stats`.
+async fn download_loaded(
     metainfo: torrent::Metainfo,
     client: &Client,
     stats: &Arc<TorrentStats>,

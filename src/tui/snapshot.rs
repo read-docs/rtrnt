@@ -25,7 +25,7 @@ pub struct Snapshot {
     pub logs: Vec<LogLine>,
     /// The latest notice, while it is fresh.
     pub notice: Option<String>,
-    /// Set once every torrent's task has ended.
+    /// Set while no torrent's task is running.
     pub finished: bool,
 }
 

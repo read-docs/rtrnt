@@ -12,6 +12,7 @@ pub mod snapshot;
 pub mod theme;
 pub mod view;
 
+pub use crate::manager::Command;
 use crate::stats::SessionStats;
 use app::{Action, App};
 use crossterm::event::{
@@ -34,19 +35,10 @@ use tokio::sync::{mpsc, watch};
 /// How often the stats are read and the screen drawn.
 pub const TICK: Duration = Duration::from_millis(250);
 
-/// What the UI asks of the session.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Command {
-    /// Stop the torrents, as Ctrl-C does.
-    Stop,
-    /// Change the download and upload limits to these KiB/s, 0 for none.
-    SetRateLimits(u64, u64),
-}
-
 /// Where the UI gets what it shows, and what it asks of the session.
 pub trait Feed {
     /// What to show now, with the insides of the torrent `selected`.
-    /// `finished` says every torrent's task has ended.
+    /// `finished` says no torrent's task is running.
     fn snapshot(&mut self, selected: Option<[u8; 20]>, finished: bool) -> Snapshot;
 
     /// Passes `command` on. Returns false if the UI should quit at once:
@@ -110,7 +102,7 @@ pub enum Exit {
 }
 
 /// Runs the UI on the terminal until the user leaves, showing what `feed`
-/// gives. `finished` turns true once every torrent's task has ended; the UI
+/// gives. `finished` is true while no torrent's task is running; the UI
 /// then says so and waits for `q`.
 ///
 /// The terminal is put back as it was on every way out, a panic included.
@@ -164,7 +156,7 @@ pub async fn run(mut feed: impl Feed, mut finished: watch::Receiver<bool>) -> io
                     capture_mouse(mouse)?;
                 }
             }
-            Ok(()) = finished.changed(), if !done => done = *finished.borrow(),
+            Ok(()) = finished.changed() => done = *finished.borrow(),
         }
         snapshot = feed.snapshot(app.selected, done);
         let selected = app.selected;
