@@ -8,8 +8,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
 const KEYS: &[(&str, &str)] = &[
-    ("↑ ↓  j k", "select a torrent, or scroll the detail panel"),
-    ("PgUp PgDn", "scroll the detail panel"),
+    ("↑ ↓  j k", "select a torrent or a peer, or scroll a tab"),
+    ("PgUp PgDn", "a page of peers, or scroll the detail panel"),
     ("tab", "switch between the torrents and the detail panel"),
     ("1-5", "peers, pieces, trackers, files, info"),
     ("l", "show or hide the log"),

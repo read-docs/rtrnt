@@ -536,6 +536,7 @@ impl DemoFeed {
             },
             down_history: Vec::new(),
             up_history: Vec::new(),
+            peer_history: None,
         }
     }
 }

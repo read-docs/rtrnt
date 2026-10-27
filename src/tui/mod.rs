@@ -153,7 +153,7 @@ pub async fn run(mut feed: impl Feed, mut finished: watch::Receiver<bool>) -> io
         if sample {
             app.rates.record(&snapshot, Instant::now());
         }
-        app.rates.apply(&mut snapshot);
+        app.apply_rates(&mut snapshot);
         terminal.draw(|frame| view::draw(frame, &snapshot, &app))?;
     }
 }

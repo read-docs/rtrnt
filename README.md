@@ -26,12 +26,12 @@ cargo run --release -- first.torrent second.torrent 'magnet:?xt=urn:btih:...' -o
 
 ### Terminal UI
 
-When stdout and stderr are terminals, a run shows a full-screen UI instead of progress bars and log lines (`--no-tui`, or `tui = false` in the config file, turns it off; `--tui` turns it on regardless). It is never used with `--check`, `--scrape` or `--print-config`. At the top are the session's rates and counts, then the torrent table, then a detail panel for the selected torrent with five tabs: its peers (client, flags, rates and how much each has, with the torrent's rates over the last half minute), a map of its pieces with the swarm's numbers, its trackers, its files, and facts about it. The log sits below, and the keys at the bottom:
+When stdout and stderr are terminals, a run shows a full-screen UI instead of progress bars and log lines (`--no-tui`, or `tui = false` in the config file, turns it off; `--tui` turns it on regardless). It is never used with `--check`, `--scrape` or `--print-config`. At the top are the session's rates and counts, then the torrent table, then a detail panel for the selected torrent with five tabs: its peers (client, flags, rates and how much each has, with the torrent's rates over the last half minute, or the selected peer's while the panel has the focus), a map of its pieces with the swarm's numbers, its trackers, its files, and facts about it. The log sits below, and the keys at the bottom:
 
 | Key | Action |
 |-----|--------|
-| `↑`/`↓`, `j`/`k` | select a torrent, or scroll the detail panel when it has the focus |
-| `PgUp`/`PgDn` | scroll the detail panel |
+| `↑`/`↓`, `j`/`k` | select a torrent; when the detail panel has the focus, select a peer on the Peers tab or scroll the other tabs |
+| `PgUp`/`PgDn` | move the peer selection a page, or scroll the other tabs |
 | `tab` | move the focus between the torrent table and the detail panel |
 | `1`–`5` | peers, pieces, trackers, files, info |
 | `l` | show or hide the log |

@@ -123,13 +123,55 @@ fn peers_tab_lists_peers_fastest_first() {
 fn peers_scroll_and_lose_the_client_column_when_narrow() {
     let snapshot = demo::fixture();
     let mut app = app(&snapshot);
-    app.detail_scroll = 100;
+    app.select_peer(&snapshot, 100);
     let buffer = render(80, 24, &snapshot, &app);
     let lines = text(&buffer, buffer.area);
     assert!(lines[10].starts_with("│ Address                  Flags "));
-    // Scrolled as far as the rows go, and no further.
+    // Scrolled to the cursor on the last row; it shows only with the focus.
     assert!(lines[11].starts_with("│ 91.121.44.7:6881"), "{}", lines[11]);
     assert!(lines[18].starts_with("│ 3-9 of 9 peers"), "{}", lines[18]);
+}
+
+#[test]
+fn the_peer_cursor_shows_its_peer_under_the_table() {
+    let mut snapshot = demo::fixture();
+    let mut app = app(&snapshot);
+    app.focus = crate::tui::app::Focus::Detail;
+    app.select_peer(&snapshot, 2);
+    let mib = 1024.0 * 1024.0;
+    let addr = "91.121.44.7:6881".parse().unwrap();
+    snapshot.detail.as_mut().unwrap().peer_history =
+        Some((addr, vec![0.0, mib, 2.0 * mib], vec![0.0; 3]));
+    let buffer = render(100, 32, &snapshot, &app);
+    let lines = text(&buffer, buffer.area);
+    assert!(lines[11].starts_with("│ 185.21.216.143:51413 "));
+    assert!(
+        lines[13].starts_with("│▌91.121.44.7:6881 "),
+        "{}",
+        lines[13]
+    );
+    let theme = Theme::default();
+    assert_eq!(buffer[(30, 13)].bg, theme.selection());
+    assert_ne!(buffer[(30, 11)].bg, theme.selection());
+    assert!(
+        lines[27].starts_with("│ 91.121.44.7:6881 · libtorrent 2.0.11 "),
+        "{}",
+        lines[27]
+    );
+    assert!(
+        lines[28].ends_with("▁▄█   640 KiB/s  peak 2.0 MiB/s │"),
+        "{}",
+        lines[28]
+    );
+    assert!(lines[29].ends_with("▁▁▁   112 KiB/s  peak 112 KiB/s │"));
+
+    // With the torrents focused, the torrent's, and no cursor.
+    app.focus = crate::tui::app::Focus::Torrents;
+    let buffer = render(100, 32, &snapshot, &app);
+    let lines = text(&buffer, buffer.area);
+    assert!(lines[13].starts_with("│ 91.121.44.7:6881 "));
+    assert_eq!(lines[27].trim_matches(['│', ' ']), "");
+    assert!(lines[28].ends_with("   4.2 MiB/s  peak 5.2 MiB/s │"));
 }
 
 #[test]
@@ -335,7 +377,7 @@ fn help_lists_the_keys_over_the_screen() {
         .position(|line| line.contains("╭ Keys ─"))
         .unwrap();
     assert!(lines[top].contains(" any key closes ╮"));
-    assert!(lines[top + 2].contains("  ↑ ↓  j k  select a torrent, or scroll the detail panel"));
+    assert!(lines[top + 2].contains("  ↑ ↓  j k  select a torrent or a peer, or scroll a tab"));
     assert!(
         lines
             .iter()

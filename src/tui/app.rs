@@ -2,7 +2,7 @@
 //! that turns byte counters into rates.
 
 use super::Command;
-use super::snapshot::{Snapshot, TorrentSnapshot};
+use super::snapshot::{Detail, Snapshot, TorrentSnapshot};
 use super::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::cmp::Ordering;
@@ -173,8 +173,13 @@ pub struct App {
     pub selected: Option<[u8; 20]>,
     pub focus: Focus,
     pub tab: Tab,
-    /// First row shown of the detail panel's table.
+    /// First row shown of the detail panel's table. The Peers tab scrolls
+    /// to its cursor instead.
     pub detail_scroll: usize,
+    /// Address of the peer under the Peers tab's cursor.
+    pub peer: Option<SocketAddr>,
+    /// Its row, for the cursor to stay near once the peer has gone.
+    peer_row: usize,
     pub show_log: bool,
     pub sort: Sort,
     pub reverse: bool,
@@ -196,6 +201,8 @@ impl App {
             focus: Focus::Torrents,
             tab: Tab::Peers,
             detail_scroll: 0,
+            peer: None,
+            peer_row: 0,
             show_log: true,
             sort: Sort::Added,
             reverse: false,
@@ -229,9 +236,17 @@ impl App {
             .iter()
             .any(|torrent| Some(torrent.info_hash) == self.selected)
         {
-            self.selected = visible.first().map(|torrent| torrent.info_hash);
-            self.detail_scroll = 0;
+            self.select(visible.first().map(|torrent| torrent.info_hash));
         }
+    }
+
+    /// Selects the torrent with info hash `selected`, its detail panel
+    /// scrolled to the top.
+    fn select(&mut self, selected: Option<[u8; 20]>) {
+        self.selected = selected;
+        self.detail_scroll = 0;
+        self.peer = None;
+        self.peer_row = 0;
     }
 
     /// Moves the selection `by` rows down the table (up if negative).
@@ -246,8 +261,71 @@ impl App {
             .unwrap_or(0);
         let next = current.saturating_add_signed(by).min(visible.len() - 1);
         if next != current {
-            self.selected = Some(visible[next].info_hash);
-            self.detail_scroll = 0;
+            self.select(Some(visible[next].info_hash));
+        }
+    }
+
+    /// The selected torrent's insides, if `snapshot` has them.
+    fn detail<'a>(&self, snapshot: &'a Snapshot) -> Option<&'a Detail> {
+        snapshot
+            .detail
+            .as_ref()
+            .filter(|detail| Some(detail.info_hash) == self.selected)
+    }
+
+    /// Puts the peer cursor on `row` of the Peers tab, or its last row.
+    pub fn select_peer(&mut self, snapshot: &Snapshot, row: usize) {
+        let Some(detail) = self.detail(snapshot) else {
+            return;
+        };
+        let peers = detail.sorted_peers();
+        if peers.is_empty() {
+            return;
+        }
+        self.peer_row = row.min(peers.len() - 1);
+        self.peer = Some(peers[self.peer_row].addr);
+    }
+
+    /// Moves the peer cursor `by` rows down (up if negative).
+    fn move_peer(&mut self, snapshot: &Snapshot, by: isize) {
+        let current = self
+            .detail(snapshot)
+            .and_then(|detail| {
+                detail
+                    .sorted_peers()
+                    .iter()
+                    .position(|peer| Some(peer.addr) == self.peer)
+            })
+            .unwrap_or(self.peer_row);
+        self.select_peer(snapshot, current.saturating_add_signed(by));
+    }
+
+    /// Keeps the peer cursor on its peer, wherever it sorts now. Once the
+    /// peer has gone, the cursor takes the nearest row.
+    pub fn ensure_peer(&mut self, snapshot: &Snapshot) {
+        let Some(detail) = self.detail(snapshot) else {
+            return;
+        };
+        let peers = detail.sorted_peers();
+        match peers.iter().position(|peer| Some(peer.addr) == self.peer) {
+            Some(row) => self.peer_row = row,
+            None => {
+                let row = self.peer_row.min(peers.len().saturating_sub(1));
+                self.peer = peers.get(row).map(|peer| peer.addr);
+            }
+        }
+    }
+
+    /// Fills in the rates of `snapshot` (see `Rates::apply`), then keeps the
+    /// peer cursor on a peer it has, since the peers sort by those rates.
+    pub fn apply_rates(&mut self, snapshot: &mut Snapshot) {
+        self.rates.apply(snapshot, self.peer);
+        let peer = self.peer;
+        self.ensure_peer(snapshot);
+        if self.peer != peer
+            && let Some(detail) = &mut snapshot.detail
+        {
+            self.rates.apply_peer(detail, self.peer);
         }
     }
 
@@ -255,7 +333,6 @@ impl App {
     fn scroll_detail(&mut self, snapshot: &Snapshot, by: isize) {
         let detail = snapshot.detail.as_ref();
         let rows = match self.tab {
-            Tab::Peers => detail.map_or(0, |detail| detail.peers.len()),
             // The DHT, PeX and incoming rows, after a blank one.
             Tab::Trackers => detail.map_or(0, |detail| detail.trackers.len() + 4),
             Tab::Files => self
@@ -263,12 +340,22 @@ impl App {
                 .and_then(|hash| snapshot.torrent(hash))
                 .and_then(|torrent| torrent.layout.as_ref())
                 .map_or(0, |layout| layout.files.len()),
-            Tab::Pieces | Tab::Info => 0,
+            // The Peers tab moves its cursor instead.
+            Tab::Peers | Tab::Pieces | Tab::Info => 0,
         };
         self.detail_scroll = self
             .detail_scroll
             .saturating_add_signed(by)
             .min(rows.saturating_sub(1));
+    }
+
+    /// Moves the peer cursor on the Peers tab, and scrolls the others.
+    fn move_in_detail(&mut self, snapshot: &Snapshot, by: isize) {
+        if self.tab == Tab::Peers {
+            self.move_peer(snapshot, by);
+        } else {
+            self.scroll_detail(snapshot, by);
+        }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, snapshot: &Snapshot) -> Action {
@@ -291,14 +378,14 @@ impl App {
             KeyCode::Char('q') => return self.quit(snapshot),
             KeyCode::Up | KeyCode::Char('k') => match self.focus {
                 Focus::Torrents => self.move_selection(snapshot, -1),
-                Focus::Detail => self.scroll_detail(snapshot, -1),
+                Focus::Detail => self.move_in_detail(snapshot, -1),
             },
             KeyCode::Down | KeyCode::Char('j') => match self.focus {
                 Focus::Torrents => self.move_selection(snapshot, 1),
-                Focus::Detail => self.scroll_detail(snapshot, 1),
+                Focus::Detail => self.move_in_detail(snapshot, 1),
             },
-            KeyCode::PageUp => self.scroll_detail(snapshot, -PAGE),
-            KeyCode::PageDown => self.scroll_detail(snapshot, PAGE),
+            KeyCode::PageUp => self.move_in_detail(snapshot, -PAGE),
+            KeyCode::PageDown => self.move_in_detail(snapshot, PAGE),
             KeyCode::Tab | KeyCode::BackTab => {
                 self.focus = match self.focus {
                     Focus::Torrents => Focus::Detail,
@@ -525,8 +612,8 @@ impl Rates {
     }
 
     /// Fills in the rates, ETAs and histories of `snapshot` from what was
-    /// recorded.
-    pub fn apply(&self, snapshot: &mut Snapshot) {
+    /// recorded, with the history of the peer at address `peer`.
+    pub fn apply(&self, snapshot: &mut Snapshot, peer: Option<SocketAddr>) {
         for torrent in &mut snapshot.torrents {
             let Some(history) = self.torrents.get(&torrent.info_hash) else {
                 continue;
@@ -552,6 +639,19 @@ impl Rates {
                 (peer.rate_down, peer.rate_up) = history.current();
             }
         }
+        self.apply_peer(detail, peer);
+    }
+
+    /// Fills in the history of the peer at address `peer`, if it has one.
+    fn apply_peer(&self, detail: &mut Detail, peer: Option<SocketAddr>) {
+        detail.peer_history = peer.and_then(|addr| {
+            let history = self.peers.get(&(detail.info_hash, addr))?;
+            Some((
+                addr,
+                history.down.iter().copied().collect(),
+                history.up.iter().copied().collect(),
+            ))
+        });
     }
 }
 

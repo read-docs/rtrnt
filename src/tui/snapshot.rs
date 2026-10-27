@@ -128,6 +128,22 @@ pub struct Detail {
     /// in from the rate history.
     pub down_history: Vec<f64>,
     pub up_history: Vec<f64>,
+    /// The same for the peer under the Peers tab's cursor, by its address.
+    pub peer_history: Option<(SocketAddr, Vec<f64>, Vec<f64>)>,
+}
+
+impl Detail {
+    /// The peers as the Peers tab lists them: fastest first.
+    pub fn sorted_peers(&self) -> Vec<&PeerSnapshot> {
+        let mut peers: Vec<&PeerSnapshot> = self.peers.iter().collect();
+        peers.sort_by(|a, b| {
+            b.rate_down
+                .total_cmp(&a.rate_down)
+                .then(b.rate_up.total_cmp(&a.rate_up))
+                .then(a.addr.cmp(&b.addr))
+        });
+        peers
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -249,6 +265,7 @@ fn detail(torrent: &TorrentStats, now: Instant) -> Detail {
         },
         down_history: Vec::new(),
         up_history: Vec::new(),
+        peer_history: None,
     }
 }
 

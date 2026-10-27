@@ -1,10 +1,11 @@
 //! The Peers tab: one row per connected peer, a flag legend, and the
-//! torrent's rates over the last half minute.
+//! torrent's rates over the last half minute, or the cursor peer's while
+//! the panel has the focus.
 
-use super::{bar, fit, human_rate, sparkline};
+use super::{bar, bold, fit, human_rate, scroll_to, selected_style, sparkline};
 use crate::stats::PeerFlags;
-use crate::tui::app::App;
-use crate::tui::snapshot::{Detail, PeerSnapshot, TorrentSnapshot};
+use crate::tui::app::{App, Focus};
+use crate::tui::snapshot::{Detail, TorrentSnapshot};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -97,21 +98,29 @@ pub fn draw(
     ));
     let mut lines = vec![Line::from(heading)];
 
-    let mut peers: Vec<&PeerSnapshot> = detail.peers.iter().collect();
-    peers.sort_by(|a, b| {
-        b.rate_down
-            .total_cmp(&a.rate_down)
-            .then(b.rate_up.total_cmp(&a.rate_up))
-            .then(a.addr.cmp(&b.addr))
-    });
+    let peers = detail.sorted_peers();
     let rows = table_height.saturating_sub(1);
-    let offset = app.detail_scroll.min(peers.len().saturating_sub(rows));
+    let cursor = peers.iter().position(|peer| Some(peer.addr) == app.peer);
+    let offset = scroll_to(cursor.unwrap_or(0), 0, rows);
+    // The cursor shows while the panel has the focus.
+    let cursor = cursor.filter(|_| app.focus == Focus::Detail);
     let pieces = torrent.layout.as_ref().map_or(0, |layout| layout.pieces);
-    for peer in peers.iter().skip(offset).take(rows) {
-        let mut spans = vec![
-            Span::raw(" "),
-            Span::raw(fit(&peer.addr.to_string(), address, false)),
-        ];
+    for (index, peer) in peers.iter().enumerate().skip(offset).take(rows) {
+        let is_cursor = cursor == Some(index);
+        let mut spans = if is_cursor {
+            vec![
+                Span::styled("▌", Style::new().fg(theme.down())),
+                Span::styled(
+                    fit(&peer.addr.to_string(), address, false),
+                    bold(theme.bright()),
+                ),
+            ]
+        } else {
+            vec![
+                Span::raw(" "),
+                Span::raw(fit(&peer.addr.to_string(), address, false)),
+            ]
+        };
         if client > 0 {
             spans.push(Span::styled(
                 format!(
@@ -154,7 +163,12 @@ pub fn draw(
             format!("{:.0}%", (fraction * 100.0).floor())
         };
         spans.push(Span::styled(format!(" {has:>4}"), theme.dim_style()));
-        lines.push(Line::from(spans));
+        let line = Line::from(spans);
+        lines.push(if is_cursor {
+            line.style(selected_style(theme))
+        } else {
+            line
+        });
     }
     if detail.peers.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -182,11 +196,31 @@ pub fn draw(
         format!(" {shown}  ·  D/d down unchoked/interested  U/u up  I incoming  F fast  X pex");
     let mut footer_lines = vec![Line::from(Span::styled(legend, theme.dim_style()))];
     if footer > 1 {
-        footer_lines.push(Line::default());
-        for (arrow, history, rate, color) in [
-            ("↓", &detail.down_history, torrent.rate_down, theme.down()),
-            ("↑", &detail.up_history, torrent.rate_up, theme.up()),
-        ] {
+        // The cursor peer's rates, titled with who it is, or the torrent's.
+        let peer = cursor
+            .map(|row| peers[row])
+            .and_then(|peer| match &detail.peer_history {
+                Some((addr, down, up)) if *addr == peer.addr => Some((peer, down, up)),
+                _ => None,
+            });
+        let (title, down, up) = match peer {
+            Some((peer, down, up)) => {
+                let mut title = format!(" {}", peer.addr);
+                if let Some(client) = &peer.client {
+                    title.push_str(&format!(" · {client}"));
+                }
+                let title = Line::from(Span::styled(title, theme.dim_style()));
+                (title, (down, peer.rate_down), (up, peer.rate_up))
+            }
+            None => (
+                Line::default(),
+                (&detail.down_history, torrent.rate_down),
+                (&detail.up_history, torrent.rate_up),
+            ),
+        };
+        footer_lines.push(title);
+        for (arrow, (history, rate), color) in [("↓", down, theme.down()), ("↑", up, theme.up())]
+        {
             let peak = history.iter().copied().fold(rate, f64::max);
             let text = format!("  {:>10}  peak {}", human_rate(rate), human_rate(peak));
             let spark = width.saturating_sub(text.chars().count() + 4);
