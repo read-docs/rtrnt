@@ -1,0 +1,12 @@
+//! End-to-end downloads from mock seeders (and a mock tracker) over loopback.
+
+mod common;
+mod download;
+mod fast;
+mod magnet;
+mod pex;
+mod rate_limit;
+mod resume;
+mod seeding;
+mod session;
+mod tracker;
