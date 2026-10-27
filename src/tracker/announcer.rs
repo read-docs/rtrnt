@@ -2,7 +2,7 @@
 //! tracker's interval with real stats, sends `completed` when the download
 //! finishes, and `stopped` at the end.
 
-use crate::tracker::{AnnounceEvent, AnnounceRequest, AnnounceResponse, Tiers};
+use super::{AnnounceEvent, AnnounceRequest, AnnounceResponse, Tiers};
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};

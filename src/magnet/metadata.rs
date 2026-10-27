@@ -18,7 +18,7 @@ mod fetch;
 pub(crate) use fetch::MetadataFetch;
 
 use crate::bencode;
-use crate::extension::UT_METADATA;
+use crate::peer::extension::UT_METADATA;
 use crate::peer::{PeerConnection, ProtocolViolation};
 use anyhow::{Context, Result, bail};
 use serde_bencode::value::Value;

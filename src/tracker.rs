@@ -4,6 +4,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use tracing::{debug, warn};
 use url::Url;
 
+pub mod announcer;
 mod http;
 mod udp;
 

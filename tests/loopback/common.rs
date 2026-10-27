@@ -1,7 +1,7 @@
 use indicatif::MultiProgress;
 use rtrnt::client::Client;
 use rtrnt::download::{DownloadConfig, SeedLimits, Session};
-use rtrnt::fast;
+use rtrnt::peer::fast;
 use rtrnt::peer::{PeerMessage, generate_peer_id, handshake_bytes, parse_handshake};
 use rtrnt::rate_limit::RateLimits;
 use rtrnt::storage::Storage;

@@ -8,9 +8,9 @@
 
 use crate::bencode;
 use crate::download::{self, DownloadConfig, Session};
+use crate::storage::verify;
 use crate::storage::{FileSpan, Storage};
 use crate::torrent::TorrentFile;
-use crate::verify;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;

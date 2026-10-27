@@ -1,4 +1,3 @@
-use crate::announcer::{Announcer, Transferred};
 use crate::client::{Client, ConnectionSlots};
 use crate::dht::Dht;
 use crate::listener::Listener;
@@ -6,6 +5,7 @@ use crate::rate_limit::RateLimits;
 use crate::resume::{self, Target};
 use crate::storage::Storage;
 use crate::torrent::{self, TorrentFile};
+use crate::tracker::announcer::{Announcer, Transferred};
 use crate::tracker::{AnnounceEvent, AnnounceRequest};
 use anyhow::{Result, bail};
 use indicatif::MultiProgress;
@@ -17,6 +17,8 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 mod check;
+mod choker;
+pub(crate) mod peer_pool;
 mod progress;
 mod queue;
 mod requests;

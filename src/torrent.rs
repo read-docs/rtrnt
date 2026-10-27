@@ -215,7 +215,7 @@ pub fn encode_with_info(tiers: &[Vec<String>], info_bytes: &[u8]) -> Result<Vec<
         data.extend(bencoded(&tiers)?);
     }
     data.extend_from_slice(b"10:created by");
-    data.extend(bencoded(&crate::extension::CLIENT)?);
+    data.extend(bencoded(&crate::peer::extension::CLIENT)?);
     data.extend_from_slice(b"4:info");
     data.extend_from_slice(info_bytes);
     data.push(b'e');

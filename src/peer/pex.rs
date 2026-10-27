@@ -12,8 +12,8 @@
 //! Each connection has a [`PexPeer`], which advertises its own peer there,
 //! sends its peer what changed, and passes on what that peer tells us.
 
+use super::{PeerConnection, ProtocolViolation};
 use crate::bencode;
-use crate::peer::{PeerConnection, ProtocolViolation};
 use crate::tracker::{parse_compact_v4, parse_compact_v6};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;

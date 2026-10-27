@@ -6,6 +6,8 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
+pub mod verify;
+
 /// Most files kept open at once. A torrent can have thousands of files, and
 /// macOS's default soft limit is 256 descriptors shared with peer sockets.
 const MAX_OPEN_FILES: usize = 64;

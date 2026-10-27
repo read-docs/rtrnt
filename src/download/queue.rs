@@ -1,5 +1,5 @@
-use crate::fast;
 use crate::peer::PeerMessage;
+use crate::peer::fast;
 use rand::Rng;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard, PoisonError};

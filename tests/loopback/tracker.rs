@@ -1,7 +1,7 @@
-use rtrnt::announcer::Announcer;
 use rtrnt::download::download_from_peers;
 use rtrnt::peer::{PeerMessage, generate_peer_id};
 use rtrnt::torrent::TorrentFile;
+use rtrnt::tracker::announcer::Announcer;
 use rtrnt::tracker::{AnnounceEvent, AnnounceRequest, ScrapeStats, scrape, scrape_tiers};
 use std::future::pending;
 use std::sync::Arc;

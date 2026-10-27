@@ -1,7 +1,7 @@
 use crate::peer::{self};
 use crate::storage::Storage;
+use crate::storage::verify;
 use crate::torrent::{self, TorrentFile};
-use crate::verify;
 use anyhow::{Result, bail};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::path::Path;

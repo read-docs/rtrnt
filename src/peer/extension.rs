@@ -7,7 +7,8 @@
 //! receive that extension's messages under, plus a few facts about itself.
 //! Any other id is one the receiver picked in its own handshake.
 
-use crate::{bencode, pex};
+use super::pex;
+use crate::bencode;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_bencode::value::Value;

@@ -1,5 +1,5 @@
 use rtrnt::download::download_from_peers;
-use rtrnt::fast;
+use rtrnt::peer::fast;
 use rtrnt::peer::{PeerMessage, generate_peer_id, handshake_bytes, parse_handshake};
 use std::future::pending;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

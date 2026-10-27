@@ -1,6 +1,6 @@
-use rtrnt::announcer::Announcer;
 use rtrnt::download::{DownloadConfig, SeedLimits, download_file, download_from_peers};
 use rtrnt::peer::{PeerMessage, generate_peer_id};
+use rtrnt::tracker::announcer::Announcer;
 use rtrnt::tracker::{AnnounceEvent, AnnounceRequest};
 use std::future::pending;
 use std::net::SocketAddr;

@@ -1,4 +1,4 @@
-use crate::announcer::Transferred;
+use crate::tracker::announcer::Transferred;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::sync::atomic::Ordering;
 

@@ -10,22 +10,24 @@
 //! the output directory, so a later run with the same link, `--check` among
 //! them, uses that instead of asking peers again.
 
-use crate::announcer::{Announcer, Transferred};
 use crate::client::Client;
 use crate::dht::DhtSearch;
+use crate::download::peer_pool::PeerPool;
 use crate::download::{self, Limits, Session, StartPeers};
-use crate::extension::Advertised;
-use crate::metadata::MetadataFetch;
-use crate::peer_pool::PeerPool;
+use crate::peer::extension::Advertised;
 use crate::resume::{self, Target};
 use crate::storage::Storage;
 use crate::torrent;
+use crate::tracker::announcer::{Announcer, Transferred};
 use crate::tracker::{AnnounceEvent, AnnounceRequest};
 use anyhow::{Context, Result, anyhow, bail};
+use metadata::MetadataFetch;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+pub mod metadata;
 
 /// `left` told to trackers while the torrent's size is unknown; libtorrent
 /// sends the same. Anything but 0, which would make us look like a seed.

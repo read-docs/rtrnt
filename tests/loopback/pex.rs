@@ -1,7 +1,7 @@
 use rtrnt::download::{Interrupted, download_from_peers};
-use rtrnt::extension::ExtendedHandshake;
 use rtrnt::peer::PeerMessage;
-use rtrnt::pex::{self, PexMessage};
+use rtrnt::peer::extension::ExtendedHandshake;
+use rtrnt::peer::pex::{self, PexMessage};
 use rtrnt::torrent::TorrentFile;
 use sha1::Digest;
 use std::future::pending;

@@ -2,8 +2,11 @@ use rand::Rng;
 use tokio::time::Duration;
 
 mod connection;
+pub mod extension;
+pub mod fast;
 mod handshake;
 mod message;
+pub mod pex;
 
 pub use connection::{PeerConnection, ProtocolViolation};
 pub use handshake::{Handshake, Incoming, handshake_bytes, parse_handshake};

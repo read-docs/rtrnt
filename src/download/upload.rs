@@ -1,4 +1,4 @@
-use crate::extension::{self};
+use crate::peer::extension::{self};
 use crate::peer::{PeerConnection, PeerMessage};
 use crate::storage::Storage;
 use anyhow::{Result, bail};

@@ -1,14 +1,14 @@
 use super::assembly::{Added, Assembly};
 use super::{Message, peer_supports_metadata};
-use crate::announcer::{Announcer, Transferred};
 use crate::client::{ConnectionSlots, SlotPermit};
 use crate::dht::DhtSearch;
+use crate::download::peer_pool::PeerPool;
 use crate::download::{self, ConnectedPeers, Misbehaved};
-use crate::extension::{Advertised, UT_METADATA, UT_METADATA_ID};
 use crate::listener::Registration;
 use crate::magnet::FetchInterrupted;
+use crate::peer::extension::{Advertised, UT_METADATA, UT_METADATA_ID};
 use crate::peer::{Incoming, PeerConnection, PeerMessage, ProtocolViolation};
-use crate::peer_pool::PeerPool;
+use crate::tracker::announcer::{Announcer, Transferred};
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};

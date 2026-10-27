@@ -1,5 +1,5 @@
-use crate::extension;
-use crate::fast;
+use super::extension;
+use super::fast;
 use anyhow::{Context, Result, bail};
 use std::net::SocketAddr;
 use tokio::io::AsyncReadExt;

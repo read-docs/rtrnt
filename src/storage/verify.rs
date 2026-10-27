@@ -1,7 +1,7 @@
 //! Checks data already on disk against the torrent's piece hashes, so an
 //! interrupted download can resume where it left off.
 
-use crate::storage::Storage;
+use super::Storage;
 use crate::torrent::TorrentFile;
 use anyhow::{Result, anyhow};
 use sha1::Digest;

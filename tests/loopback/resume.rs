@@ -1,11 +1,12 @@
 use indicatif::MultiProgress;
-use rtrnt::announcer::Announcer;
 use rtrnt::download::{DownloadConfig, Interrupted, SeedLimits, Session, download_from_peers};
 use rtrnt::peer::{PeerMessage, generate_peer_id};
+use rtrnt::resume;
 use rtrnt::storage::Storage;
+use rtrnt::storage::verify;
 use rtrnt::torrent::TorrentFile;
+use rtrnt::tracker::announcer::Announcer;
 use rtrnt::tracker::{AnnounceEvent, AnnounceRequest};
-use rtrnt::{resume, verify};
 use std::future::pending;
 use std::path::Path;
 use std::sync::Arc;

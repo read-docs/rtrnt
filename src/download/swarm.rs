@@ -1,11 +1,11 @@
-use crate::announcer::{Announcer, Transferred};
-use crate::choker::Choker;
+use super::choker::Choker;
+use super::peer_pool::PeerPool;
 use crate::client::{ConnectionSlots, SlotPermit};
 use crate::dht::DhtSearch;
 use crate::listener::Registration;
+use crate::peer::pex::PeerExchange;
 use crate::peer::{self, Incoming, PeerConnection};
-use crate::peer_pool::PeerPool;
-use crate::pex::PeerExchange;
+use crate::tracker::announcer::{Announcer, Transferred};
 use anyhow::{Result, bail};
 use indicatif::HumanBytes;
 use std::collections::HashSet;

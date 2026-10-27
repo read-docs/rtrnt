@@ -1,7 +1,7 @@
 use rtrnt::download::{DownloadConfig, SeedLimits, check_file, download_from_peers};
-use rtrnt::extension::{ExtendedHandshake, UT_METADATA, UT_METADATA_ID};
+use rtrnt::magnet::metadata::{self, Message};
 use rtrnt::magnet::{self, MagnetLink, download_magnet};
-use rtrnt::metadata::{self, Message};
+use rtrnt::peer::extension::{ExtendedHandshake, UT_METADATA, UT_METADATA_ID};
 use rtrnt::peer::{PeerMessage, generate_peer_id, handshake_bytes, parse_handshake};
 use rtrnt::torrent::{self, TorrentFile};
 use sha1::Digest;

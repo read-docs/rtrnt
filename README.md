@@ -69,38 +69,64 @@ See [ROADMAP.md](ROADMAP.md) for what's done and what's next.
 
 ```
 src/
-├── main.rs      # CLI entry point (clap + tracing)
-├── lib.rs       # Library root
-├── announcer.rs # Re-announces and completed/stopped events
-├── bencode.rs   # Raw bencode scanning (info-hash span)
-├── choker.rs    # Choking algorithm: who may download from us
-├── client.rs    # What the torrents of a session share: port, DHT, rate limits, bars
-├── config.rs    # Config file loading and CLI > file > default precedence
-├── dht/         # Trackerless peer discovery (BEP 5)
-│   ├── mod.rs     # DHT node: UDP socket, queries and answers, lookups
-│   ├── krpc.rs    # KRPC messages, bencode values, compact node/peer info
-│   ├── routing.rs # Node ids, XOR distance, k-bucket routing table
-│   ├── lookup.rs  # Iterative lookup state machine
-│   ├── token.rs   # get_peers tokens with rotating secrets
-│   ├── store.rs   # Peers announced to us
-│   └── search.rs  # Periodic lookups for the torrent being downloaded
-├── download.rs  # Piece queue, peer workers, block pipelining, seeding
-├── extension.rs # Extension protocol (BEP 10) handshake
-├── fast.rs      # Fast extension (BEP 6): allowed fast set, Have All/Have None
-├── listener.rs  # Incoming peers, handed to the torrent their handshake asks for
-├── magnet.rs    # Magnet links (BEP 9): parsing, metadata fetch, then download
-├── metadata.rs  # ut_metadata messages, assembling and serving the info dict
-├── peer.rs      # Peer wire protocol: handshake, message encode/decode
-├── peer_pool.rs # Known peers, retry backoff and bans
-├── pex.rs       # Peer exchange (BEP 11): telling peers about each other
-├── rate_limit.rs # Upload and download rate limits (shared token buckets)
-├── storage.rs   # Maps pieces onto files on disk (single and multi-file)
-├── torrent.rs   # Torrent file parsing and validation
-└── tracker.rs   # Tracker communication (UDP/HTTP)
+├── main.rs        # CLI entry point: runs each torrent, prints the result
+├── cli.rs         # Command-line arguments (clap)
+├── shutdown.rs    # Ctrl-C handling: first stops gracefully, second exits
+├── log_line.rs    # Log output that does not break the progress bars
+├── lib.rs         # Library root
+├── bencode.rs     # Raw bencode scanning (info-hash span)
+├── client.rs      # What the torrents of a session share: port, DHT, rate limits, bars
+├── config.rs      # Config file loading and CLI > file > default precedence
+├── dht/           # Trackerless peer discovery (BEP 5)
+│   ├── mod.rs       # DHT node: UDP socket, queries and answers, lookups
+│   ├── krpc.rs      # KRPC messages, bencode values, compact node/peer info
+│   ├── routing.rs   # Node ids, XOR distance, k-bucket routing table
+│   ├── lookup.rs    # Iterative lookup state machine
+│   ├── token.rs     # get_peers tokens with rotating secrets
+│   ├── store.rs     # Peers announced to us
+│   └── search.rs    # Periodic lookups for the torrent being downloaded
+├── download.rs    # Download config, Session and the entry points
+├── download/
+│   ├── swarm.rs     # A torrent's main loop: starts, replaces and bans peer workers
+│   ├── worker.rs    # One peer: download and upload over its connection
+│   ├── queue.rs     # Piece queue: rarest first, endgame, availability
+│   ├── requests.rs  # Pieces in progress and request pipelining
+│   ├── upload.rs    # Blocks peers asked us for
+│   ├── check.rs     # Hashing the data on disk
+│   ├── choker.rs    # Choking algorithm: who may download from us
+│   ├── peer_pool.rs # Known peers, retry backoff and bans
+│   └── progress.rs  # Progress bar
+├── listener.rs    # Incoming peers, handed to the torrent their handshake asks for
+├── magnet.rs      # Magnet links (BEP 9): parsing, metadata fetch, then download
+├── magnet/
+│   └── metadata.rs  # ut_metadata: messages, assembling and fetching the info dict
+├── peer.rs        # Peer wire protocol
+├── peer/
+│   ├── message.rs   # Message encode/decode
+│   ├── handshake.rs # Handshakes, ours and incoming
+│   ├── connection.rs # A connection to one peer
+│   ├── extension.rs # Extension protocol (BEP 10) handshake
+│   ├── fast.rs      # Fast extension (BEP 6): allowed fast set, Have All/Have None
+│   └── pex.rs       # Peer exchange (BEP 11): telling peers about each other
+├── rate_limit.rs  # Upload and download rate limits (shared token buckets)
+├── resume.rs      # Resume files: what was on disk last time
+├── storage.rs     # Maps pieces onto files on disk (single and multi-file)
+├── storage/
+│   └── verify.rs    # Hash checks of the data on disk
+├── torrent.rs     # Torrent file parsing and validation
+├── tracker.rs     # Tracker announce and scrape
+└── tracker/
+    ├── http.rs      # HTTP trackers
+    ├── udp.rs       # UDP trackers (BEP 15)
+    └── announcer.rs # Re-announces and completed/stopped events
 tests/
-├── dht.rs       # DHT nodes on loopback: bootstrap, announce, lookup
-└── loopback.rs  # End-to-end downloads from mock seeders, a mock tracker, the DHT, peer exchange and magnet links
+├── dht.rs         # DHT nodes on loopback: bootstrap, announce, lookup
+└── loopback/      # End-to-end runs against mock seeders, trackers and peers,
+                   # one file per topic, shared helpers in common.rs
 ```
+
+Unit tests live next to the code: inline in small modules, in `foo/tests.rs`
+for `foo.rs` otherwise.
 
 ## How It Works
 

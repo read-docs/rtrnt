@@ -1,4 +1,4 @@
-use crate::extension::{self, Advertised, ExtendedHandshake};
+use super::extension::{self, Advertised, ExtendedHandshake};
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::{Buf, BytesMut};
 use std::net::SocketAddr;
