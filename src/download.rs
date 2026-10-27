@@ -3,9 +3,7 @@ use crate::dht::Dht;
 use crate::listener::Listener;
 use crate::rate_limit::RateLimits;
 use crate::resume::{self, Target};
-use crate::stats::{
-    PeerSource, TorrentStats,
-};
+use crate::stats::{PeerSource, TorrentStats};
 use crate::storage::Storage;
 use crate::torrent::{self, TorrentFile};
 use crate::tracker::announcer::{Announcer, Transferred};

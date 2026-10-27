@@ -176,6 +176,9 @@ pub async fn initial_pieces(
     if let Some(target) = &session.resume {
         target.save(&session.storage, have.clone()).await;
     }
+    session
+        .stats
+        .set_verified(download::verified_bytes(torrent, &have)?);
     session.stats.set_state(TorrentState::Downloading);
     Ok(have)
 }

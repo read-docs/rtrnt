@@ -1,7 +1,5 @@
 use crate::peer::{self};
-use crate::stats::{
-    TorrentState, TorrentStats,
-};
+use crate::stats::{TorrentState, TorrentStats};
 use crate::storage::Storage;
 use crate::storage::verify;
 use crate::torrent::{self, TorrentFile};

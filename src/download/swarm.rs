@@ -5,9 +5,7 @@ use crate::dht::DhtSearch;
 use crate::listener::Registration;
 use crate::peer::pex::PeerExchange;
 use crate::peer::{self, Incoming, PeerConnection};
-use crate::stats::{
-    PeerSource, PieceSnapshot, PieceSource, TorrentState,
-};
+use crate::stats::{PeerSource, PieceSnapshot, PieceSource, TorrentState};
 use crate::tracker::announcer::{Announcer, Transferred};
 use anyhow::{Result, bail};
 use indicatif::HumanBytes;
@@ -95,7 +93,7 @@ pub(crate) async fn download_with(
             &torrent.info.name,
             torrent.length(),
             verified_bytes(torrent, have)?,
-            Arc::clone(stats.transferred()),
+            Arc::clone(stats),
         ),
         connected: ConnectedPeers::default(),
         choker: Choker::default(),
@@ -201,6 +199,7 @@ pub(crate) async fn download_with(
                 break;
             }
         }
+        stats.set_pool(pool.len());
         // Made before a slot is looked for, so that one freed meanwhile is
         // not missed.
         let mut freed = std::pin::pin!(slots.freed());

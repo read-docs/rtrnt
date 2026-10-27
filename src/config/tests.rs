@@ -74,7 +74,7 @@ fn parses_every_key() {
 #[test]
 fn parses_seeding_dht_and_rate_keys() {
     let text = "seed-ratio = 1.5\nseed-time = 90\ndht = false\n\
-                max-download-rate = 500\nmax-upload-rate = 64\n";
+                max-download-rate = 500\nmax-upload-rate = 64\ntui = true\n";
     let parsed = parse(text, None).unwrap();
     assert_eq!(
         parsed,
@@ -84,6 +84,7 @@ fn parses_seeding_dht_and_rate_keys() {
             dht: Some(false),
             max_download_rate: Some(500),
             max_upload_rate: Some(64),
+            tui: Some(true),
             ..Options::default()
         }
     );
@@ -251,7 +252,8 @@ fn describe_names_each_source() {
          seed-time = 0  # default\n\
          dht = false  # command line\n\
          max-download-rate = 0  # default\n\
-         max-upload-rate = 64  # command line\n"
+         max-upload-rate = 64  # command line\n\
+         # tui: when stdout and stderr are terminals  # default\n"
     );
     // The settings part is valid TOML that parses to the same values.
     let reparsed = parse(&text, None).unwrap();
@@ -272,4 +274,14 @@ fn describe_names_each_source() {
     assert!(text.starts_with("# no config file\n"), "{text}");
     assert!(text.contains("seed-ratio = 0.0  # default\n"), "{text}");
     parse(&text, None).unwrap();
+    let file = ConfigFile {
+        path: None,
+        options: Options {
+            tui: Some(false),
+            ..Options::default()
+        },
+    };
+    let text = describe(&Options::default(), &file);
+    assert!(text.ends_with("tui = false  # config file\n"), "{text}");
+    assert_eq!(parse(&text, None).unwrap().tui, Some(false));
 }

@@ -3,9 +3,7 @@ use crate::peer::extension::{self, Advertised};
 use crate::peer::fast;
 use crate::peer::pex::{self};
 use crate::peer::{PeerConnection, PeerMessage};
-use crate::stats::{
-    PeerFlags, PeerStats,
-};
+use crate::stats::{PeerFlags, PeerStats};
 use anyhow::{Result, anyhow, bail};
 use std::collections::HashSet;
 use std::net::SocketAddr;

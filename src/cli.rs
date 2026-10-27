@@ -78,6 +78,14 @@ pub(crate) struct Args {
     /// torrents (0: unlimited) [default: 0]
     #[arg(long, value_name = "KIB/S")]
     pub(crate) max_upload_rate: Option<u64>,
+    /// Show the full-screen terminal UI, never with --check, --scrape or
+    /// --print-config [default: when stdout and stderr are terminals]
+    #[arg(long, overrides_with = "no_tui")]
+    tui: bool,
+    /// Print progress bars and log lines instead of the terminal UI (`tui =
+    /// false` in the config file)
+    #[arg(long, overrides_with = "tui")]
+    no_tui: bool,
 }
 
 impl Args {
@@ -85,6 +93,16 @@ impl Args {
     /// of `--dht` and `--no-dht`, if either is given.
     pub(crate) fn dht(&self) -> Option<bool> {
         match (self.dht, self.no_dht) {
+            (_, true) => Some(false),
+            (true, false) => Some(true),
+            (false, false) => None,
+        }
+    }
+
+    /// Whether the terminal UI was turned on or off on the command line, as
+    /// for `dht`.
+    pub(crate) fn tui(&self) -> Option<bool> {
+        match (self.tui, self.no_tui) {
             (_, true) => Some(false),
             (true, false) => Some(true),
             (false, false) => None,

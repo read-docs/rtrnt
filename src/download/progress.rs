@@ -1,3 +1,4 @@
+use crate::stats::TorrentStats;
 use crate::tracker::announcer::Transferred;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::sync::Arc;
@@ -8,6 +9,7 @@ use std::sync::atomic::Ordering;
 pub(super) struct Progress {
     pub(super) bar: ProgressBar,
     pub(super) transferred: Arc<Transferred>,
+    stats: Arc<TorrentStats>,
 }
 
 impl Progress {
@@ -19,7 +21,7 @@ impl Progress {
         name: &str,
         total: u64,
         done: u64,
-        transferred: Arc<Transferred>,
+        stats: Arc<TorrentStats>,
     ) -> Self {
         let bar = bars.add(ProgressBar::new(total));
         let style = ProgressStyle::with_template(
@@ -33,12 +35,18 @@ impl Progress {
         // drops it again, so data from disk does not count towards the rate.
         bar.set_position(done);
         bar.reset_eta();
-        Self { bar, transferred }
+        stats.set_verified(done);
+        Self {
+            bar,
+            transferred: Arc::clone(stats.transferred()),
+            stats,
+        }
     }
 
     /// Counts a verified piece.
     pub(super) fn add(&self, bytes: u64) {
         self.bar.inc(bytes);
+        self.stats.add_verified(bytes);
         self.transferred
             .downloaded
             .fetch_add(bytes, Ordering::Relaxed);

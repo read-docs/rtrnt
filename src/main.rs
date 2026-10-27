@@ -5,37 +5,67 @@ mod shutdown;
 use anyhow::bail;
 use clap::Parser;
 use cli::{Args, Source};
-use indicatif::MultiProgress;
+use indicatif::{MultiProgress, ProgressDrawTarget};
 use log_line::LogLine;
 use rtrnt::client::Client;
 use rtrnt::download::{self, DownloadConfig, Interrupted};
 use rtrnt::magnet::{self, FetchInterrupted};
+use rtrnt::tui::log_buffer::LogBuffer;
+use rtrnt::tui::{self, SessionFeed};
 use rtrnt::{config, torrent, tracker};
 use shutdown::Shutdown;
+use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{Instrument, Span, error, info, info_span, warn};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 /// Exit code for a run stopped by Ctrl-C (128 + SIGINT).
 const EXIT_INTERRUPTED: u8 = 130;
 
+/// How far back the warnings and errors printed after the UI closes go.
+const PROBLEMS_SHOWN_AFTER_UI: Duration = Duration::from_secs(10);
+
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
-    let bars = MultiProgress::new();
-    let log_bars = bars.clone();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_writer(move || LogLine::new(log_bars.clone()))
-        .init();
-
     let args = Args::parse();
-    let file = config::load(args.config.as_deref())?;
+    // Read before logging starts, which depends on it; any error is printed
+    // on the way out.
+    let file = config::load(args.config.as_deref());
+    let use_tui = !(args.check || args.scrape || args.print_config)
+        && args
+            .tui()
+            .or(file.as_ref().ok().and_then(|file| file.options.tui))
+            .unwrap_or_else(|| std::io::stdout().is_terminal() && std::io::stderr().is_terminal());
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let logs = LogBuffer::default();
+    let bars = if use_tui {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(logs.layer())
+            .init();
+        // The bars keep counting, but nothing draws them.
+        MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
+    } else {
+        let bars = MultiProgress::new();
+        let log_bars = bars.clone();
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(move || LogLine::new(log_bars.clone()))
+            .init();
+        bars
+    };
+
+    let file = file?;
     let cli = config::Options {
         dht: args.dht(),
+        tui: args.tui(),
         output: args.output,
         max_peers: args.max_peers,
         max_connections: args.max_connections,
@@ -70,7 +100,48 @@ async fn main() -> anyhow::Result<ExitCode> {
         })
         .await;
     }
-    download_all(args.torrents, Client::new(config, bars)).await
+    let client = Arc::new(Client::new(config, bars));
+    let shutdown = Shutdown::new();
+    if !use_tui {
+        return download_all(args.torrents, client, shutdown).await;
+    }
+    with_tui(args.torrents, client, shutdown, logs).await
+}
+
+/// `download_all`, shown in the terminal UI. Leaving the UI before every
+/// torrent has stopped exits at once, as a second Ctrl-C does.
+async fn with_tui(
+    torrents: Vec<Source>,
+    client: Arc<Client>,
+    shutdown: Arc<Shutdown>,
+    logs: LogBuffer,
+) -> anyhow::Result<ExitCode> {
+    let (finished, finished_rx) = watch::channel(false);
+    let downloads = tokio::spawn({
+        let (client, shutdown) = (Arc::clone(&client), Arc::clone(&shutdown));
+        async move {
+            let result = download_all(torrents, client, shutdown).await;
+            finished.send_replace(true);
+            result
+        }
+    });
+    let stop = {
+        let shutdown = Arc::clone(&shutdown);
+        move || shutdown.request_stop()
+    };
+    let feed = SessionFeed::new(Arc::clone(client.stats()), logs.clone(), stop);
+    let exit = tui::run(feed, finished_rx).await;
+    // The terminal is back to normal: say what went wrong lately, which the
+    // UI showed but which is gone with it.
+    for line in logs.problems_since(SystemTime::now(), PROBLEMS_SHOWN_AFTER_UI) {
+        eprintln!("{line}");
+    }
+    match exit {
+        Ok(tui::Exit::Quit) => {}
+        Ok(tui::Exit::Now) => std::process::exit(EXIT_INTERRUPTED.into()),
+        Err(e) => eprintln!("cannot run the terminal UI: {e}; carrying on without it"),
+    }
+    downloads.await?
 }
 
 /// Runs `run` on each torrent in turn. With several, each one's output is
@@ -146,9 +217,11 @@ enum Outcome {
 /// A single torrent's failure is returned as the error; with several, each
 /// failure is logged and the exit code is a failure. Otherwise the exit code
 /// says whether Ctrl-C cut a download short.
-async fn download_all(torrents: Vec<Source>, client: Client) -> anyhow::Result<ExitCode> {
-    let client = Arc::new(client);
-    let shutdown = Shutdown::new();
+async fn download_all(
+    torrents: Vec<Source>,
+    client: Arc<Client>,
+    shutdown: Arc<Shutdown>,
+) -> anyhow::Result<ExitCode> {
     let several = torrents.len() > 1;
     let mut tasks = JoinSet::new();
     for source in torrents {

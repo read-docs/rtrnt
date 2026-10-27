@@ -497,6 +497,8 @@ async fn stats_follow_a_download() {
     assert!(torrent_stats.finished_at().is_some());
     assert_eq!(torrent_stats.downloaded(), data.len() as u64);
     assert_eq!(torrent_stats.received(), data.len() as u64);
+    assert_eq!(torrent_stats.verified(), data.len() as u64);
+    assert!(torrent_stats.pool() >= 1);
     assert!(torrent_stats.peers().is_empty());
     assert_eq!(torrent_stats.pieces().unwrap().have, vec![true; num_pieces]);
     assert_eq!(torrent_stats.next_announce(), None);

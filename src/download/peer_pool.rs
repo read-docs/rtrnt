@@ -52,6 +52,11 @@ impl PeerPool {
 
     /// How many peers wait to be tried for the first time or after a
     /// backoff that is over, not counting those still backing off.
+    /// Every peer ever added.
+    pub(crate) fn len(&self) -> usize {
+        self.known.len()
+    }
+
     pub(crate) fn ready_len(&self) -> usize {
         self.ready.len()
     }

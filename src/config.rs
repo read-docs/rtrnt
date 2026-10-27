@@ -4,7 +4,7 @@
 //! config file, else from its built-in default. Keys in the file are the
 //! long option names, so `--max-peers 50` is `max-peers = 50`; the one
 //! exception is `--no-dht`, which is `dht = false` (and `--dht` overrides
-//! it from the command line).
+//! it from the command line), and likewise `--no-tui`, `tui = false`.
 
 use crate::download::{DownloadConfig, SeedLimits};
 use crate::peer;
@@ -63,6 +63,9 @@ pub struct Options {
     pub max_download_rate: Option<u64>,
     /// Most block data to upload per second, in KiB; 0 for no limit.
     pub max_upload_rate: Option<u64>,
+    /// Whether to show the terminal UI; unset, it shows when stdout and
+    /// stderr are terminals.
+    pub tui: Option<bool>,
 }
 
 /// Whether `ratio` is a valid seed ratio: a finite number, 0 or more.
@@ -96,6 +99,7 @@ impl Options {
             dht: self.dht.or(fallback.dht),
             max_download_rate: self.max_download_rate.or(fallback.max_download_rate),
             max_upload_rate: self.max_upload_rate.or(fallback.max_upload_rate),
+            tui: self.tui.or(fallback.tui),
         }
     }
 
@@ -287,7 +291,17 @@ pub fn describe(cli: &Options, file: &ConfigFile) -> String {
     let settings = lines
         .into_iter()
         .map(|(key, value, source)| format!("{key} = {value}  # {source}\n"));
-    std::iter::once(header).chain(settings).collect()
+    let tui = match cli.tui.or(file.options.tui) {
+        Some(tui) => format!(
+            "tui = {tui}  # {}\n",
+            source(cli.tui.is_some(), file.options.tui.is_some())
+        ),
+        None => "# tui: when stdout and stderr are terminals  # default\n".to_string(),
+    };
+    std::iter::once(header)
+        .chain(settings)
+        .chain(std::iter::once(tui))
+        .collect()
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 use crate::EXIT_INTERRUPTED;
+use rtrnt::tui;
 use std::sync::{Arc, Once};
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -39,13 +40,30 @@ impl Shutdown {
             warn!("cannot listen for Ctrl-C: {e}");
             return;
         }
-        if self.stop.receiver_count() == 0 {
-            std::process::exit(EXIT_INTERRUPTED.into());
+        if !self.request_stop() {
+            exit_now();
+        }
+        if tokio::signal::ctrl_c().await.is_ok() {
+            exit_now();
+        }
+    }
+
+    /// Does what the first Ctrl-C does: asks every torrent to stop. Returns
+    /// false, asking nothing, if a stop was asked for already or no torrent
+    /// waits for one yet; the caller should then exit at once.
+    pub(crate) fn request_stop(&self) -> bool {
+        if *self.stop.borrow() || self.stop.receiver_count() == 0 {
+            return false;
         }
         self.stop.send_replace(true);
         info!("stopping, press Ctrl-C again to quit at once");
-        if tokio::signal::ctrl_c().await.is_ok() {
-            std::process::exit(EXIT_INTERRUPTED.into());
-        }
+        true
     }
+}
+
+/// Exits at once, as a second Ctrl-C does, with the terminal put back as it
+/// was if the UI had it.
+fn exit_now() -> ! {
+    tui::restore_terminal();
+    std::process::exit(EXIT_INTERRUPTED.into());
 }

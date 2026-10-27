@@ -14,7 +14,7 @@ use crate::tracker::AnnounceResponse;
 use crate::tracker::announcer::Transferred;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::Instant;
 
@@ -224,6 +224,10 @@ pub struct TorrentStats {
     /// Block data received, verified or not: what the download rate is
     /// made of, as verified pieces come in bursts.
     received: AtomicU64,
+    /// Bytes verified and on disk, from earlier runs too.
+    verified: AtomicU64,
+    /// Peers known to the download, connected or not.
+    pool: AtomicUsize,
     pieces: Mutex<Pieces>,
     peers: Mutex<Vec<Weak<PeerStats>>>,
     trackers: Mutex<Vec<TrackerStatus>>,
@@ -244,6 +248,8 @@ impl TorrentStats {
             finished: OnceLock::new(),
             transferred: Arc::default(),
             received: AtomicU64::new(0),
+            verified: AtomicU64::new(0),
+            pool: AtomicUsize::new(0),
             pieces: Mutex::new(Pieces::Unknown),
             peers: Mutex::new(Vec::new()),
             trackers: Mutex::new(Vec::new()),
@@ -349,6 +355,28 @@ impl TorrentStats {
 
     pub(crate) fn add_received(&self, bytes: u64) {
         self.received.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Bytes verified and on disk, from earlier runs too.
+    pub fn verified(&self) -> u64 {
+        self.verified.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_verified(&self, bytes: u64) {
+        self.verified.store(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_verified(&self, bytes: u64) {
+        self.verified.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Peers known to the download, connected or not.
+    pub fn pool(&self) -> usize {
+        self.pool.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_pool(&self, peers: usize) {
+        self.pool.store(peers, Ordering::Relaxed);
     }
 
     /// Lets `source` answer `pieces()` while the download runs.

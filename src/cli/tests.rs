@@ -80,6 +80,32 @@ fn help_shows_the_defaults() {
     }
     // `--dht` says the DHT is on by default.
     const { assert!(config::DEFAULT_DHT) };
+    // The UI's default depends on the terminal, which the help says.
+    let tui = command
+        .get_arguments()
+        .find(|arg| arg.get_id() == "tui")
+        .and_then(|arg| arg.get_help())
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    assert!(
+        tui.ends_with("[default: when stdout and stderr are terminals]"),
+        "{tui}"
+    );
+}
+
+/// Without `--tui` or `--no-tui` the config file decides; with both,
+/// the last one wins.
+#[test]
+fn tui_flags_fall_back_to_the_file() {
+    let tui = |flags: &[&str]| {
+        let args = ["rtrnt", "x.torrent"].iter().chain(flags);
+        Args::try_parse_from(args).unwrap().tui()
+    };
+    assert_eq!(tui(&[]), None);
+    assert_eq!(tui(&["--no-tui"]), Some(false));
+    assert_eq!(tui(&["--tui"]), Some(true));
+    assert_eq!(tui(&["--tui", "--no-tui"]), Some(false));
+    assert_eq!(tui(&["--no-tui", "--tui"]), Some(true));
 }
 
 /// Without `--dht` or `--no-dht` the config file decides; with both,
