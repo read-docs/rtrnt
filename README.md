@@ -38,8 +38,11 @@ When stdout and stderr are terminals, a run shows a full-screen UI instead of pr
 | `s` / `S` | sort by the next column / reverse the order |
 | `/` | filter torrents by name; `esc` clears the filter |
 | `d` / `u` | set the download / upload limit in KiB/s, 0 for none, until the run ends; the header shows the limits next to the rates |
+| `m` | turn the mouse off, so the terminal can select text, or on again |
 | `?` | help |
 | `q`, `Ctrl-C` | stop the torrents, as Ctrl-C does without the UI; pressed again, quit at once |
+
+The mouse works too: click a torrent or a peer to select it, a column heading to sort by it (again to reverse), or a tab title to show it; the wheel moves the selection, or scrolls the detail panel, under the pointer. While the UI has the mouse, most terminals still select text with Shift held down, or press `m` to give the mouse back.
 
 Peer flags: `D` we download from the peer, `d` we want to but it chokes us; `U` we upload to it, `u` it wants us to but we choke it; `I` it connected to us; `F` fast extension; `X` peer exchange. When every torrent has finished the UI says so and waits for `q`, and the warnings and errors of the last 10 seconds are printed once the terminal is back. `cargo run --example tui_demo` shows the UI with a made-up session.
 

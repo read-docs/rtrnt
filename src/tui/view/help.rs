@@ -16,6 +16,7 @@ const KEYS: &[(&str, &str)] = &[
     ("s  S", "sort by the next column, reverse the order"),
     ("/", "filter torrents by name; esc clears it"),
     ("d  u", "set the download or upload limit, in KiB/s"),
+    ("m", "turn the mouse off to select text, and on again"),
     ("?", "this help"),
     ("q  Ctrl-C", "stop the torrents; again to quit at once"),
 ];
@@ -33,7 +34,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let block = boxed(
         theme,
         title(theme, "Keys"),
-        Some("any key closes".to_string()),
+        Some("any key or click closes".to_string()),
         true,
     );
     let mut lines = vec![Line::default()];

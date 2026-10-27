@@ -1,11 +1,11 @@
 //! The torrent table.
 
 use super::{
-    bar, bold, boxed, fit, human_bytes, human_rate, scroll_to, selected_style, short_duration,
-    title,
+    Rows, bar, bold, boxed, fit, human_bytes, human_rate, inner_of, scroll_to, selected_style,
+    short_duration, title,
 };
 use crate::stats::TorrentState;
-use crate::tui::app::{App, Focus};
+use crate::tui::app::{App, Focus, Sort};
 use crate::tui::snapshot::{Snapshot, TorrentSnapshot};
 use crate::tui::theme::Theme;
 use ratatui::Frame;
@@ -61,6 +61,20 @@ impl Column {
     fn right_aligned(self) -> bool {
         !matches!(self, Column::Name | Column::Progress | Column::Status)
     }
+
+    /// What a click on the heading sorts by.
+    fn sort(self) -> Option<Sort> {
+        match self {
+            Column::Name => Some(Sort::Name),
+            Column::Size => Some(Sort::Size),
+            Column::Progress => Some(Sort::Progress),
+            Column::Status => None,
+            Column::Down => Some(Sort::Down),
+            Column::Up => Some(Sort::Up),
+            Column::Peers => Some(Sort::Peers),
+            Column::Eta => Some(Sort::Eta),
+        }
+    }
 }
 
 /// The columns that fit in `width`, and the name column's width. Below
@@ -84,6 +98,60 @@ fn columns(width: usize, screen_width: u16) -> (Vec<Column>, usize) {
     }
     let name = name_width(&columns);
     (columns, name)
+}
+
+/// The columns shown inside the table's box, `inner`, each with its width.
+/// One column goes first, for the selection marker.
+fn shown_columns(inner: Rect, screen_width: u16) -> Vec<(Column, usize)> {
+    let (columns, name_width) = columns((inner.width as usize).saturating_sub(1), screen_width);
+    columns
+        .into_iter()
+        .map(|column| match column {
+            Column::Name => (column, name_width),
+            column => (column, column.width()),
+        })
+        .collect()
+}
+
+/// The first of the `visible` torrents shown in `height` rows: scrolled to
+/// the selection.
+fn first_row(app: &App, visible: &[&TorrentSnapshot], height: usize) -> usize {
+    let selected = visible
+        .iter()
+        .position(|torrent| Some(torrent.info_hash) == app.selected)
+        .unwrap_or(0);
+    scroll_to(selected, 0, height)
+}
+
+/// Where the headings that sort are, in the table's box `area`.
+pub fn headings(area: Rect, screen_width: u16) -> Vec<(Sort, Rect)> {
+    let inner = inner_of(area);
+    if inner.height == 0 {
+        return Vec::new();
+    }
+    let mut x = inner.x + 1;
+    let mut headings = Vec::new();
+    for (column, width) in shown_columns(inner, screen_width) {
+        let width = width as u16;
+        if let Some(sort) = column.sort() {
+            headings.push((sort, Rect::new(x, inner.y, width, 1).intersection(inner)));
+        }
+        x += width + 1;
+    }
+    headings
+}
+
+/// The torrent rows shown in the table's box `area`.
+pub fn rows(snapshot: &Snapshot, app: &App, area: Rect) -> Rows {
+    let inner = inner_of(area);
+    let visible = app.visible(snapshot);
+    let height = (inner.height as usize).saturating_sub(1);
+    let first = first_row(app, &visible, height);
+    Rows::under_heading(
+        inner,
+        first,
+        visible.len().saturating_sub(first).min(height),
+    )
 }
 
 /// What the status column says, and its color.
@@ -129,16 +197,11 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
     if inner.height == 0 {
         return;
     }
-    // One column for the selection marker.
-    let (columns, name_width) = columns(inner.width as usize - 1, frame.area().width);
-    let width_of = |column: Column| match column {
-        Column::Name => name_width,
-        column => column.width(),
-    };
+    let columns = shown_columns(inner, frame.area().width);
     let mut heading = vec![Span::raw(" ")];
-    for &column in &columns {
+    for &(column, width) in &columns {
         heading.push(Span::styled(
-            fit(column.heading(), width_of(column), column.right_aligned()),
+            fit(column.heading(), width, column.right_aligned()),
             theme.heading_style(),
         ));
         heading.push(Span::raw(" "));
@@ -147,20 +210,16 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
 
     let visible = app.visible(snapshot);
     let height = inner.height as usize - 1;
-    let selected = visible
-        .iter()
-        .position(|torrent| Some(torrent.info_hash) == app.selected)
-        .unwrap_or(0);
-    let offset = scroll_to(selected, 0, height);
-    for (index, torrent) in visible.iter().enumerate().skip(offset).take(height) {
-        let is_selected = index == selected && app.selected.is_some();
+    let offset = first_row(app, &visible, height);
+    for torrent in visible.iter().skip(offset).take(height) {
+        let is_selected = Some(torrent.info_hash) == app.selected;
         let mut spans = vec![if is_selected {
             Span::styled("▌", Style::new().fg(theme.down()))
         } else {
             Span::raw(" ")
         }];
-        for &column in &columns {
-            spans.extend(cell(theme, torrent, column, width_of(column), is_selected));
+        for &(column, width) in &columns {
+            spans.extend(cell(theme, torrent, column, width, is_selected));
             spans.push(Span::raw(" "));
         }
         let line = Line::from(spans);

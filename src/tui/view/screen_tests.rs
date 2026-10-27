@@ -20,7 +20,11 @@ pub(crate) fn text(buffer: &ratatui::buffer::Buffer, area: ratatui::layout::Rect
 
 pub(crate) fn render(width: u16, height: u16, snapshot: &Snapshot, app: &App) -> Buffer {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-    terminal.draw(|frame| draw(frame, snapshot, app)).unwrap();
+    terminal
+        .draw(|frame| {
+            draw(frame, snapshot, app);
+        })
+        .unwrap();
     terminal.backend().buffer().clone()
 }
 
@@ -376,7 +380,7 @@ fn help_lists_the_keys_over_the_screen() {
         .iter()
         .position(|line| line.contains("╭ Keys ─"))
         .unwrap();
-    assert!(lines[top].contains(" any key closes ╮"));
+    assert!(lines[top].contains(" any key or click closes ╮"));
     assert!(lines[top + 2].contains("  ↑ ↓  j k  select a torrent or a peer, or scroll a tab"));
     assert!(
         lines
@@ -483,7 +487,7 @@ fn a_notice_shows_in_place_of_the_keys() {
     let app = app(&snapshot);
     // Without one, the keys; the limit keys where there is room.
     let buffer = render(100, 32, &snapshot, &app);
-    assert!(text(&buffer, buffer.area)[31].contains("  q quit  d u limits"));
+    assert!(text(&buffer, buffer.area)[31].contains("  q quit  d u limits  m mouse"));
     let buffer = render(80, 24, &snapshot, &app);
     let line = &text(&buffer, buffer.area)[23];
     assert!(
@@ -499,4 +503,116 @@ fn a_notice_shows_in_place_of_the_keys() {
         lines[31]
     );
     assert_eq!(buffer[(1, 31)].fg, Theme::default().warn());
+}
+
+/// The text of `area` of the buffer, on one line.
+fn text_at(buffer: &Buffer, area: Rect) -> String {
+    text(buffer, area).concat()
+}
+
+#[test]
+fn the_layout_says_where_draw_put_the_tabs_and_headings() {
+    use crate::tui::app::{Sort, Tab};
+    let snapshot = demo::fixture();
+    let app = app(&snapshot);
+    for (width, height, sorts) in [
+        (
+            100,
+            32,
+            &[
+                Sort::Name,
+                Sort::Size,
+                Sort::Progress,
+                Sort::Down,
+                Sort::Up,
+                Sort::Peers,
+                Sort::Eta,
+            ][..],
+        ),
+        // ETA and ↑ have dropped.
+        (
+            80,
+            24,
+            &[
+                Sort::Name,
+                Sort::Size,
+                Sort::Progress,
+                Sort::Down,
+                Sort::Peers,
+            ][..],
+        ),
+    ] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut drawn = Areas::default();
+        terminal
+            .draw(|frame| drawn = draw(frame, &snapshot, &app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let areas = layout(Rect::new(0, 0, width, height), &snapshot, &app);
+        assert_eq!(areas, drawn);
+
+        let tabs: Vec<Tab> = areas.tabs.iter().map(|&(tab, _)| tab).collect();
+        assert_eq!(tabs, Tab::ALL);
+        for (i, &(tab, rect)) in areas.tabs.iter().enumerate() {
+            assert_eq!(rect.y, areas.detail.y);
+            assert_eq!(text_at(buffer, rect), format!("{} {}", i + 1, tab.title()));
+        }
+
+        let shown: Vec<Sort> = areas.headings.iter().map(|&(sort, _)| sort).collect();
+        assert_eq!(shown, sorts, "at {width}×{height}");
+        for &(sort, rect) in &areas.headings {
+            let heading = match sort {
+                Sort::Name => "Name",
+                Sort::Size => "Size",
+                Sort::Progress => "Progress",
+                Sort::Down => "↓",
+                Sort::Up => "↑",
+                Sort::Peers => "Peers",
+                Sort::Eta => "ETA",
+                Sort::Added => unreachable!(),
+            };
+            assert_eq!(text_at(buffer, rect).trim(), heading, "at {width}×{height}");
+        }
+        // Each spans its column: the one after starts past a space.
+        for pair in areas.headings.windows(2) {
+            assert!(pair[0].1.right() < pair[1].1.x);
+        }
+
+        // Every torrent fits; the first is selected.
+        assert_eq!(areas.torrent_rows.first, 0);
+        assert_eq!(areas.torrent_rows.rects.len(), snapshot.torrents.len());
+        assert!(text_at(buffer, areas.torrent_rows.rects[0]).starts_with("▌debian"));
+        let peers = snapshot.detail.as_ref().unwrap().sorted_peers();
+        let first = areas.peer_rows.first;
+        for (i, &rect) in areas.peer_rows.rects.iter().enumerate() {
+            let line = text_at(buffer, rect);
+            assert!(
+                line.trim_start()
+                    .starts_with(&peers[first + i].addr.to_string()),
+                "{line}"
+            );
+        }
+        assert!(!areas.peer_rows.rects.is_empty());
+        assert_eq!(areas.keybar.y, height - 1);
+    }
+}
+
+#[test]
+fn the_peer_rows_follow_the_cursor_and_go_with_the_tab() {
+    let snapshot = demo::fixture();
+    let mut app = app(&snapshot);
+    app.select_peer(&snapshot, 100);
+    let area = Rect::new(0, 0, 80, 24);
+    let areas = layout(area, &snapshot, &app);
+    // As drawn in `peers_scroll_and_lose_the_client_column_when_narrow`.
+    assert_eq!(areas.peer_rows.first, 2);
+    assert_eq!(areas.peer_rows.rects.len(), 7);
+    assert_eq!(areas.peer_rows.rects[0].y, 11);
+    app.tab = crate::tui::app::Tab::Files;
+    assert_eq!(layout(area, &snapshot, &app).peer_rows, Rows::default());
+    // Nothing on a screen too small to draw.
+    assert_eq!(
+        layout(Rect::new(0, 0, 59, 24), &snapshot, &app),
+        Areas::default()
+    );
 }

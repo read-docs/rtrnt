@@ -14,7 +14,9 @@ pub mod view;
 
 use crate::stats::SessionStats;
 use app::{Action, App};
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyEventKind, MouseEventKind,
+};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute, terminal};
 use futures_util::StreamExt;
@@ -120,28 +122,48 @@ pub async fn run(mut feed: impl Feed, mut finished: watch::Receiver<bool>) -> io
     let mut tick = tokio::time::interval(TICK);
     let mut done = *finished.borrow();
     let mut snapshot = Snapshot::default();
+    // Where the last screen put everything, for the mouse.
+    let mut areas = view::Areas::default();
+    let mut mouse = app.mouse;
     loop {
         let mut sample = false;
         tokio::select! {
             _ = tick.tick() => sample = true,
-            event = events.next() => match event {
-                Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {
-                    match app.handle_key(key, &snapshot) {
-                        Action::None => {}
-                        Action::Quit => return Ok(Exit::Quit),
-                        Action::ForceQuit => return Ok(Exit::Now),
-                        Action::Command(command) => {
-                            if !feed.command(command) {
-                                return Ok(Exit::Now);
-                            }
+            event = events.next() => {
+                let action = match event {
+                    Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {
+                        app.handle_key(key, &snapshot)
+                    }
+                    // Nothing to redraw for: no hover, no drag.
+                    Some(Ok(Event::Mouse(event)))
+                        if matches!(
+                            event.kind,
+                            MouseEventKind::Moved | MouseEventKind::Drag(_) | MouseEventKind::Up(_)
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Some(Ok(Event::Mouse(event))) => app.handle_mouse(event, &areas, &snapshot),
+                    Some(Ok(_)) => Action::None,
+                    Some(Err(e)) => return Err(e),
+                    // No more input: nothing left to wait for.
+                    None => return Ok(Exit::Now),
+                };
+                match action {
+                    Action::None => {}
+                    Action::Quit => return Ok(Exit::Quit),
+                    Action::ForceQuit => return Ok(Exit::Now),
+                    Action::Command(command) => {
+                        if !feed.command(command) {
+                            return Ok(Exit::Now);
                         }
                     }
                 }
-                Some(Ok(_)) => {}
-                Some(Err(e)) => return Err(e),
-                // No more input: nothing left to wait for.
-                None => return Ok(Exit::Now),
-            },
+                if app.mouse != mouse {
+                    mouse = app.mouse;
+                    capture_mouse(mouse)?;
+                }
+            }
             Ok(()) = finished.changed(), if !done => done = *finished.borrow(),
         }
         snapshot = feed.snapshot(app.selected, done);
@@ -154,7 +176,17 @@ pub async fn run(mut feed: impl Feed, mut finished: watch::Receiver<bool>) -> io
             app.rates.record(&snapshot, Instant::now());
         }
         app.apply_rates(&mut snapshot);
-        terminal.draw(|frame| view::draw(frame, &snapshot, &app))?;
+        terminal.draw(|frame| areas = view::draw(frame, &snapshot, &app))?;
+    }
+}
+
+/// Turns the terminal's reporting of mouse events on or off. While it is
+/// on, the terminal's own text selection needs Shift held in most of them.
+fn capture_mouse(on: bool) -> io::Result<()> {
+    if on {
+        execute!(io::stdout(), EnableMouseCapture)
+    } else {
+        execute!(io::stdout(), DisableMouseCapture)
     }
 }
 
@@ -166,11 +198,17 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 pub fn restore_terminal() {
     if ACTIVE.swap(false, Ordering::SeqCst) {
         let _ = terminal::disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, cursor::Show);
+        let _ = execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            cursor::Show
+        );
     }
 }
 
-/// Holds the terminal in raw mode on the alternate screen until dropped.
+/// Holds the terminal in raw mode on the alternate screen, with the mouse
+/// captured, until dropped.
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -180,7 +218,12 @@ impl TerminalGuard {
         ACTIVE.store(true, Ordering::SeqCst);
         // From here on a failure drops the guard, which restores.
         let guard = Self;
-        execute!(io::stdout(), EnterAlternateScreen, cursor::Hide)?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            cursor::Hide,
+            EnableMouseCapture
+        )?;
         Ok(guard)
     }
 }

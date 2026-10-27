@@ -2,10 +2,10 @@
 //! torrent's rates over the last half minute, or the cursor peer's while
 //! the panel has the focus.
 
-use super::{bar, bold, fit, human_rate, scroll_to, selected_style, sparkline};
+use super::{Rows, bar, bold, fit, human_rate, scroll_to, selected_style, sparkline};
 use crate::stats::PeerFlags;
 use crate::tui::app::{App, Focus};
-use crate::tui::snapshot::{Detail, TorrentSnapshot};
+use crate::tui::snapshot::{Detail, PeerSnapshot, TorrentSnapshot};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -49,6 +49,33 @@ pub fn flag_letters(flags: PeerFlags, inbound: bool) -> String {
     spaced.join(" ")
 }
 
+/// Lines of the tab's `area` under the table: the legend, and the two rate
+/// lines if there is room.
+fn footer(area: Rect) -> usize {
+    if area.height >= 8 { 4 } else { 1 }
+}
+
+/// Peer rows the table in the tab's `area` has room for, under its heading.
+fn table_rows(area: Rect) -> usize {
+    (area.height as usize)
+        .saturating_sub(footer(area))
+        .saturating_sub(1)
+}
+
+/// The first of `peers` shown in `rows` rows: scrolled to the cursor.
+fn first_row(peers: &[&PeerSnapshot], app: &App, rows: usize) -> usize {
+    let cursor = peers.iter().position(|peer| Some(peer.addr) == app.peer);
+    scroll_to(cursor.unwrap_or(0), 0, rows)
+}
+
+/// The peer rows shown in the tab's `area`.
+pub fn rows(detail: &Detail, app: &App, area: Rect) -> Rows {
+    let peers = detail.sorted_peers();
+    let rows = table_rows(area);
+    let first = first_row(&peers, app, rows);
+    Rows::under_heading(area, first, peers.len().saturating_sub(first).min(rows))
+}
+
 pub fn draw(
     frame: &mut Frame,
     torrent: &TorrentSnapshot,
@@ -61,8 +88,7 @@ pub fn draw(
         return;
     };
     let width = area.width as usize;
-    // Below: the legend, and the two rate lines if there is room.
-    let footer = if area.height >= 8 { 4 } else { 1 };
+    let footer = footer(area);
     let table_height = (area.height as usize).saturating_sub(footer);
     let mut client = width.saturating_sub(ADDRESS + FLAGS + 2 * RATE + HAS + 7);
     if client < MIN_CLIENT {
@@ -99,9 +125,9 @@ pub fn draw(
     let mut lines = vec![Line::from(heading)];
 
     let peers = detail.sorted_peers();
-    let rows = table_height.saturating_sub(1);
+    let rows = table_rows(area);
     let cursor = peers.iter().position(|peer| Some(peer.addr) == app.peer);
-    let offset = scroll_to(cursor.unwrap_or(0), 0, rows);
+    let offset = first_row(&peers, app, rows);
     // The cursor shows while the panel has the focus.
     let cursor = cursor.filter(|_| app.focus == Focus::Detail);
     let pieces = torrent.layout.as_ref().map_or(0, |layout| layout.pieces);

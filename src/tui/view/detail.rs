@@ -1,7 +1,7 @@
 //! The detail panel: the selected torrent's peers, pieces, trackers, files
 //! or info, one tab at a time.
 
-use super::{boxed, truncate};
+use super::{boxed, inner_of, truncate};
 use crate::tui::app::{App, Focus, Tab};
 use crate::tui::snapshot::{Detail, Snapshot, TorrentSnapshot};
 use ratatui::Frame;
@@ -9,15 +9,16 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use unicode_width::UnicodeWidthStr;
 
 pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
     let theme = app.theme;
     let mut tabs = vec![Span::raw(" ")];
     for (i, &tab) in Tab::ALL.iter().enumerate() {
         if i > 0 {
-            tabs.push(Span::styled(" ─ ", theme.border_style()));
+            tabs.push(Span::styled(TAB_GAP, theme.border_style()));
         }
-        let text = format!("{} {}", i + 1, tab.title());
+        let text = tab_title(i, tab);
         tabs.push(if tab == app.tab {
             Span::styled(
                 text,
@@ -60,9 +61,28 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
     draw_tab(frame, snapshot, torrent, detail, app, inner);
 }
 
-/// The area inside the box drawn in `area`.
-fn inner_of(area: Rect) -> Rect {
-    ratatui::widgets::Block::bordered().inner(area)
+/// Between two tab titles.
+const TAB_GAP: &str = " ─ ";
+
+/// The title of `tab`, the `index`th: `1 Peers`.
+fn tab_title(index: usize, tab: Tab) -> String {
+    format!("{} {}", index + 1, tab.title())
+}
+
+/// Where the tab titles are on the top border of the panel's box `area`.
+pub fn tabs(area: Rect) -> Vec<(Tab, Rect)> {
+    // After the corner and the space before the first title.
+    let mut x = area.x + 2;
+    let mut tabs = Vec::new();
+    for (i, &tab) in Tab::ALL.iter().enumerate() {
+        if i > 0 {
+            x += TAB_GAP.width() as u16;
+        }
+        let width = tab_title(i, tab).width() as u16;
+        tabs.push((tab, Rect::new(x, area.y, width, 1).intersection(area)));
+        x += width;
+    }
+    tabs
 }
 
 fn draw_tab(

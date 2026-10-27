@@ -4,7 +4,9 @@
 use super::Command;
 use super::snapshot::{Detail, Snapshot, TorrentSnapshot};
 use super::theme::Theme;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use super::view::Areas;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::{Position, Rect};
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -155,7 +157,7 @@ impl Input {
     }
 }
 
-/// What a key press asks of the caller.
+/// What a key press or a click asks of the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     None,
@@ -188,6 +190,9 @@ pub struct App {
     /// Set while something is being typed.
     pub input: Option<Input>,
     pub show_help: bool,
+    /// Whether the terminal reports the mouse to the UI, rather than
+    /// selecting text with it.
+    pub mouse: bool,
     /// Set once a stop was asked for.
     pub stopping: bool,
     pub rates: Rates,
@@ -209,6 +214,7 @@ impl App {
             filter: String::new(),
             input: None,
             show_help: false,
+            mouse: true,
             stopping: false,
             rates: Rates::default(),
         }
@@ -358,6 +364,25 @@ impl App {
         }
     }
 
+    /// Shows `tab`, scrolled to the top unless it shows already.
+    fn show_tab(&mut self, tab: Tab) {
+        if tab != self.tab {
+            self.tab = tab;
+            self.detail_scroll = 0;
+        }
+    }
+
+    /// Sorts the torrents by `sort`, or reverses the order if they are
+    /// already.
+    fn sort_by(&mut self, sort: Sort) {
+        if sort == self.sort {
+            self.reverse = !self.reverse;
+        } else {
+            self.sort = sort;
+            self.reverse = false;
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent, snapshot: &Snapshot) -> Action {
         let ctrl_c =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
@@ -392,14 +417,9 @@ impl App {
                     Focus::Detail => Focus::Torrents,
                 };
             }
-            KeyCode::Char(c @ '1'..='5') => {
-                let tab = Tab::ALL[c as usize - '1' as usize];
-                if tab != self.tab {
-                    self.tab = tab;
-                    self.detail_scroll = 0;
-                }
-            }
+            KeyCode::Char(c @ '1'..='5') => self.show_tab(Tab::ALL[c as usize - '1' as usize]),
             KeyCode::Char('l') => self.show_log = !self.show_log,
+            KeyCode::Char('m') => self.mouse = !self.mouse,
             KeyCode::Char('s') => self.sort = self.sort.next(),
             KeyCode::Char('S') => self.reverse = !self.reverse,
             KeyCode::Char('/') => {
@@ -419,6 +439,65 @@ impl App {
         }
         self.ensure_selection(snapshot);
         Action::None
+    }
+
+    /// A mouse event on the screen last drawn, laid out as `areas`. A left
+    /// click selects a torrent or a peer, sorts by a column or shows a tab;
+    /// the wheel moves the selection, the peer cursor or the scroll of the
+    /// box it is over, and focuses it. While help shows, a click closes it.
+    /// While the input line is open, the mouse does nothing, so the line
+    /// keeps what was typed.
+    pub fn handle_mouse(
+        &mut self,
+        event: MouseEvent,
+        areas: &Areas,
+        snapshot: &Snapshot,
+    ) -> Action {
+        if self.input.is_some() {
+            return Action::None;
+        }
+        let at = Position::new(event.column, event.row);
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) if self.show_help => self.show_help = false,
+            MouseEventKind::Down(MouseButton::Left) => self.click(at, areas, snapshot),
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if !self.show_help => {
+                let by = if event.kind == MouseEventKind::ScrollUp {
+                    -1
+                } else {
+                    1
+                };
+                if areas.torrents.contains(at) {
+                    self.focus = Focus::Torrents;
+                    self.move_selection(snapshot, by);
+                } else if areas.detail.contains(at) {
+                    self.focus = Focus::Detail;
+                    self.move_in_detail(snapshot, by);
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// A left click at `at`.
+    fn click(&mut self, at: Position, areas: &Areas, snapshot: &Snapshot) {
+        if let Some(row) = areas.torrent_rows.at(at) {
+            let hash = self
+                .visible(snapshot)
+                .get(row)
+                .map(|torrent| torrent.info_hash);
+            if hash.is_some() && hash != self.selected {
+                self.select(hash);
+            }
+            self.focus = Focus::Torrents;
+        } else if let Some(sort) = hit(&areas.headings, at) {
+            self.sort_by(sort);
+        } else if let Some(tab) = hit(&areas.tabs, at) {
+            self.show_tab(tab);
+        } else if let Some(row) = areas.peer_rows.at(at) {
+            self.select_peer(snapshot, row);
+            self.focus = Focus::Detail;
+        }
     }
 
     /// A key pressed while the input line is open: Enter submits, Esc
@@ -492,6 +571,14 @@ impl App {
             Action::Command(Command::Stop)
         }
     }
+}
+
+/// What is under `at`, of `areas` and what each is for.
+fn hit<T: Copy>(areas: &[(T, Rect)], at: Position) -> Option<T> {
+    areas
+        .iter()
+        .find(|(_, area)| area.contains(at))
+        .map(|&(what, _)| what)
 }
 
 /// Byte counters seen at one tick.

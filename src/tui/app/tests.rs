@@ -386,3 +386,188 @@ fn enter_sends_the_new_limit_with_the_other_unchanged() {
         Action::Command(Command::SetRateLimits(2048, 0))
     );
 }
+
+#[test]
+fn m_turns_the_mouse_off_and_on() {
+    let snapshot = snapshot(&["a"]);
+    let mut app = App::new(Theme::default());
+    assert!(app.mouse);
+    app.handle_key(key(KeyCode::Char('m')), &snapshot);
+    assert!(!app.mouse);
+    app.handle_key(key(KeyCode::Char('m')), &snapshot);
+    assert!(app.mouse);
+}
+
+/// A screen with torrents "a" to "c" in rows 3 to 5, the Name and Size
+/// headings above them, and under them the detail panel with its Peers
+/// and Files tabs, and peer rows 1 and 2 at lines 9 and 10.
+fn clickable() -> (Snapshot, App, Areas) {
+    use crate::tui::view::Rows;
+    let mut snapshot = snapshot(&["a", "b", "c"]);
+    snapshot.detail = Some(Detail {
+        info_hash: [0; 20],
+        peers: (1..=5).map(|port| peer(port, port.into())).collect(),
+        ..Detail::default()
+    });
+    let mut app = App::new(Theme::default());
+    app.ensure_selection(&snapshot);
+    let row = |y| Rect::new(1, y, 38, 1);
+    let areas = Areas {
+        torrents: Rect::new(0, 1, 40, 6),
+        headings: vec![
+            (Sort::Name, Rect::new(2, 2, 10, 1)),
+            (Sort::Size, Rect::new(13, 2, 5, 1)),
+        ],
+        torrent_rows: Rows {
+            first: 0,
+            rects: vec![row(3), row(4), row(5)],
+        },
+        detail: Rect::new(0, 7, 40, 10),
+        tabs: vec![
+            (Tab::Peers, Rect::new(2, 7, 7, 1)),
+            (Tab::Files, Rect::new(12, 7, 7, 1)),
+        ],
+        peer_rows: Rows {
+            first: 1,
+            rects: vec![row(9), row(10)],
+        },
+        ..Areas::default()
+    };
+    (snapshot, app, areas)
+}
+
+fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn click(column: u16, row: u16) -> MouseEvent {
+    mouse(MouseEventKind::Down(MouseButton::Left), column, row)
+}
+
+#[test]
+fn a_click_on_a_torrent_selects_it_and_focuses_the_table() {
+    let (snapshot, mut app, areas) = clickable();
+    app.focus = Focus::Detail;
+    assert_eq!(
+        app.handle_mouse(click(20, 5), &areas, &snapshot),
+        Action::None
+    );
+    assert_eq!((app.selected, app.focus), (Some([2; 20]), Focus::Torrents));
+    // The border and the heading are not rows.
+    app.handle_mouse(click(0, 4), &areas, &snapshot);
+    app.handle_mouse(click(25, 2), &areas, &snapshot);
+    assert_eq!(app.selected, Some([2; 20]));
+    // Nor does a right click or a release select.
+    app.handle_mouse(
+        mouse(MouseEventKind::Down(MouseButton::Right), 20, 3),
+        &areas,
+        &snapshot,
+    );
+    app.handle_mouse(
+        mouse(MouseEventKind::Up(MouseButton::Left), 20, 3),
+        &areas,
+        &snapshot,
+    );
+    assert_eq!(app.selected, Some([2; 20]));
+}
+
+#[test]
+fn a_click_on_a_heading_sorts_and_a_second_reverses() {
+    let (snapshot, mut app, areas) = clickable();
+    app.handle_mouse(click(14, 2), &areas, &snapshot);
+    assert_eq!((app.sort, app.reverse), (Sort::Size, false));
+    app.handle_mouse(click(17, 2), &areas, &snapshot);
+    assert_eq!((app.sort, app.reverse), (Sort::Size, true));
+    // Another column sorts it the right way round again.
+    app.handle_mouse(click(2, 2), &areas, &snapshot);
+    assert_eq!((app.sort, app.reverse), (Sort::Name, false));
+    // Between headings is nothing.
+    app.handle_mouse(click(12, 2), &areas, &snapshot);
+    assert_eq!((app.sort, app.reverse), (Sort::Name, false));
+}
+
+#[test]
+fn a_click_on_a_tab_title_shows_it() {
+    let (snapshot, mut app, areas) = clickable();
+    app.tab = Tab::Peers;
+    app.detail_scroll = 3;
+    app.handle_mouse(click(18, 7), &areas, &snapshot);
+    assert_eq!((app.tab, app.detail_scroll), (Tab::Files, 0));
+    app.handle_mouse(click(30, 7), &areas, &snapshot);
+    assert_eq!(app.tab, Tab::Files);
+    app.handle_mouse(click(2, 7), &areas, &snapshot);
+    assert_eq!(app.tab, Tab::Peers);
+}
+
+#[test]
+fn a_click_on_a_peer_moves_the_cursor_and_focuses_the_panel() {
+    let (snapshot, mut app, areas) = clickable();
+    // The rows shown start at the second peer, the second fastest.
+    app.handle_mouse(click(5, 10), &areas, &snapshot);
+    assert_eq!((app.peer, app.focus), (Some(addr(3)), Focus::Detail));
+    app.handle_mouse(click(5, 9), &areas, &snapshot);
+    assert_eq!(app.peer, Some(addr(4)));
+    // Under the rows shown is nothing.
+    app.handle_mouse(click(5, 11), &areas, &snapshot);
+    assert_eq!(app.peer, Some(addr(4)));
+}
+
+#[test]
+fn a_click_anywhere_closes_the_help_and_does_nothing_else() {
+    let (snapshot, mut app, areas) = clickable();
+    app.show_help = true;
+    app.handle_mouse(click(20, 5), &areas, &snapshot);
+    assert!(!app.show_help);
+    assert_eq!(app.selected, Some([0; 20]));
+    app.show_help = true;
+    app.handle_mouse(click(70, 30), &areas, &snapshot);
+    assert!(!app.show_help);
+}
+
+#[test]
+fn the_wheel_moves_in_the_box_under_it() {
+    let (snapshot, mut app, areas) = clickable();
+    let wheel = |down: bool, row| {
+        let kind = if down {
+            MouseEventKind::ScrollDown
+        } else {
+            MouseEventKind::ScrollUp
+        };
+        mouse(kind, 20, row)
+    };
+    app.handle_mouse(wheel(true, 1), &areas, &snapshot);
+    app.handle_mouse(wheel(true, 4), &areas, &snapshot);
+    assert_eq!((app.selected, app.focus), (Some([2; 20]), Focus::Torrents));
+    app.handle_mouse(wheel(false, 3), &areas, &snapshot);
+    assert_eq!(app.selected, Some([1; 20]));
+
+    // Over the Peers tab, the cursor, from the fastest peer.
+    let (snapshot, mut app, areas) = clickable();
+    app.ensure_peer(&snapshot);
+    app.handle_mouse(wheel(true, 12), &areas, &snapshot);
+    assert_eq!((app.peer, app.focus), (Some(addr(4)), Focus::Detail));
+    app.handle_mouse(wheel(false, 7), &areas, &snapshot);
+    assert_eq!(app.peer, Some(addr(5)));
+    // Over another tab, the scroll.
+    app.tab = Tab::Trackers;
+    app.handle_mouse(wheel(true, 12), &areas, &snapshot);
+    assert_eq!(app.detail_scroll, 1);
+    // Elsewhere, nothing.
+    app.handle_mouse(wheel(true, 30), &areas, &snapshot);
+    assert_eq!(app.detail_scroll, 1);
+}
+
+#[test]
+fn the_mouse_leaves_the_input_line_alone() {
+    let (snapshot, mut app, areas) = clickable();
+    app.handle_key(key(KeyCode::Char('d')), &snapshot);
+    app.handle_mouse(click(20, 5), &areas, &snapshot);
+    app.handle_mouse(mouse(MouseEventKind::ScrollDown, 20, 4), &areas, &snapshot);
+    assert_eq!(app.selected, Some([0; 20]));
+    assert_eq!(app.input.as_ref().unwrap().text, "0");
+}

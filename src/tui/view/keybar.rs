@@ -22,7 +22,7 @@ const KEYS: &[(&str, &str)] = &[
 ];
 
 /// Keys shown after them where there is room.
-const MORE_KEYS: &[(&str, &str)] = &[("d u", "limits")];
+const MORE_KEYS: &[(&str, &str)] = &[("d u", "limits"), ("m", "mouse")];
 
 pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
     let theme = app.theme;
@@ -39,12 +39,15 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
     } else {
         let mut spans = vec![Span::raw(" ")];
         spans.extend(keys(theme, KEYS));
-        let more: Vec<Span> = [Span::raw("  ")]
-            .into_iter()
-            .chain(keys(theme, MORE_KEYS))
-            .collect();
         let width = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>();
-        if width(&spans) + width(&more) <= area.width as usize {
+        for pair in MORE_KEYS {
+            let more: Vec<Span> = [Span::raw("  ")]
+                .into_iter()
+                .chain(keys(theme, std::slice::from_ref(pair)))
+                .collect();
+            if width(&spans) + width(&more) > area.width as usize {
+                break;
+            }
             spans.extend(more);
         }
         if app.stopping {

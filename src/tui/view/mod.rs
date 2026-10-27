@@ -14,11 +14,11 @@ mod prompt;
 mod torrents;
 mod trackers;
 
-use super::app::App;
+use super::app::{App, Sort, Tab};
 use super::snapshot::Snapshot;
 use super::theme::Theme;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
@@ -34,13 +34,62 @@ const MAX_TORRENT_ROWS: u16 = 10;
 /// show.
 const MIN_DETAIL: u16 = 7;
 
-/// Draws the whole screen.
-pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App) {
-    let area = frame.area();
-    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
-        let note = Paragraph::new("terminal too small").style(app.theme.dim_style());
-        frame.render_widget(note, area);
-        return;
+/// Where `draw` puts each part of the screen, for telling what a click
+/// hit. Empty on a screen too small to draw.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Areas {
+    pub header: Rect,
+    /// The torrent table's box.
+    pub torrents: Rect,
+    /// The column headings that sort the table, each as wide as its column.
+    pub headings: Vec<(Sort, Rect)>,
+    pub torrent_rows: Rows,
+    /// The detail panel's box.
+    pub detail: Rect,
+    /// The tab titles on its top border.
+    pub tabs: Vec<(Tab, Rect)>,
+    /// The Peers tab's rows, while it shows.
+    pub peer_rows: Rows,
+    pub log: Option<Rect>,
+    pub keybar: Rect,
+}
+
+/// The rows of a table shown on screen: `rects[i]` is row `first + i`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Rows {
+    pub first: usize,
+    pub rects: Vec<Rect>,
+}
+
+impl Rows {
+    /// `shown` rows from row `first`, one a line, under the heading on the
+    /// top line of `area`.
+    fn under_heading(area: Rect, first: usize, shown: usize) -> Self {
+        let rects = (0..shown)
+            .map(|i| Rect {
+                y: area.y + 1 + i as u16,
+                height: 1,
+                ..area
+            })
+            .collect();
+        Self { first, rects }
+    }
+
+    /// The row of the table at `at`, if one is shown there.
+    pub fn at(&self, at: Position) -> Option<usize> {
+        let i = self.rects.iter().position(|rect| rect.contains(at))?;
+        Some(self.first + i)
+    }
+}
+
+fn too_small(area: Rect) -> bool {
+    area.width < MIN_WIDTH || area.height < MIN_HEIGHT
+}
+
+/// Where everything goes on a screen `area`.
+pub fn layout(area: Rect, snapshot: &Snapshot, app: &App) -> Areas {
+    if too_small(area) {
+        return Areas::default();
     }
     let rows = app.visible(snapshot).len() as u16;
     // Rows, heading and borders, leaving the detail panel at least half.
@@ -59,19 +108,55 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App) {
         Constraint::Length(1),
     ])
     .areas(area);
-    header::draw(frame, snapshot, app, header);
-    torrents::draw(frame, snapshot, app, torrents_area);
-    detail::draw(frame, snapshot, app, detail_area);
-    if log > 0 {
-        log::draw(frame, snapshot, app, log_area);
+    // The Peers tab shows rows once the selected torrent's insides are in.
+    let peer_rows = snapshot
+        .detail
+        .as_ref()
+        .filter(|detail| app.tab == Tab::Peers && Some(detail.info_hash) == app.selected)
+        .filter(|detail| snapshot.torrent(detail.info_hash).is_some())
+        .map(|detail| peers::rows(detail, app, inner_of(detail_area)))
+        .unwrap_or_default();
+    Areas {
+        header,
+        torrents: torrents_area,
+        headings: torrents::headings(torrents_area, area.width),
+        torrent_rows: torrents::rows(snapshot, app, torrents_area),
+        detail: detail_area,
+        tabs: detail::tabs(detail_area),
+        peer_rows,
+        log: (log > 0).then_some(log_area),
+        keybar,
     }
-    keybar::draw(frame, snapshot, app, keybar);
+}
+
+/// Draws the whole screen, and says where everything went.
+pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App) -> Areas {
+    let area = frame.area();
+    if too_small(area) {
+        let note = Paragraph::new("terminal too small").style(app.theme.dim_style());
+        frame.render_widget(note, area);
+        return Areas::default();
+    }
+    let areas = layout(area, snapshot, app);
+    header::draw(frame, snapshot, app, areas.header);
+    torrents::draw(frame, snapshot, app, areas.torrents);
+    detail::draw(frame, snapshot, app, areas.detail);
+    if let Some(log) = areas.log {
+        log::draw(frame, snapshot, app, log);
+    }
+    keybar::draw(frame, snapshot, app, areas.keybar);
     if let Some(input) = &app.input {
-        prompt::draw(frame, app, input, keybar);
+        prompt::draw(frame, app, input, areas.keybar);
     }
     if app.show_help {
         help::draw(frame, app, area);
     }
+    areas
+}
+
+/// The area inside the box drawn in `area`.
+fn inner_of(area: Rect) -> Rect {
+    Block::bordered().inner(area)
 }
 
 /// A rounded box in the border color, titled `title` in bold, with `hint`
