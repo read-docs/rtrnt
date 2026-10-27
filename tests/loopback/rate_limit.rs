@@ -154,3 +154,71 @@ async fn upload_rate_limit_paces_the_blocks_we_send() {
         "{total} bytes in {elapsed:?} at {TEST_RATE_KIB} KiB/s"
     );
 }
+
+/// A download limit raised partway through takes effect at once: a worker
+/// waiting for its turn at the old limit is woken, rather than sleeping
+/// until the turn the old limit gave it.
+#[tokio::test]
+async fn a_raised_download_limit_takes_effect_at_once() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seeder = tokio::spawn(counting_seeder(
+        listener,
+        Arc::clone(&data),
+        info_hash,
+        num_pieces,
+    ));
+
+    // At 2 KiB/s the burst is one block, and the next block's turn comes
+    // 8 s later; the whole torrent would take over half a minute.
+    let out = tempfile::tempdir().unwrap();
+    let limits = RateLimits::from_kib(2, 0);
+    let session = limited_session(
+        torrent,
+        info_hash,
+        out.path(),
+        SeedLimits::default(),
+        limits,
+    );
+    let rate_limits = Arc::clone(&session.rate_limits);
+    let raise_after = Duration::from_millis(500);
+    tokio::spawn(async move {
+        tokio::time::sleep(raise_after).await;
+        rate_limits.set(10 * 1024, 0);
+    });
+    let start = std::time::Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        download_from_peers(
+            session,
+            &vec![false; num_pieces],
+            &[addr],
+            10,
+            Vec::new(),
+            None,
+            pending(),
+        ),
+    )
+    .await
+    .expect("download timed out")
+    .expect("download failed");
+    let elapsed = start.elapsed();
+    assert_files_match(out.path(), &data);
+
+    // Held back until the limit was raised, then done long before the
+    // 8 s the old limit would have kept it waiting.
+    assert!(
+        elapsed >= raise_after,
+        "done in {elapsed:?}, before the raise"
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "done in {elapsed:?} after the raise at {raise_after:?}"
+    );
+    seeder.await.unwrap();
+}

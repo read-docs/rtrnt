@@ -55,16 +55,16 @@ impl Client {
                 "rate limits in KiB/s (0: unlimited)"
             );
         }
-        let rate_limits = RateLimits::from_kib(config.max_download_rate, config.max_upload_rate);
+        let rate_limits = Arc::new(RateLimits::from_kib(
+            config.max_download_rate,
+            config.max_upload_rate,
+        ));
         let slots = ConnectionSlots::new(config.max_connections);
-        let stats = SessionStats::new(
-            (config.max_download_rate, config.max_upload_rate),
-            slots.clone(),
-        );
+        let stats = SessionStats::new(Arc::clone(&rate_limits), slots.clone());
         Self {
             config,
             peer_id: peer::generate_peer_id(),
-            rate_limits: Arc::new(rate_limits),
+            rate_limits,
             slots,
             hashing: Semaphore::new(1),
             bars,
@@ -94,6 +94,14 @@ impl Client {
     /// torrent.
     pub fn rate_limits(&self) -> Arc<RateLimits> {
         Arc::clone(&self.rate_limits)
+    }
+
+    /// Changes the rate limits to `download` and `upload` KiB/s (0:
+    /// unlimited) for every torrent, at once. `config` keeps the limits the
+    /// session started with, and the config file is left as it is.
+    pub fn set_rate_limits(&self, download: u64, upload: u64) {
+        info!(download, upload, "rate limits in KiB/s (0: unlimited)");
+        self.rate_limits.set(download, upload);
     }
 
     /// The peer connections left to open, across every torrent.

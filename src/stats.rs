@@ -7,6 +7,7 @@
 
 use crate::client::ConnectionSlots;
 use crate::dht::Dht;
+use crate::rate_limit::RateLimits;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
@@ -26,15 +27,14 @@ pub struct SessionStats {
     dht: OnceLock<Dht>,
     /// Set once the listening port is open.
     port: OnceLock<Option<u16>>,
-    /// Download and upload limits in KiB/s, 0 for none.
-    rate_limits: (u64, u64),
+    rate_limits: Arc<RateLimits>,
     slots: ConnectionSlots,
 }
 
 impl SessionStats {
-    /// Stats for a session with the rate limits `rate_limits` (KiB/s each
-    /// way) whose connections hold `slots`.
-    pub fn new(rate_limits: (u64, u64), slots: ConnectionSlots) -> Self {
+    /// Stats for a session with the rate limits `rate_limits` whose
+    /// connections hold `slots`.
+    pub fn new(rate_limits: Arc<RateLimits>, slots: ConnectionSlots) -> Self {
         Self {
             torrents: Mutex::new(Vec::new()),
             dht: OnceLock::new(),
@@ -80,9 +80,9 @@ impl SessionStats {
         self.port.get().copied().flatten()
     }
 
-    /// Download and upload limits in KiB/s, 0 for none.
+    /// Download and upload limits in KiB/s, 0 for none, as they are now.
     pub fn rate_limits(&self) -> (u64, u64) {
-        self.rate_limits
+        self.rate_limits.kib()
     }
 
     /// Peer connections open now, across every torrent.

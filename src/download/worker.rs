@@ -150,6 +150,16 @@ pub(super) async fn peer_worker(
         // queue from here on still wakes the idle wait below.
         let mut changed = std::pin::pin!(queue.changed.notified());
         changed.as_mut().enable();
+        // Likewise for a change of either rate limit, after which our turn
+        // is worked out again at the new rate.
+        let download_changed = session.rate_limits.download.changed();
+        let upload_changed = session.rate_limits.upload.changed();
+        let mut limits_changed = std::pin::pin!(async move {
+            tokio::select! {
+                () = download_changed => {}
+                () = upload_changed => {}
+            }
+        });
 
         drop_completed(&mut conn, &mut active, fast.then_some(&mut cancelled)).await?;
         announce_pieces(&mut conn, queue, &mut announced).await?;
@@ -250,8 +260,8 @@ pub(super) async fn peer_worker(
             .filter(|budget| budget.is_waiting(waiting_since))
             .filter_map(|budget| budget.ready_at())
             .min();
-        // Set if the wait below ends because our turn came, rather than
-        // because nothing was left to read.
+        // Set if the wait below ends because our turn came, or a limit
+        // changed, rather than because nothing was left to read.
         let mut turn_came = false;
 
         // `receive` and `receive_untimed` are cancel-safe, so losing a race
@@ -283,6 +293,10 @@ pub(super) async fn peer_worker(
                     turn_came = true;
                     None
                 }
+                () = &mut limits_changed => {
+                    turn_came = true;
+                    None
+                }
             }
         } else {
             conn.keep_alive().await?;
@@ -308,6 +322,10 @@ pub(super) async fn peer_worker(
                 () = queue.wait_for(woken) => None,
                 () = slot.changed() => None,
                 () = sleep_until_some(next_turn) => {
+                    turn_came = true;
+                    None
+                }
+                () = &mut limits_changed => {
                     turn_came = true;
                     None
                 }

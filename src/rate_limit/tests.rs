@@ -1,4 +1,5 @@
 use super::*;
+use crate::download::sleep_until_some;
 use std::sync::Arc;
 
 const BLOCK: u64 = 16 * 1024;
@@ -30,19 +31,28 @@ async fn unlimited_never_waits() {
 fn limits_are_in_kib() {
     let limits = RateLimits::from_kib(0, 64);
     assert!(!limits.download.is_limited());
-    let bucket = limits.upload.bucket.as_ref().unwrap();
-    assert_eq!(bucket.rate, 64 * 1024);
+    assert_eq!(limits.upload.rate(), 64 * 1024);
+    assert_eq!(limits.kib(), (0, 64));
+    limits.set(128, 0);
+    assert_eq!(limits.download.rate(), 128 * 1024);
+    assert!(!limits.upload.is_limited());
+    assert_eq!(limits.kib(), (128, 0));
     // Absurd limits saturate instead of overflowing.
     let limits = RateLimits::from_kib(u64::MAX, 1);
-    assert_eq!(limits.download.bucket.as_ref().unwrap().rate, u64::MAX);
+    assert_eq!(limits.download.rate(), u64::MAX);
 }
 
 #[test]
 fn burst_is_a_quarter_second_and_at_least_a_block() {
+    let now = Instant::now();
     // 100 KiB/s: a quarter second is 25 KiB, more than a block.
-    assert_eq!(Bucket::new(RATE).burst, BURST_TIME);
+    assert_eq!(Bucket::new(RATE, now).burst, BURST_TIME);
     // 16 KiB/s: a block is a whole second.
-    assert_eq!(Bucket::new(BLOCK).burst, Duration::from_secs(1));
+    assert_eq!(Bucket::new(BLOCK, now).burst, Duration::from_secs(1));
+    // A new rate gets its own burst.
+    let limiter = RateLimiter::new(RATE);
+    limiter.set_rate(BLOCK);
+    assert_eq!(limiter.lock().burst, Duration::from_secs(1));
 }
 
 #[tokio::test(start_paused = true)]
@@ -180,4 +190,130 @@ async fn a_reservation_covers_a_different_size() {
     // `ready`, which leaves 12 KiB: a block needs 4 KiB more, 40 ms.
     assert!(!other.try_take(BLOCK, ready));
     assert_eq!(other.ready_at().unwrap() - ready, Duration::from_millis(40));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_new_rate_changes_the_next_wait() {
+    let limiter = RateLimiter::new(RATE);
+    let now = Instant::now();
+    // At 100 KiB/s, `a` takes the burst and reserves a block more: the
+    // bucket is 320 ms from full.
+    let mut a = limiter.allowance();
+    assert!(a.try_take(BLOCK, now));
+    assert!(!a.try_take(BLOCK, now));
+    // At 16 KiB/s the burst is a second, of which 320 ms are used: the
+    // 680 ms left are not a block, so the next one waits 320 ms (at the old
+    // rate it would have been 230 ms).
+    limiter.set_rate(BLOCK);
+    let mut b = limiter.allowance();
+    assert!(!b.try_take(BLOCK, now));
+    assert_eq!(b.ready_at().unwrap() - now, Duration::from_millis(320));
+    // At 1000 KiB/s the debt of 1.32 s is cut to the new burst, a quarter
+    // second, so it does not stall the new rate: a block waits 16 ms.
+    limiter.set_rate(10 * RATE);
+    let mut c = limiter.allowance();
+    assert!(!c.try_take(BLOCK, now));
+    assert_eq!(c.ready_at().unwrap() - now, Duration::from_millis(16));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reservation_from_before_a_change_is_made_again() {
+    let limiter = RateLimiter::new(BLOCK);
+    let mut allowance = limiter.allowance();
+    let start = Instant::now();
+    // At 16 KiB/s, the second block waits a second.
+    assert!(allowance.try_take(BLOCK, start));
+    assert!(!allowance.try_take(BLOCK, start));
+    assert_eq!(allowance.ready_at(), Some(start + Duration::from_secs(1)));
+    // Ten times as fast, the old reservation no longer counts...
+    limiter.set_rate(10 * BLOCK);
+    assert_eq!(allowance.ready_at(), None);
+    assert!(!allowance.is_waiting(start));
+    // ...and the block is reserved again: behind the debt, cut to one
+    // burst, it waits 100 ms.
+    assert!(!allowance.try_take(BLOCK, start));
+    assert_eq!(
+        allowance.ready_at(),
+        Some(start + Duration::from_millis(100))
+    );
+    // Slower again, the reservation is made again at the slow rate, with
+    // the 350 ms of debt still there.
+    limiter.set_rate(BLOCK);
+    assert!(!allowance.try_take(BLOCK, start));
+    assert_eq!(
+        allowance.ready_at(),
+        Some(start + Duration::from_millis(350))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn limited_unlimited_and_limited_again() {
+    let limiter = RateLimiter::new(RATE);
+    let mut allowance = limiter.allowance();
+    let now = Instant::now();
+    assert!(allowance.try_take(BLOCK, now));
+    assert!(!allowance.try_take(BLOCK, now));
+    // Without a limit, the waiting block goes at once, and so does
+    // everything after it.
+    limiter.set_rate(0);
+    assert!(!limiter.is_limited());
+    assert_eq!(allowance.ready_at(), None);
+    for _ in 0..1000 {
+        assert!(allowance.try_take(BLOCK, now));
+    }
+    assert_eq!(allowance.ready_at(), None);
+    // Limited again, the bytes taken meanwhile cost nothing: a full burst
+    // is there.
+    limiter.set_rate(RATE);
+    assert!(limiter.is_limited());
+    assert!(allowance.try_take(BLOCK, now));
+    assert!(!allowance.try_take(BLOCK, now));
+    assert_eq!(
+        allowance.ready_at().unwrap() - now,
+        Duration::from_millis(70)
+    );
+    // A reservation from before a change is not given back on release, as
+    // the change reset the bucket: with the debt cut to the burst, the
+    // next block waits 160 ms, not none.
+    limiter.set_rate(RATE);
+    allowance.release();
+    let mut other = limiter.allowance();
+    assert!(!other.try_take(BLOCK, now));
+    assert_eq!(other.ready_at().unwrap() - now, Duration::from_millis(160));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_change_wakes_the_waiters() {
+    let limiter = Arc::new(RateLimiter::new(BLOCK));
+    // A peer waiting for its turn, a second away at 16 KiB/s.
+    let waiter = {
+        let limiter = Arc::clone(&limiter);
+        tokio::spawn(async move {
+            let mut allowance = limiter.allowance();
+            let start = Instant::now();
+            assert!(allowance.try_take(BLOCK, start));
+            loop {
+                let changed = limiter.changed();
+                if allowance.try_take(BLOCK, Instant::now()) {
+                    return start.elapsed();
+                }
+                tokio::select! {
+                    () = changed => {}
+                    () = sleep_until_some(allowance.ready_at()) => {}
+                }
+            }
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!waiter.is_finished());
+    // Raised to 1600 KiB/s, it wakes and reserves again, and its block
+    // goes one block's time (10 ms) later rather than at 1 s.
+    limiter.set_rate(100 * BLOCK);
+    assert_eq!(waiter.await.unwrap(), Duration::from_millis(110));
+    // A future made before a change resolves even if not polled before it.
+    let changed = limiter.changed();
+    limiter.set_rate(BLOCK);
+    tokio::time::timeout(Duration::from_secs(1), changed)
+        .await
+        .expect("not woken");
 }
