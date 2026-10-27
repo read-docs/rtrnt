@@ -32,10 +32,18 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
     tabs.push(Span::raw(" "));
     let torrent = app.selected.and_then(|hash| snapshot.torrent(hash));
     let tabs_width: usize = tabs.iter().map(Span::width).sum();
-    let hint = torrent.map(|torrent| {
-        let room = (area.width as usize).saturating_sub(tabs_width + 8);
-        truncate(&torrent.name, room)
+    let detail = torrent.and_then(|torrent| {
+        snapshot
+            .detail
+            .as_ref()
+            .filter(|detail| detail.info_hash == torrent.info_hash)
     });
+    let room = (area.width as usize).saturating_sub(tabs_width + 8);
+    let hint = match app.tab {
+        Tab::Pieces => super::pieces::hint(detail, inner_of(area)),
+        _ => torrent.map(|torrent| torrent.name.clone()),
+    }
+    .map(|hint| truncate(&hint, room));
     let block = boxed(
         theme,
         Line::from(tabs),
@@ -49,11 +57,12 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(note), inner);
         return;
     };
-    let detail = snapshot
-        .detail
-        .as_ref()
-        .filter(|detail| detail.info_hash == torrent.info_hash);
     draw_tab(frame, torrent, detail, app, inner);
+}
+
+/// The area inside the box drawn in `area`.
+fn inner_of(area: Rect) -> Rect {
+    ratatui::widgets::Block::bordered().inner(area)
 }
 
 fn draw_tab(
@@ -65,6 +74,7 @@ fn draw_tab(
 ) {
     match app.tab {
         Tab::Peers => super::peers::draw(frame, torrent, detail, app, area),
+        Tab::Pieces => super::pieces::draw(frame, torrent, detail, app, area),
         _ => {
             let note = Span::styled(" nothing to show yet", app.theme.dim_style());
             frame.render_widget(Paragraph::new(note), area);

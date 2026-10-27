@@ -5,6 +5,7 @@ mod detail;
 mod header;
 mod keybar;
 mod peers;
+mod pieces;
 mod torrents;
 
 use super::app::App;
@@ -400,6 +401,56 @@ mod screen_tests {
         // Scrolled as far as the rows go, and no further.
         assert!(lines[11].starts_with("│ 91.121.44.7:6881"), "{}", lines[11]);
         assert!(lines[18].starts_with("│ 3-9 of 9 peers"), "{}", lines[18]);
+    }
+
+    #[test]
+    fn pieces_tab_maps_a_known_bitfield() {
+        let mut snapshot = demo::fixture();
+        let detail = snapshot.detail.as_mut().unwrap();
+        // 10 had, one in flight, one rare, one missing, one had.
+        let mut have = vec![true; 10];
+        have.extend([false, false, false, true]);
+        let mut in_flight = vec![false; 14];
+        in_flight[10] = true;
+        let mut availability = vec![9; 14];
+        availability[11] = 1;
+        detail.pieces = Some(crate::stats::PieceSnapshot {
+            have,
+            in_flight,
+            availability,
+        });
+        let mut app = app(&snapshot);
+        app.tab = crate::tui::app::Tab::Pieces;
+        let buffer = render(100, 32, &snapshot, &app);
+        let lines = text(&buffer, buffer.area);
+        assert!(lines[9].ends_with(" 1 cell ≈ 1 pieces ╮"), "{}", lines[9]);
+        assert!(lines[10].starts_with("│ ██████████▓░░█ "), "{}", lines[10]);
+        let theme = Theme::default();
+        let fg = |x| buffer[(x, 10)].fg;
+        assert_eq!(fg(2), theme.up());
+        assert_eq!(fg(12), theme.warn());
+        assert_eq!(fg(13), theme.error());
+        assert_eq!(fg(14), theme.dim());
+        assert!(
+            lines[27].starts_with(
+                "│ █ have   ▒ partial   ▓ downloading   ░ missing   ░ rare (<4 peers)"
+            )
+        );
+        assert!(
+            lines[28].starts_with(
+                "│ seeds 9  peers 0  pool 418  copies 1.9  rarest piece 1 peers  pieces 11/14"
+            ),
+            "{}",
+            lines[28]
+        );
+        assert!(
+            lines[29].starts_with("│ sources ■ tracker 212  ■ dht 118  ■ pex 70  ■ incoming 12")
+        );
+
+        // A big torrent shares cells.
+        let snapshot = demo::fixture();
+        let buffer = render(100, 32, &snapshot, &app);
+        assert!(text(&buffer, buffer.area)[9].ends_with(" 1 cell ≈ 2 pieces ╮"));
     }
 
     #[test]
