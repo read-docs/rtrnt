@@ -211,8 +211,24 @@ impl App {
         }
     }
 
-    fn scroll_detail(&mut self, by: isize) {
-        self.detail_scroll = self.detail_scroll.saturating_add_signed(by);
+    /// Scrolls the detail panel `by` rows, no further than its last row.
+    fn scroll_detail(&mut self, snapshot: &Snapshot, by: isize) {
+        let detail = snapshot.detail.as_ref();
+        let rows = match self.tab {
+            Tab::Peers => detail.map_or(0, |detail| detail.peers.len()),
+            // The DHT, PeX and incoming rows, after a blank one.
+            Tab::Trackers => detail.map_or(0, |detail| detail.trackers.len() + 4),
+            Tab::Files => self
+                .selected
+                .and_then(|hash| snapshot.torrent(hash))
+                .and_then(|torrent| torrent.layout.as_ref())
+                .map_or(0, |layout| layout.files.len()),
+            Tab::Pieces | Tab::Info => 0,
+        };
+        self.detail_scroll = self
+            .detail_scroll
+            .saturating_add_signed(by)
+            .min(rows.saturating_sub(1));
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, snapshot: &Snapshot) -> Action {
@@ -246,14 +262,14 @@ impl App {
             KeyCode::Char('q') => return self.quit(snapshot),
             KeyCode::Up | KeyCode::Char('k') => match self.focus {
                 Focus::Torrents => self.move_selection(snapshot, -1),
-                Focus::Detail => self.scroll_detail(-1),
+                Focus::Detail => self.scroll_detail(snapshot, -1),
             },
             KeyCode::Down | KeyCode::Char('j') => match self.focus {
                 Focus::Torrents => self.move_selection(snapshot, 1),
-                Focus::Detail => self.scroll_detail(1),
+                Focus::Detail => self.scroll_detail(snapshot, 1),
             },
-            KeyCode::PageUp => self.scroll_detail(-PAGE),
-            KeyCode::PageDown => self.scroll_detail(PAGE),
+            KeyCode::PageUp => self.scroll_detail(snapshot, -PAGE),
+            KeyCode::PageDown => self.scroll_detail(snapshot, PAGE),
             KeyCode::Tab | KeyCode::BackTab => {
                 self.focus = match self.focus {
                     Focus::Torrents => Focus::Detail,
@@ -494,7 +510,23 @@ mod tests {
 
     #[test]
     fn selection_moves_within_the_table() {
-        let snapshot = snapshot(&["a", "b", "c"]);
+        let mut snapshot = snapshot(&["a", "b", "c"]);
+        let peer = |port| crate::tui::snapshot::PeerSnapshot {
+            addr: SocketAddr::from(([127, 0, 0, 1], port)),
+            inbound: false,
+            client: None,
+            flags: crate::stats::PeerFlags::initial(),
+            downloaded: 0,
+            uploaded: 0,
+            pieces: 0,
+            rate_down: 0.0,
+            rate_up: 0.0,
+        };
+        snapshot.detail = Some(Detail {
+            info_hash: [2; 20],
+            peers: vec![peer(1), peer(2), peer(3)],
+            ..Detail::default()
+        });
         let mut app = App::new(Theme::default());
         app.ensure_selection(&snapshot);
         assert_eq!(app.selected, Some([0; 20]));
@@ -510,6 +542,12 @@ mod tests {
         assert_eq!(app.selected, Some([2; 20]));
         app.handle_key(key(KeyCode::Down), &snapshot);
         assert_eq!(app.detail_scroll, 1);
+        // No further than the last peer.
+        app.handle_key(key(KeyCode::PageDown), &snapshot);
+        assert_eq!(app.detail_scroll, 2);
+        app.handle_key(key(KeyCode::PageUp), &snapshot);
+        assert_eq!(app.detail_scroll, 0);
+        app.handle_key(key(KeyCode::Down), &snapshot);
         app.handle_key(key(KeyCode::Char('3')), &snapshot);
         assert_eq!((app.tab, app.detail_scroll), (Tab::Trackers, 0));
     }

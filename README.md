@@ -24,6 +24,24 @@ cargo run --release -- 'magnet:?xt=urn:btih:...&tr=udp://tracker.example:1337' -
 cargo run --release -- first.torrent second.torrent 'magnet:?xt=urn:btih:...' -o ~/Downloads
 ```
 
+### Terminal UI
+
+When stdout and stderr are terminals, a run shows a full-screen UI instead of progress bars and log lines (`--no-tui`, or `tui = false` in the config file, turns it off; `--tui` turns it on regardless). It is never used with `--check`, `--scrape` or `--print-config`. At the top are the session's rates and counts, then the torrent table, then a detail panel for the selected torrent with five tabs: its peers (client, flags, rates and how much each has, with the torrent's rates over the last half minute), a map of its pieces with the swarm's numbers, its trackers, its files, and facts about it. The log sits below, and the keys at the bottom:
+
+| Key | Action |
+|-----|--------|
+| `↑`/`↓`, `j`/`k` | select a torrent, or scroll the detail panel when it has the focus |
+| `PgUp`/`PgDn` | scroll the detail panel |
+| `tab` | move the focus between the torrent table and the detail panel |
+| `1`–`5` | peers, pieces, trackers, files, info |
+| `l` | show or hide the log |
+| `s` / `S` | sort by the next column / reverse the order |
+| `/` | filter torrents by name; `esc` clears the filter |
+| `?` | help |
+| `q`, `Ctrl-C` | stop the torrents, as Ctrl-C does without the UI; pressed again, quit at once |
+
+Peer flags: `D` we download from the peer, `d` we want to but it chokes us; `U` we upload to it, `u` it wants us to but we choke it; `I` it connected to us; `F` fast extension; `X` peer exchange. When every torrent has finished the UI says so and waits for `q`, and the warnings and errors of the last 10 seconds are printed once the terminal is back. `cargo run --example tui_demo` shows the UI with a made-up session.
+
 Give several torrents and they are downloaded at once, each with its own progress bar, sharing one listening port, one DHT node, the rate limits and the connection limit, and checking the data already on disk one torrent at a time. One that fails does not stop the others, Ctrl-C stops them all, and the run ends when every one is done (and seeded, with `--seed-ratio` or `--seed-time`). A torrent that would write a file another running one writes is refused, naming the file, before it touches anything. With `--check` or `--scrape`, each torrent is handled in turn under its name.
 
 A magnet link works wherever a .torrent file does. The torrent's metadata is fetched from peers found through the link's trackers (`tr`), its peers (`x.pe`) and the DHT, then the download carries on with the same peers. The metadata is saved as `<info hash>.torrent` in the output directory, so running the same link again resumes without fetching it, and `--check` uses that file (it fails without it). `--scrape` asks the link's trackers.
@@ -34,7 +52,7 @@ Progress is saved in a resume file per torrent, `$XDG_STATE_HOME/rtrnt/resume/<i
 
 ### Config file
 
-Every option except `--check`, `--recheck`, `--scrape`, `--config` and `--print-config` can also be set in `~/.config/rtrnt/config.toml` (or `$XDG_CONFIG_HOME/rtrnt/config.toml`), or in a file given with `--config <PATH>`. Keys are the long option names, except that `--no-dht` is `dht = false`, and every key is optional:
+Every option except `--check`, `--recheck`, `--scrape`, `--config` and `--print-config` can also be set in `~/.config/rtrnt/config.toml` (or `$XDG_CONFIG_HOME/rtrnt/config.toml`), or in a file given with `--config <PATH>`. Keys are the long option names, except that `--no-dht` is `dht = false` and `--no-tui` is `tui = false`, and every key is optional:
 
 ```toml
 output = "~/Downloads"
@@ -46,6 +64,7 @@ seed-time = 120
 dht = false
 max-download-rate = 2048
 max-upload-rate = 256
+tui = false
 ```
 
 A flag on the command line overrides the file, and the file overrides the built-in defaults. `--print-config` shows the effective settings and where each one came from. Unknown keys are errors, so typos don't go unnoticed.
@@ -63,6 +82,9 @@ See [ROADMAP.md](ROADMAP.md) for what's done and what's next.
 - **clap** - Command-line interface
 - **toml** - Config file parsing
 - **indicatif** - Progress tracking
+- **ratatui**, **crossterm** & **futures-util** - Terminal UI and its key events
+- **chrono** - Local time in the UI
+- **unicode-width** - Column widths of torrent names
 - **anyhow** - Error handling
 
 ## Project Structure
@@ -110,15 +132,26 @@ src/
 │   └── pex.rs       # Peer exchange (BEP 11): telling peers about each other
 ├── rate_limit.rs  # Upload and download rate limits (shared token buckets)
 ├── resume.rs      # Resume files: what was on disk last time
+├── stats.rs       # Counters the engine publishes for the UI: torrents, peers, trackers
 ├── storage.rs     # Maps pieces onto files on disk (single and multi-file)
 ├── storage/
 │   └── verify.rs    # Hash checks of the data on disk
 ├── torrent.rs     # Torrent file parsing and validation
 ├── tracker.rs     # Tracker announce and scrape
-└── tracker/
-    ├── http.rs      # HTTP trackers
-    ├── udp.rs       # UDP trackers (BEP 15)
-    └── announcer.rs # Re-announces and completed/stopped events
+├── tracker/
+│   ├── http.rs      # HTTP trackers
+│   ├── udp.rs       # UDP trackers (BEP 15)
+│   └── announcer.rs # Re-announces and completed/stopped events
+└── tui/           # Terminal UI
+    ├── mod.rs        # Event loop, terminal setup and restore
+    ├── app.rs        # Selection, tabs, sort, filter; rate history
+    ├── snapshot.rs   # Plain copies of the stats, taken each tick
+    ├── log_buffer.rs # Log lines kept in memory for the log pane
+    ├── theme.rs      # Colors, true color or ANSI
+    ├── demo.rs       # A made-up session for the demo and the view tests
+    └── view/         # One file per area of the screen
+examples/
+└── tui_demo.rs    # The UI with a made-up session
 tests/
 ├── dht.rs         # DHT nodes on loopback: bootstrap, announce, lookup
 └── loopback/      # End-to-end runs against mock seeders, trackers and peers,

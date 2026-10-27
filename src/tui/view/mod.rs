@@ -4,6 +4,7 @@
 mod detail;
 mod files;
 mod header;
+mod help;
 mod info;
 mod keybar;
 mod log;
@@ -64,6 +65,9 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App) {
         log::draw(frame, snapshot, app, log_area);
     }
     keybar::draw(frame, snapshot, app, keybar);
+    if app.show_help {
+        help::draw(frame, app, area);
+    }
 }
 
 /// A rounded box in the border color, titled `title` in bold, with `hint`
@@ -619,6 +623,30 @@ mod screen_tests {
                 .iter()
                 .any(|line| line.starts_with("╭ Log"))
         );
+    }
+
+    #[test]
+    fn help_lists_the_keys_over_the_screen() {
+        let snapshot = demo::fixture();
+        let mut app = app(&snapshot);
+        app.show_help = true;
+        let buffer = render(80, 24, &snapshot, &app);
+        let lines = text(&buffer, buffer.area);
+        let top = lines
+            .iter()
+            .position(|line| line.contains("╭ Keys ─"))
+            .unwrap();
+        assert!(lines[top].contains(" any key closes ╮"));
+        assert!(
+            lines[top + 2].contains("  ↑ ↓  j k  select a torrent, or scroll the detail panel")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("  q  Ctrl-C  stop the torrents; again to quit at once"))
+        );
+        // Drawn over what is under it, which shows around it.
+        assert!(lines[3].starts_with("│▌debian"));
     }
 
     #[test]
