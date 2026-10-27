@@ -133,6 +133,9 @@ src/
 ├── rate_limit.rs  # Upload and download rate limits (shared token buckets)
 ├── resume.rs      # Resume files: what was on disk last time
 ├── stats.rs       # Counters the engine publishes for the UI: torrents, peers, trackers
+├── stats/
+│   ├── torrent.rs   # One torrent: state, pieces, trackers, peer sources
+│   └── peer.rs      # One peer: flags, client, bytes
 ├── storage.rs     # Maps pieces onto files on disk (single and multi-file)
 ├── storage/
 │   └── verify.rs    # Hash checks of the data on disk
