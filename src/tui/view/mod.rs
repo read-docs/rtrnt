@@ -10,6 +10,7 @@ mod keybar;
 mod log;
 mod peers;
 mod pieces;
+mod prompt;
 mod torrents;
 mod trackers;
 
@@ -65,6 +66,9 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App) {
         log::draw(frame, snapshot, app, log_area);
     }
     keybar::draw(frame, snapshot, app, keybar);
+    if let Some(input) = &app.input {
+        prompt::draw(frame, app, input, keybar);
+    }
     if app.show_help {
         help::draw(frame, app, area);
     }

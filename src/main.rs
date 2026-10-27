@@ -11,14 +11,14 @@ use rtrnt::client::Client;
 use rtrnt::download::{self, DownloadConfig, Interrupted};
 use rtrnt::magnet::{self, FetchInterrupted};
 use rtrnt::tui::log_buffer::LogBuffer;
-use rtrnt::tui::{self, SessionFeed};
+use rtrnt::tui::{self, Command, SessionFeed};
 use rtrnt::{config, torrent, tracker};
 use shutdown::Shutdown;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{Instrument, Span, error, info, info_span, warn};
 use tracing_subscriber::EnvFilter;
@@ -129,7 +129,9 @@ async fn with_tui(
         let shutdown = Arc::clone(&shutdown);
         move || shutdown.request_stop()
     };
-    let feed = SessionFeed::new(Arc::clone(client.stats()), logs.clone(), stop);
+    let (commands, commands_rx) = mpsc::unbounded_channel();
+    tokio::spawn(run_commands(Arc::clone(&client), commands_rx));
+    let feed = SessionFeed::new(Arc::clone(client.stats()), logs.clone(), stop, commands);
     let exit = tui::run(feed, finished_rx).await;
     // The terminal is back to normal: say what went wrong lately, which the
     // UI showed but which is gone with it.
@@ -145,6 +147,28 @@ async fn with_tui(
         }
     }
     downloads.await?
+}
+
+/// Carries out what the UI asks of `client`, until the UI is gone.
+async fn run_commands(client: Arc<Client>, mut commands: mpsc::UnboundedReceiver<Command>) {
+    let limit = |kib: u64| match kib {
+        0 => "none".to_string(),
+        kib => format!("{kib} KiB/s"),
+    };
+    while let Some(command) = commands.recv().await {
+        match command {
+            Command::SetRateLimits(down, up) => {
+                client.set_rate_limits(down, up);
+                client.stats().notice(format!(
+                    "rate limits: download {}, upload {}",
+                    limit(down),
+                    limit(up)
+                ));
+            }
+            // The feed stops the torrents itself.
+            Command::Stop => {}
+        }
+    }
 }
 
 /// Runs `run` on each torrent in turn. With several, each one's output is

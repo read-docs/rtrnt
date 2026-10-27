@@ -27,20 +27,30 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use theme::Theme;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 /// How often the stats are read and the screen drawn.
 pub const TICK: Duration = Duration::from_millis(250);
 
-/// Where the UI gets what it shows, and how it stops the torrents.
+/// What the UI asks of the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    /// Stop the torrents, as Ctrl-C does.
+    Stop,
+    /// Change the download and upload limits to these KiB/s, 0 for none.
+    SetRateLimits(u64, u64),
+}
+
+/// Where the UI gets what it shows, and what it asks of the session.
 pub trait Feed {
     /// What to show now, with the insides of the torrent `selected`.
     /// `finished` says every torrent's task has ended.
     fn snapshot(&mut self, selected: Option<[u8; 20]>, finished: bool) -> Snapshot;
 
-    /// Asks the torrents to stop, as Ctrl-C does. Returns false if there is
-    /// nothing to wait for, so the UI should quit at once.
-    fn stop(&mut self) -> bool;
+    /// Passes `command` on. Returns false if the UI should quit at once:
+    /// on `Stop` with nothing to wait for. What comes of other commands
+    /// shows in later snapshots, or as a notice.
+    fn command(&mut self, command: Command) -> bool;
 }
 
 /// The feed of a real session.
@@ -48,13 +58,25 @@ pub struct SessionFeed<S> {
     stats: Arc<SessionStats>,
     logs: LogBuffer,
     stop: S,
+    commands: mpsc::UnboundedSender<Command>,
 }
 
 impl<S: FnMut() -> bool> SessionFeed<S> {
-    /// Shows `stats` and `logs`, stopping the torrents with `stop` (see
-    /// `Feed::stop`).
-    pub fn new(stats: Arc<SessionStats>, logs: LogBuffer, stop: S) -> Self {
-        Self { stats, logs, stop }
+    /// Shows `stats` and `logs`. `Stop` calls `stop`, which returns false if
+    /// there is nothing to wait for, and every other command goes to
+    /// `commands`.
+    pub fn new(
+        stats: Arc<SessionStats>,
+        logs: LogBuffer,
+        stop: S,
+        commands: mpsc::UnboundedSender<Command>,
+    ) -> Self {
+        Self {
+            stats,
+            logs,
+            stop,
+            commands,
+        }
     }
 }
 
@@ -63,8 +85,16 @@ impl<S: FnMut() -> bool> Feed for SessionFeed<S> {
         Snapshot::take(&self.stats, &self.logs, selected, finished)
     }
 
-    fn stop(&mut self) -> bool {
-        (self.stop)()
+    fn command(&mut self, command: Command) -> bool {
+        match command {
+            Command::Stop => (self.stop)(),
+            command => {
+                if self.commands.send(command).is_err() {
+                    self.stats.notice("the session takes no more commands");
+                }
+                true
+            }
+        }
     }
 }
 
@@ -100,8 +130,8 @@ pub async fn run(mut feed: impl Feed, mut finished: watch::Receiver<bool>) -> io
                         Action::None => {}
                         Action::Quit => return Ok(Exit::Quit),
                         Action::ForceQuit => return Ok(Exit::Now),
-                        Action::Stop => {
-                            if !feed.stop() {
+                        Action::Command(command) => {
+                            if !feed.command(command) {
                                 return Ok(Exit::Now);
                             }
                         }

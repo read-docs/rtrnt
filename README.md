@@ -37,6 +37,7 @@ When stdout and stderr are terminals, a run shows a full-screen UI instead of pr
 | `l` | show or hide the log |
 | `s` / `S` | sort by the next column / reverse the order |
 | `/` | filter torrents by name; `esc` clears the filter |
+| `d` / `u` | set the download / upload limit in KiB/s, 0 for none, until the run ends; the header shows the limits next to the rates |
 | `?` | help |
 | `q`, `Ctrl-C` | stop the torrents, as Ctrl-C does without the UI; pressed again, quit at once |
 
@@ -147,7 +148,7 @@ src/
 │   └── announcer.rs # Re-announces and completed/stopped events
 └── tui/           # Terminal UI
     ├── mod.rs        # Event loop, terminal setup and restore
-    ├── app.rs        # Selection, tabs, sort, filter; rate history
+    ├── app.rs        # Selection, tabs, sort, input line; rate history
     ├── snapshot.rs   # Plain copies of the stats, taken each tick
     ├── log_buffer.rs # Log lines kept in memory for the log pane
     ├── theme.rs      # Colors, true color or ANSI

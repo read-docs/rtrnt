@@ -1,6 +1,7 @@
 //! The UI's own state: what is selected and shown, and the rate history
 //! that turns byte counters into rates.
 
+use super::Command;
 use super::snapshot::{Snapshot, TorrentSnapshot};
 use super::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -115,12 +116,51 @@ impl Sort {
     }
 }
 
-/// What a key press asks of the caller.
+/// What the input line is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputKind {
+    /// The torrent filter, applied as it is typed.
+    Filter,
+    DownloadLimit,
+    UploadLimit,
+}
+
+impl InputKind {
+    /// What the input line says before the text.
+    pub fn prompt(self) -> &'static str {
+        match self {
+            InputKind::Filter => "/",
+            InputKind::DownloadLimit => "download limit, KiB/s (0: none): ",
+            InputKind::UploadLimit => "upload limit, KiB/s (0: none): ",
+        }
+    }
+}
+
+/// The input line, drawn over the key bar while something is typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Input {
+    pub kind: InputKind,
+    pub text: String,
+    /// Why the text was refused, until it is edited.
+    pub error: Option<String>,
+}
+
+impl Input {
+    fn new(kind: InputKind, text: String) -> Self {
+        Self {
+            kind,
+            text,
+            error: None,
+        }
+    }
+}
+
+/// What a key press asks of the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     None,
-    /// Stop the torrents gracefully.
-    Stop,
+    /// Pass this on to the session (see `Feed::command`).
+    Command(Command),
     /// Leave the UI: everything has finished.
     Quit,
     /// Leave at once, without waiting for the torrents to stop.
@@ -140,8 +180,8 @@ pub struct App {
     pub reverse: bool,
     /// Torrents whose name contains this (ignoring case) are shown.
     pub filter: String,
-    /// Set while the filter is being typed.
-    pub editing_filter: bool,
+    /// Set while something is being typed.
+    pub input: Option<Input>,
     pub show_help: bool,
     /// Set once a stop was asked for.
     pub stopping: bool,
@@ -160,7 +200,7 @@ impl App {
             sort: Sort::Added,
             reverse: false,
             filter: String::new(),
-            editing_filter: false,
+            input: None,
             show_help: false,
             stopping: false,
             rates: Rates::default(),
@@ -241,21 +281,10 @@ impl App {
             self.show_help = false;
             return Action::None;
         }
-        if self.editing_filter {
-            match key.code {
-                KeyCode::Esc => {
-                    self.filter.clear();
-                    self.editing_filter = false;
-                }
-                KeyCode::Enter => self.editing_filter = false,
-                KeyCode::Backspace => {
-                    self.filter.pop();
-                }
-                KeyCode::Char(c) => self.filter.push(c),
-                _ => {}
-            }
+        if self.input.is_some() {
+            let action = self.edit_input(key, snapshot);
             self.ensure_selection(snapshot);
-            return Action::None;
+            return action;
         }
         const PAGE: isize = 10;
         match key.code {
@@ -286,13 +315,82 @@ impl App {
             KeyCode::Char('l') => self.show_log = !self.show_log,
             KeyCode::Char('s') => self.sort = self.sort.next(),
             KeyCode::Char('S') => self.reverse = !self.reverse,
-            KeyCode::Char('/') => self.editing_filter = true,
+            KeyCode::Char('/') => {
+                self.input = Some(Input::new(InputKind::Filter, self.filter.clone()));
+            }
+            KeyCode::Char('d') => {
+                let limit = snapshot.session.rate_limits.0.to_string();
+                self.input = Some(Input::new(InputKind::DownloadLimit, limit));
+            }
+            KeyCode::Char('u') => {
+                let limit = snapshot.session.rate_limits.1.to_string();
+                self.input = Some(Input::new(InputKind::UploadLimit, limit));
+            }
             KeyCode::Esc => self.filter.clear(),
             KeyCode::Char('?') => self.show_help = true,
             _ => {}
         }
         self.ensure_selection(snapshot);
         Action::None
+    }
+
+    /// A key pressed while the input line is open: Enter submits, Esc
+    /// cancels (and clears the filter), Backspace deletes a character.
+    fn edit_input(&mut self, key: KeyEvent, snapshot: &Snapshot) -> Action {
+        let Some(input) = self.input.as_mut() else {
+            return Action::None;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                if input.kind == InputKind::Filter {
+                    self.filter.clear();
+                }
+                self.input = None;
+            }
+            KeyCode::Enter => return self.submit(snapshot),
+            KeyCode::Backspace => {
+                input.text.pop();
+                input.error = None;
+            }
+            KeyCode::Char(c) => {
+                input.text.push(c);
+                input.error = None;
+            }
+            _ => {}
+        }
+        if let Some(Input {
+            kind: InputKind::Filter,
+            text,
+            ..
+        }) = &self.input
+        {
+            self.filter.clone_from(text);
+        }
+        Action::None
+    }
+
+    /// Enter on the input line: closes it with the command it asks for, or
+    /// keeps it open, saying why, if the text will not do.
+    fn submit(&mut self, snapshot: &Snapshot) -> Action {
+        let Some(mut input) = self.input.take() else {
+            return Action::None;
+        };
+        let (down, up) = snapshot.session.rate_limits;
+        let limit = || input.text.trim().parse::<u64>();
+        let command = match input.kind {
+            // Applied already, as it was typed.
+            InputKind::Filter => return Action::None,
+            InputKind::DownloadLimit => limit().map(|down| Command::SetRateLimits(down, up)),
+            InputKind::UploadLimit => limit().map(|up| Command::SetRateLimits(down, up)),
+        };
+        match command {
+            Ok(command) => Action::Command(command),
+            Err(_) => {
+                input.error = Some("enter a whole number of KiB/s, 0 for none".to_string());
+                self.input = Some(input);
+                Action::None
+            }
+        }
     }
 
     /// `q` or Ctrl-C: once everything has finished, leave; otherwise ask
@@ -304,7 +402,7 @@ impl App {
             Action::ForceQuit
         } else {
             self.stopping = true;
-            Action::Stop
+            Action::Command(Command::Stop)
         }
     }
 }

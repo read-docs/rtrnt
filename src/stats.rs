@@ -10,6 +10,7 @@ use crate::dht::Dht;
 use crate::rate_limit::RateLimits;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::Instant;
 
 mod peer;
 mod torrent;
@@ -29,6 +30,8 @@ pub struct SessionStats {
     port: OnceLock<Option<u16>>,
     rate_limits: Arc<RateLimits>,
     slots: ConnectionSlots,
+    /// The latest notice, and when it came.
+    notice: Mutex<Option<(Instant, String)>>,
 }
 
 impl SessionStats {
@@ -41,6 +44,7 @@ impl SessionStats {
             port: OnceLock::new(),
             rate_limits,
             slots,
+            notice: Mutex::new(None),
         }
     }
 
@@ -93,6 +97,18 @@ impl SessionStats {
     /// Most peer connections open at once.
     pub fn max_connections(&self) -> usize {
         self.slots.limit()
+    }
+
+    /// Tells the user `text`: something the UI should show, such as the
+    /// result of a command, that it cannot wait for. A later notice
+    /// replaces it.
+    pub fn notice(&self, text: impl Into<String>) {
+        *lock(&self.notice) = Some((Instant::now(), text.into()));
+    }
+
+    /// The latest notice, and when it came.
+    pub fn last_notice(&self) -> Option<(Instant, String)> {
+        lock(&self.notice).clone()
     }
 }
 

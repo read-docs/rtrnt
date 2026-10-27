@@ -97,7 +97,7 @@ fn quitting_stops_first_and_leaves_on_the_second_press() {
     let mut app = App::new(Theme::default());
     assert_eq!(
         app.handle_key(key(KeyCode::Char('q')), &snapshot),
-        Action::Stop
+        Action::Command(Command::Stop)
     );
     let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
     assert_eq!(app.handle_key(ctrl_c, &snapshot), Action::ForceQuit);
@@ -136,7 +136,7 @@ fn sorts_and_filters() {
     assert!(!app.stopping);
     app.handle_key(key(KeyCode::Backspace), &snapshot);
     app.handle_key(key(KeyCode::Enter), &snapshot);
-    assert!(!app.editing_filter);
+    assert_eq!(app.input, None);
     assert_eq!(app.filter, "BIAN");
     app.handle_key(key(KeyCode::Esc), &snapshot);
     assert_eq!(names(&app, &snapshot).len(), 3);
@@ -192,4 +192,82 @@ fn rates_are_smoothed_and_the_eta_averaged() {
     snapshot.torrents.clear();
     rates.record(&snapshot, start + Duration::from_secs(20));
     assert!(rates.torrents.is_empty());
+}
+
+#[test]
+fn limit_keys_open_the_prompt_with_the_current_limit() {
+    let mut snapshot = snapshot(&["a"]);
+    snapshot.session.rate_limits = (2048, 0);
+    let mut app = App::new(Theme::default());
+    app.handle_key(key(KeyCode::Char('d')), &snapshot);
+    let input = app.input.as_ref().unwrap();
+    assert_eq!(
+        (input.kind, input.text.as_str()),
+        (InputKind::DownloadLimit, "2048")
+    );
+    // Esc cancels, leaving the filter alone.
+    app.filter = "a".into();
+    app.handle_key(key(KeyCode::Esc), &snapshot);
+    assert_eq!((&app.input, app.filter.as_str()), (&None, "a"));
+    app.handle_key(key(KeyCode::Char('u')), &snapshot);
+    let input = app.input.as_ref().unwrap();
+    assert_eq!(
+        (input.kind, input.text.as_str()),
+        (InputKind::UploadLimit, "0")
+    );
+}
+
+#[test]
+fn a_limit_that_is_not_a_number_keeps_the_prompt_open() {
+    let mut snapshot = snapshot(&["a"]);
+    snapshot.session.rate_limits = (2048, 0);
+    let mut app = App::new(Theme::default());
+    app.handle_key(key(KeyCode::Char('u')), &snapshot);
+    for c in "5k".chars() {
+        app.handle_key(key(KeyCode::Char(c)), &snapshot);
+    }
+    assert_eq!(app.handle_key(key(KeyCode::Enter), &snapshot), Action::None);
+    let input = app.input.as_ref().unwrap();
+    assert_eq!(input.text, "05k");
+    assert!(input.error.is_some());
+    // Editing clears the error. Keys go to the text, not to the app.
+    app.handle_key(key(KeyCode::Backspace), &snapshot);
+    app.handle_key(key(KeyCode::Char('q')), &snapshot);
+    let input = app.input.as_ref().unwrap();
+    assert_eq!((input.text.as_str(), &input.error), ("05q", &None));
+    assert!(!app.stopping);
+    // Empty is not a number either.
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Backspace), &snapshot);
+    }
+    app.handle_key(key(KeyCode::Enter), &snapshot);
+    assert!(app.input.as_ref().unwrap().error.is_some());
+}
+
+#[test]
+fn enter_sends_the_new_limit_with_the_other_unchanged() {
+    let mut snapshot = snapshot(&["a"]);
+    snapshot.session.rate_limits = (2048, 512);
+    let mut app = App::new(Theme::default());
+    app.handle_key(key(KeyCode::Char('d')), &snapshot);
+    for _ in 0..4 {
+        app.handle_key(key(KeyCode::Backspace), &snapshot);
+    }
+    for c in " 100 ".chars() {
+        app.handle_key(key(KeyCode::Char(c)), &snapshot);
+    }
+    assert_eq!(
+        app.handle_key(key(KeyCode::Enter), &snapshot),
+        Action::Command(Command::SetRateLimits(100, 512))
+    );
+    assert_eq!(app.input, None);
+    app.handle_key(key(KeyCode::Char('u')), &snapshot);
+    app.handle_key(key(KeyCode::Backspace), &snapshot);
+    app.handle_key(key(KeyCode::Backspace), &snapshot);
+    app.handle_key(key(KeyCode::Backspace), &snapshot);
+    app.handle_key(key(KeyCode::Char('0')), &snapshot);
+    assert_eq!(
+        app.handle_key(key(KeyCode::Enter), &snapshot),
+        Action::Command(Command::SetRateLimits(2048, 0))
+    );
 }

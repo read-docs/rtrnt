@@ -1,4 +1,4 @@
-//! The top line: session rates and counts, and the time.
+//! The top line: session rates and limits, counts, and the time.
 
 use super::{bold, human_rate};
 use crate::tui::app::App;
@@ -14,6 +14,7 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
     let dim = theme.dim_style();
     let (down, up) = snapshot.rates();
     let session = &snapshot.session;
+    let (down_limit, up_limit) = session.rate_limits;
     let count = snapshot.torrents.len();
     let mut facts = vec![
         format!("{count} torrent{}", if count == 1 { "" } else { "s" }),
@@ -33,8 +34,10 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
             format!("↓ {}", human_rate(down)),
             Style::new().fg(theme.down()),
         ),
+        Span::styled(limit(down_limit), dim),
         Span::raw("  "),
         Span::styled(format!("↑ {}", human_rate(up)), Style::new().fg(theme.up())),
+        Span::styled(limit(up_limit), dim),
         Span::styled(" │ ", Style::new().fg(theme.border())),
     ];
     // Facts that do not fit are left out, from the last.
@@ -55,4 +58,15 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
         ..area
     };
     frame.render_widget(Paragraph::new(Span::styled(clock, dim)), clock_area);
+}
+
+/// A rate limit of `kib` KiB/s as it follows the rate, ` (2 MiB/s)`, or
+/// nothing for none.
+fn limit(kib: u64) -> String {
+    if kib == 0 {
+        return String::new();
+    }
+    let rate = human_rate(kib.saturating_mul(1024) as f64);
+    // Limits are mostly round: 2 MiB/s, not 2.0 MiB/s.
+    format!(" ({})", rate.replace(".0 ", " "))
 }

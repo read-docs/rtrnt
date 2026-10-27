@@ -10,6 +10,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+/// How long a notice shows (see `SessionStats::notice`).
+pub const NOTICE_SHOWN: Duration = Duration::from_secs(5);
+
 /// Everything one frame shows.
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
@@ -20,6 +23,8 @@ pub struct Snapshot {
     /// Peers, pieces and trackers of the selected torrent.
     pub detail: Option<Detail>,
     pub logs: Vec<LogLine>,
+    /// The latest notice, while it is fresh.
+    pub notice: Option<String>,
     /// Set once every torrent's task has ended.
     pub finished: bool,
 }
@@ -166,6 +171,10 @@ impl Snapshot {
                 .collect(),
             detail,
             logs: logs.lines(),
+            notice: stats
+                .last_notice()
+                .filter(|(at, _)| now.saturating_duration_since(*at) < NOTICE_SHOWN)
+                .map(|(_, text)| text),
             finished,
         }
     }

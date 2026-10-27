@@ -2,9 +2,9 @@
 //! the UI without a swarm (`cargo run --example tui_demo`) and for the view
 //! tests.
 
-use super::Feed;
 use super::log_buffer::LogLine;
 use super::snapshot::{Detail, PeerSnapshot, SessionSnapshot, Snapshot, Sources, TorrentSnapshot};
+use super::{Command, Feed};
 use crate::stats::{Layout, PeerFlags, PieceSnapshot, TorrentState, TrackerResult, TrackerStatus};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -364,6 +364,7 @@ pub struct DemoFeed {
     last: f64,
     rng: StdRng,
     stopped: bool,
+    rate_limits: (u64, u64),
 }
 
 impl Default for DemoFeed {
@@ -384,6 +385,7 @@ impl DemoFeed {
             last: 0.0,
             rng: StdRng::seed_from_u64(7),
             stopped: false,
+            rate_limits: (0, 2048),
         }
     }
 
@@ -437,11 +439,12 @@ impl DemoFeed {
                 port: Some(6881),
                 connections: 71,
                 max_connections: 200,
-                rate_limits: (0, 2048),
+                rate_limits: self.rate_limits,
             },
             torrents,
             detail,
             logs,
+            notice: None,
             finished,
         }
     }
@@ -555,8 +558,11 @@ impl Feed for DemoFeed {
         self.snapshot_at(t, selected, finished || self.stopped)
     }
 
-    fn stop(&mut self) -> bool {
-        self.stopped = true;
+    fn command(&mut self, command: Command) -> bool {
+        match command {
+            Command::Stop => self.stopped = true,
+            Command::SetRateLimits(down, up) => self.rate_limits = (down, up),
+        }
         true
     }
 }

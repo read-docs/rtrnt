@@ -1,9 +1,11 @@
 use super::*;
 use crate::tui::app::App;
 use crate::tui::demo;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 
 /// The text of the cells in `area` of the buffer, row by row, for tests.
 pub(crate) fn text(buffer: &ratatui::buffer::Buffer, area: ratatui::layout::Rect) -> Vec<String> {
@@ -39,7 +41,7 @@ fn header_and_torrent_table_at_100_columns() {
     let lines = text(&buffer, buffer.area);
     assert!(
         lines[0].starts_with(
-            " rtrnt │ ↓ 6.6 MiB/s  ↑ 1.1 MiB/s │ 5 torrents  71/200 peers  DHT 312 nodes  port 6881"
+            " rtrnt │ ↓ 6.6 MiB/s  ↑ 1.1 MiB/s (2 MiB/s) │ 5 torrents  71/200 peers  DHT 312 nodes "
         ),
         "{}",
         lines[0]
@@ -360,4 +362,99 @@ fn the_key_bar_says_when_everything_has_finished() {
     let app = app(&snapshot);
     let buffer = render(100, 32, &snapshot, &app);
     assert!(text(&buffer, buffer.area)[31].starts_with(" all torrents finished, press q to exit"));
+}
+
+#[test]
+fn the_header_shows_the_limits_next_to_the_rates() {
+    let mut snapshot = demo::fixture();
+    snapshot.session.rate_limits = (0, 0);
+    let app = app(&snapshot);
+    let header = |snapshot: &Snapshot| {
+        text(&render(100, 32, snapshot, &app), Rect::new(0, 0, 100, 1))[0].clone()
+    };
+    assert!(
+        header(&snapshot).starts_with(
+            " rtrnt │ ↓ 6.6 MiB/s  ↑ 1.1 MiB/s │ 5 torrents  71/200 peers  DHT 312 nodes  port 6881"
+        ),
+        "{}",
+        header(&snapshot)
+    );
+    snapshot.session.rate_limits = (2048, 300);
+    let line = header(&snapshot);
+    assert!(
+        line.starts_with(" rtrnt │ ↓ 6.6 MiB/s (2 MiB/s)  ↑ 1.1 MiB/s (300 KiB/s) │ 5 torrents "),
+        "{line}"
+    );
+    let theme = Theme::default();
+    let buffer = render(100, 32, &snapshot, &app);
+    let x = line[..line.find("(2 MiB/s)").unwrap()].chars().count() as u16;
+    assert_eq!(buffer[(x, 0)].fg, theme.dim());
+}
+
+#[test]
+fn the_prompt_line_sits_over_the_key_bar() {
+    let snapshot = demo::fixture();
+    let mut app = app(&snapshot);
+    app.handle_key(
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        &snapshot,
+    );
+    let buffer = render(100, 32, &snapshot, &app);
+    let lines = text(&buffer, buffer.area);
+    assert!(
+        lines[31].starts_with(" download limit, KiB/s (0: none): 0▏   enter set  esc cancel"),
+        "{}",
+        lines[31]
+    );
+    // The line above is left alone until the text is refused.
+    assert!(lines[30].starts_with("╰────"), "{}", lines[30]);
+    app.handle_key(
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        &snapshot,
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &snapshot);
+    let buffer = render(100, 32, &snapshot, &app);
+    let lines = text(&buffer, buffer.area);
+    assert!(
+        lines[30].starts_with(" enter a whole number of KiB/s, 0 for none "),
+        "{}",
+        lines[30]
+    );
+    assert_eq!(buffer[(1, 30)].fg, Theme::default().error());
+    assert!(lines[31].starts_with(" download limit, KiB/s (0: none): 0x▏"));
+
+    // The filter is typed on it too.
+    let mut app = self::app(&snapshot);
+    for c in "/deb".chars() {
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            &snapshot,
+        );
+    }
+    let buffer = render(100, 32, &snapshot, &app);
+    assert!(text(&buffer, buffer.area)[31].starts_with(" /deb▏   enter keep  esc clear"));
+}
+
+#[test]
+fn a_notice_shows_in_place_of_the_keys() {
+    let mut snapshot = demo::fixture();
+    let app = app(&snapshot);
+    // Without one, the keys; the limit keys where there is room.
+    let buffer = render(100, 32, &snapshot, &app);
+    assert!(text(&buffer, buffer.area)[31].contains("  q quit  d u limits"));
+    let buffer = render(80, 24, &snapshot, &app);
+    let line = &text(&buffer, buffer.area)[23];
+    assert!(
+        line.contains("  q quit") && !line.contains("limits"),
+        "{line}"
+    );
+    snapshot.notice = Some("rate limits: download 100 KiB/s, upload none".into());
+    let buffer = render(100, 32, &snapshot, &app);
+    let lines = text(&buffer, buffer.area);
+    assert!(
+        lines[31].starts_with(" rate limits: download 100 KiB/s, upload none "),
+        "{}",
+        lines[31]
+    );
+    assert_eq!(buffer[(1, 31)].fg, Theme::default().warn());
 }

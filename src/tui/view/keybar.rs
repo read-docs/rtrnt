@@ -1,4 +1,4 @@
-//! The bottom line: the keys, or what the session is doing.
+//! The bottom line: the keys, a notice, or what the session is doing.
 
 use super::keys;
 use crate::tui::app::App;
@@ -9,37 +9,44 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+/// The keys always shown.
+const KEYS: &[(&str, &str)] = &[
+    ("↑↓", "select"),
+    ("tab", "panel"),
+    ("1-5", "view"),
+    ("l", "log"),
+    ("s", "sort"),
+    ("/", "filter"),
+    ("?", "help"),
+    ("q", "quit"),
+];
+
+/// Keys shown after them where there is room.
+const MORE_KEYS: &[(&str, &str)] = &[("d u", "limits")];
+
 pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
     let theme = app.theme;
-    let line = if snapshot.finished {
+    let line = if let Some(notice) = &snapshot.notice {
+        Line::from(Span::styled(
+            format!(" {notice}"),
+            Style::new().fg(theme.warn()),
+        ))
+    } else if snapshot.finished {
         Line::from(Span::styled(
             " all torrents finished, press q to exit",
             Style::new().fg(theme.warn()).add_modifier(Modifier::BOLD),
         ))
-    } else if app.editing_filter {
-        let mut spans = vec![
-            Span::styled(" /", theme.key_style()),
-            Span::styled(app.filter.clone(), Style::new().fg(theme.bright())),
-            Span::styled("▏", Style::new().fg(theme.down())),
-            Span::raw("   "),
-        ];
-        spans.extend(keys(theme, &[("enter", "keep"), ("esc", "clear")]));
-        Line::from(spans)
     } else {
         let mut spans = vec![Span::raw(" ")];
-        spans.extend(keys(
-            theme,
-            &[
-                ("↑↓", "select"),
-                ("tab", "panel"),
-                ("1-5", "view"),
-                ("l", "log"),
-                ("s", "sort"),
-                ("/", "filter"),
-                ("?", "help"),
-                ("q", "quit"),
-            ],
-        ));
+        spans.extend(keys(theme, KEYS));
+        let more: Vec<Span> = [Span::raw("  ")]
+            .into_iter()
+            .chain(keys(theme, MORE_KEYS))
+            .collect();
+        let width = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>();
+        if width(&spans) + width(&more) <= area.width as usize {
+            spans.extend(more);
+        }
         if app.stopping {
             spans.push(Span::styled(
                 "   stopping, q again to quit at once",
