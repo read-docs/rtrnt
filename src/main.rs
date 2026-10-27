@@ -139,7 +139,10 @@ async fn with_tui(
     match exit {
         Ok(tui::Exit::Quit) => {}
         Ok(tui::Exit::Now) => std::process::exit(EXIT_INTERRUPTED.into()),
-        Err(e) => eprintln!("cannot run the terminal UI: {e}; carrying on without it"),
+        Err(e) => {
+            eprintln!("cannot run the terminal UI: {e}; carrying on without it");
+            logs.echo_to_stderr();
+        }
     }
     downloads.await?
 }

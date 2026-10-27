@@ -40,30 +40,47 @@ impl fmt::Display for LogLine {
 /// The last `CAPACITY` log lines, shared between the layer that writes them
 /// and the UI that reads them.
 #[derive(Clone, Default)]
-pub struct LogBuffer(Arc<Mutex<VecDeque<LogLine>>>);
+pub struct LogBuffer(Arc<Mutex<Lines>>);
+
+#[derive(Default)]
+struct Lines {
+    kept: VecDeque<LogLine>,
+    /// Also print each new line to stderr, once no UI shows them.
+    echo: bool,
+}
 
 impl LogBuffer {
-    fn lock(&self) -> MutexGuard<'_, VecDeque<LogLine>> {
+    fn lock(&self) -> MutexGuard<'_, Lines> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn push(&self, line: LogLine) {
         let mut lines = self.lock();
-        if lines.len() == CAPACITY {
-            lines.pop_front();
+        if lines.echo {
+            eprintln!("{line}");
         }
-        lines.push_back(line);
+        if lines.kept.len() == CAPACITY {
+            lines.kept.pop_front();
+        }
+        lines.kept.push_back(line);
+    }
+
+    /// From now on, prints every new line to stderr as well, for when the UI
+    /// that showed them is gone and the session carries on.
+    pub fn echo_to_stderr(&self) {
+        self.lock().echo = true;
     }
 
     /// Every line kept, oldest first.
     pub fn lines(&self) -> Vec<LogLine> {
-        self.lock().iter().cloned().collect()
+        self.lock().kept.iter().cloned().collect()
     }
 
     /// Warnings and errors logged in the last `within` before `now`.
     pub fn problems_since(&self, now: SystemTime, within: Duration) -> Vec<LogLine> {
         let since = now.checked_sub(within).unwrap_or(SystemTime::UNIX_EPOCH);
         self.lock()
+            .kept
             .iter()
             .filter(|line| line.level <= Level::WARN && line.time >= since)
             .cloned()
