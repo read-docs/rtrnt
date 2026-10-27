@@ -571,3 +571,37 @@ fn the_mouse_leaves_the_input_line_alone() {
     assert_eq!(app.selected, Some([0; 20]));
     assert_eq!(app.input.as_ref().unwrap().text, "0");
 }
+
+#[test]
+fn p_pauses_a_running_torrent_and_resumes_a_stopped_one() {
+    let mut snapshot = snapshot(&["a"]);
+    let mut app = App::new(Theme::default());
+    app.ensure_selection(&snapshot);
+    let hash = [0; 20];
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('p')), &snapshot),
+        Action::Command(Command::Pause(hash))
+    );
+    snapshot.torrents[0].state = TorrentState::Pausing;
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('p')), &snapshot),
+        Action::None
+    );
+    for state in [
+        TorrentState::Paused,
+        TorrentState::Done,
+        TorrentState::Interrupted,
+        TorrentState::Failed("x".into()),
+    ] {
+        snapshot.torrents[0].state = state;
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('p')), &snapshot),
+            Action::Command(Command::Resume(hash))
+        );
+    }
+    // With nothing selected, nothing.
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('p')), &Snapshot::default()),
+        Action::None
+    );
+}

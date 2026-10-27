@@ -1,8 +1,10 @@
 use super::*;
 use crate::download::{DownloadConfig, SeedLimits};
+use crate::stats::TorrentState;
 use anyhow::anyhow;
 use indicatif::{MultiProgress, ProgressDrawTarget};
 use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn client() -> Arc<Client> {
     let config = DownloadConfig {
@@ -188,10 +190,8 @@ async fn a_torrent_stops_on_its_own_stop() {
     };
     stop.send_replace(true);
     manager.drive(closed()).await;
-    assert!(matches!(
-        manager.entries()[0].state,
-        State::Ended(Outcome::Interrupted)
-    ));
+    // Stopped on its own, it was paused.
+    assert!(matches!(manager.entries()[0].state, State::Paused));
 }
 
 #[tokio::test]
@@ -214,4 +214,81 @@ async fn the_run_ends_once_the_commands_end() {
     assert_eq!(client.stats().rate_limits(), (100, 0));
     let (_, notice) = client.stats().last_notice().unwrap();
     assert_eq!(notice, "rate limits: download 100 KiB/s, upload none");
+}
+
+/// `fake_run`, counting the runs in `runs`.
+fn counting(
+    runs: &Arc<AtomicUsize>,
+) -> impl Fn(Arc<Client>, Torrent, StopSignal) -> BoxFuture<'static, Result<()>> + use<> {
+    let runs = Arc::clone(runs);
+    move |client, torrent, stop| {
+        runs.fetch_add(1, Ordering::Relaxed);
+        Box::pin(fake_run(client, torrent, stop))
+    }
+}
+
+#[tokio::test]
+async fn a_paused_torrent_resumes_and_the_session_can_end_paused() {
+    let client = client();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, counting(&runs));
+    let idle = manager.idle();
+    let hash = [UNTIL_STOPPED; 20];
+    manager.start(vec![magnet(UNTIL_STOPPED)]).await;
+    // What the real run would have published.
+    let stats = client.stats().add_torrent(hash, "t", ".".as_ref());
+
+    // It shows as pausing while its task stops.
+    manager.command(Command::Pause(hash)).await;
+    assert!(matches!(&manager.entries()[0].state, State::Running { stop } if *stop.borrow()));
+    assert_eq!(stats.state(), TorrentState::Pausing);
+    let joined = manager.tasks.join_next_with_id().await.unwrap();
+    manager.ended(joined);
+    assert!(matches!(manager.entries()[0].state, State::Paused));
+    assert_eq!(stats.state(), TorrentState::Paused);
+    assert!(*idle.borrow());
+    // Pausing again does nothing.
+    manager.command(Command::Pause(hash)).await;
+    assert!(matches!(manager.entries()[0].state, State::Paused));
+
+    manager.command(Command::Resume(hash)).await;
+    assert!(matches!(&manager.entries()[0].state, State::Running { stop } if !*stop.borrow()));
+    assert!(!*idle.borrow());
+    assert_eq!(runs.load(Ordering::Relaxed), 2);
+    // Resuming a running torrent does nothing.
+    manager.command(Command::Resume(hash)).await;
+    assert_eq!(runs.load(Ordering::Relaxed), 2);
+
+    // Paused when the session ends: run again to resume.
+    let (commands, commands_rx) = mpsc::unbounded_channel();
+    commands.send(Command::Pause(hash)).unwrap();
+    drop(commands);
+    assert_eq!(
+        manager.run(commands_rx).await.unwrap(),
+        ExitCode::from(EXIT_INTERRUPTED)
+    );
+}
+
+#[tokio::test]
+async fn an_ended_torrent_can_be_run_again() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut manager = Manager::with_runner(client(), never, counting(&runs));
+    manager.start(vec![magnet(DONE), magnet(FAILED)]).await;
+    manager.drive(closed()).await;
+    // Neither is running, so neither pauses.
+    manager.command(Command::Pause([DONE; 20])).await;
+    assert!(matches!(
+        manager.entries()[0].state,
+        State::Ended(Outcome::Done)
+    ));
+
+    manager.command(Command::Resume([DONE; 20])).await;
+    manager.command(Command::Resume([FAILED; 20])).await;
+    assert_eq!(runs.load(Ordering::Relaxed), 4);
+    manager.drive(closed()).await;
+    let [done, failed] = manager.entries() else {
+        panic!("two entries");
+    };
+    assert!(matches!(done.state, State::Ended(Outcome::Done)));
+    assert!(matches!(failed.state, State::Ended(Outcome::Failed(_))));
 }

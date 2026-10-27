@@ -48,15 +48,17 @@ pub struct TorrentSnapshot {
     pub save_path: PathBuf,
     /// Bytes verified and on disk.
     pub verified: u64,
-    /// Block data received this session, verified or not.
+    /// Block data received this session, verified or not, before a pause
+    /// too.
     pub received: u64,
-    /// Verified piece data received this session.
+    /// Verified piece data received this session, before a pause too.
     pub downloaded: u64,
     pub uploaded: u64,
     pub peers: usize,
     /// Peers known, connected or not.
     pub pool: usize,
-    /// How long the torrent has been running, or ran.
+    /// How long the torrent has been running this session, or ran, not
+    /// counting its pauses.
     pub active: Duration,
     /// Order in which the torrent was added.
     pub order: usize,
@@ -212,7 +214,6 @@ impl Snapshot {
 }
 
 fn torrent_snapshot(torrent: &TorrentStats, order: usize, now: Instant) -> TorrentSnapshot {
-    let end = torrent.finished_at().unwrap_or(now);
     TorrentSnapshot {
         info_hash: torrent.info_hash(),
         name: torrent.name(),
@@ -225,7 +226,7 @@ fn torrent_snapshot(torrent: &TorrentStats, order: usize, now: Instant) -> Torre
         uploaded: torrent.uploaded(),
         peers: torrent.peers().len(),
         pool: torrent.pool(),
-        active: end.saturating_duration_since(torrent.added()),
+        active: torrent.active(now),
         order,
         rate_down: 0.0,
         rate_up: 0.0,

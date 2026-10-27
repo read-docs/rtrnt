@@ -170,6 +170,9 @@ pub(crate) async fn download_with(
     let downloading = !queue.is_done();
     // When we finished downloading and started seeding.
     let mut seeding_since = None;
+    // Uploaded by the torrent's earlier runs this session, before a pause:
+    // the ratio counts them, so that a pause does not start it over.
+    let uploaded_before = stats.previous().uploaded;
     // Pieces completed this session as of the last save of the resume file,
     // and when the next one is due.
     let mut saved = 0;
@@ -194,8 +197,12 @@ pub(crate) async fn download_with(
             progress
                 .bar
                 .set_message(format!("seeding, {} up", HumanBytes(uploaded)));
-            if seed.reached(uploaded, torrent.length(), since.elapsed()) {
-                info!(uploaded, "seed limit reached");
+            if seed.reached(
+                uploaded_before + uploaded,
+                torrent.length(),
+                since.elapsed(),
+            ) {
+                info!(uploaded = uploaded_before + uploaded, "seed limit reached");
                 break;
             }
         }

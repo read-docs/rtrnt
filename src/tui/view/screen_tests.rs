@@ -1,4 +1,5 @@
 use super::*;
+use crate::stats::TorrentState;
 use crate::tui::app::App;
 use crate::tui::demo;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -408,6 +409,36 @@ fn the_key_bar_says_when_nothing_is_running() {
     let app = app(&snapshot);
     let buffer = render(100, 32, &snapshot, &app);
     assert!(text(&buffer, buffer.area)[31].starts_with(" nothing running, press q to exit"));
+    // Unless the selected torrent can be resumed.
+    snapshot.torrents[0].state = TorrentState::Paused;
+    let buffer = render(100, 32, &snapshot, &app);
+    let line = &text(&buffer, buffer.area)[31];
+    assert!(
+        line.starts_with(" nothing running, press p to resume or q to exit"),
+        "{line}"
+    );
+}
+
+#[test]
+fn a_paused_torrent_says_so_and_p_resumes_it() {
+    let mut snapshot = demo::fixture();
+    let app = app(&snapshot);
+    snapshot.torrents[0].state = TorrentState::Pausing;
+    let buffer = render(130, 32, &snapshot, &app);
+    let lines = text(&buffer, buffer.area);
+    assert!(lines.iter().any(|line| line.contains("pausing")));
+    // Nothing to press while it stops.
+    assert!(!lines[31].contains("  p "), "{}", lines[31]);
+
+    snapshot.torrents[0].state = TorrentState::Paused;
+    let buffer = render(130, 32, &snapshot, &app);
+    let lines = text(&buffer, buffer.area);
+    assert!(lines.iter().any(|line| line.contains("paused")));
+    assert!(
+        lines[31].contains("  q quit  p resume  d u limits"),
+        "{}",
+        lines[31]
+    );
 }
 
 #[test]
@@ -485,9 +516,9 @@ fn the_prompt_line_sits_over_the_key_bar() {
 fn a_notice_shows_in_place_of_the_keys() {
     let mut snapshot = demo::fixture();
     let app = app(&snapshot);
-    // Without one, the keys; the limit keys where there is room.
+    // Without one, the keys; pause and the limit keys where there is room.
     let buffer = render(100, 32, &snapshot, &app);
-    assert!(text(&buffer, buffer.area)[31].contains("  q quit  d u limits  m mouse"));
+    assert!(text(&buffer, buffer.area)[31].contains("  q quit  p pause  d u limits"));
     let buffer = render(80, 24, &snapshot, &app);
     let line = &text(&buffer, buffer.area)[23];
     assert!(

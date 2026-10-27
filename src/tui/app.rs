@@ -5,6 +5,7 @@ use super::Command;
 use super::snapshot::{Detail, Snapshot, TorrentSnapshot};
 use super::theme::Theme;
 use super::view::Areas;
+use crate::stats::TorrentState;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 use std::cmp::Ordering;
@@ -246,6 +247,19 @@ impl App {
         }
     }
 
+    /// What `p` does to the selected torrent: pause it while it runs,
+    /// resume it once paused or ended (which retries one that failed), and
+    /// nothing while it is pausing. Comes with the key bar's word for it.
+    pub fn pause_command(&self, snapshot: &Snapshot) -> Option<(Command, &'static str)> {
+        let torrent = snapshot.torrent(self.selected?)?;
+        let hash = torrent.info_hash;
+        match torrent.state {
+            TorrentState::Pausing => None,
+            ref state if state.is_finished() => Some((Command::Resume(hash), "resume")),
+            _ => Some((Command::Pause(hash), "pause")),
+        }
+    }
+
     /// Selects the torrent with info hash `selected`, its detail panel
     /// scrolled to the top.
     fn select(&mut self, selected: Option<[u8; 20]>) {
@@ -419,6 +433,11 @@ impl App {
             }
             KeyCode::Char(c @ '1'..='5') => self.show_tab(Tab::ALL[c as usize - '1' as usize]),
             KeyCode::Char('l') => self.show_log = !self.show_log,
+            KeyCode::Char('p') => {
+                if let Some((command, _)) = self.pause_command(snapshot) {
+                    return Action::Command(command);
+                }
+            }
             KeyCode::Char('m') => self.mouse = !self.mouse,
             KeyCode::Char('s') => self.sort = self.sort.next(),
             KeyCode::Char('S') => self.reverse = !self.reverse,

@@ -4,6 +4,7 @@ mod common;
 mod download;
 mod fast;
 mod magnet;
+mod pause;
 mod pex;
 mod rate_limit;
 mod resume;

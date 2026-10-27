@@ -221,6 +221,8 @@ fn wobble(t: f64, seed: f64) -> f64 {
 struct Live {
     torrent: Torrent,
     state: TorrentState,
+    /// What it was doing before it was paused.
+    paused: Option<TorrentState>,
     verified: f64,
     received: f64,
     uploaded: f64,
@@ -266,6 +268,7 @@ impl Live {
         };
         Self {
             state,
+            paused: None,
             verified,
             received: 0.0,
             uploaded: 0.0,
@@ -387,6 +390,12 @@ impl DemoFeed {
             stopped: false,
             rate_limits: (0, 2048),
         }
+    }
+
+    /// The torrent with info hash `hash`.
+    fn live(&mut self, hash: [u8; 20]) -> Option<&mut Live> {
+        let index = (0..self.torrents.len()).find(|&i| info_hash(i) == hash)?;
+        self.torrents.get_mut(index)
     }
 
     /// The snapshot at `t` seconds in, with the torrent `selected` open.
@@ -563,6 +572,20 @@ impl Feed for DemoFeed {
         match command {
             Command::Stop => self.stopped = true,
             Command::SetRateLimits(down, up) => self.rate_limits = (down, up),
+            Command::Pause(hash) => {
+                if let Some(live) = self.live(hash)
+                    && !live.state.is_finished()
+                {
+                    live.paused = Some(std::mem::replace(&mut live.state, TorrentState::Paused));
+                }
+            }
+            Command::Resume(hash) => {
+                if let Some(live) = self.live(hash)
+                    && let Some(state) = live.paused.take()
+                {
+                    live.state = state;
+                }
+            }
         }
         true
     }

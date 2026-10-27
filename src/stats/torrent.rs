@@ -6,7 +6,7 @@ use crate::tracker::announcer::Transferred;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::{PeerStats, lock};
 
@@ -29,6 +29,10 @@ pub enum TorrentState {
     },
     Downloading,
     Seeding,
+    /// Asked to pause, and stopping.
+    Pausing,
+    /// Stopped by a pause, to be started again.
+    Paused,
     Done,
     Interrupted,
     Failed(String),
@@ -39,9 +43,23 @@ impl TorrentState {
     pub fn is_finished(&self) -> bool {
         matches!(
             self,
-            TorrentState::Done | TorrentState::Interrupted | TorrentState::Failed(_)
+            TorrentState::Paused
+                | TorrentState::Done
+                | TorrentState::Interrupted
+                | TorrentState::Failed(_)
         )
     }
+}
+
+/// What the earlier runs of a torrent this session did, before it was
+/// paused (or ended) and started again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Previous {
+    pub received: u64,
+    pub downloaded: u64,
+    pub uploaded: u64,
+    /// How long they ran.
+    pub active: Duration,
 }
 
 /// The shape of a torrent, known once its metadata is.
@@ -130,6 +148,9 @@ pub struct TorrentStats {
     info_hash: [u8; 20],
     save_path: PathBuf,
     added: Instant,
+    /// When this run started; `added` unless an earlier run was paused.
+    started: Instant,
+    previous: Previous,
     name: Mutex<String>,
     layout: OnceLock<Layout>,
     state: Mutex<TorrentState>,
@@ -153,10 +174,25 @@ pub struct TorrentStats {
 
 impl TorrentStats {
     pub fn new(info_hash: [u8; 20], name: &str, save_path: &Path) -> Self {
+        let now = Instant::now();
+        Self::again(info_hash, name, save_path, now, Previous::default())
+    }
+
+    /// Stats for a torrent run again: added at `added`, with what its
+    /// earlier runs did in `previous`.
+    pub(crate) fn again(
+        info_hash: [u8; 20],
+        name: &str,
+        save_path: &Path,
+        added: Instant,
+        previous: Previous,
+    ) -> Self {
         Self {
             info_hash,
             save_path: save_path.to_path_buf(),
-            added: Instant::now(),
+            added,
+            started: Instant::now(),
+            previous,
             name: Mutex::new(name.to_string()),
             layout: OnceLock::new(),
             state: Mutex::new(TorrentState::QueuedForChecking),
@@ -198,6 +234,33 @@ impl TorrentStats {
         self.added
     }
 
+    /// When this run of it started.
+    pub fn started(&self) -> Instant {
+        self.started
+    }
+
+    /// What its earlier runs this session did.
+    pub fn previous(&self) -> Previous {
+        self.previous
+    }
+
+    /// What this run and the earlier ones did, as the next run's
+    /// `previous`.
+    pub(crate) fn so_far(&self, now: Instant) -> Previous {
+        Previous {
+            received: self.received(),
+            downloaded: self.downloaded(),
+            uploaded: self.uploaded(),
+            active: self.active(now),
+        }
+    }
+
+    /// How long the torrent has run this session, up to `now` or its end.
+    pub fn active(&self, now: Instant) -> Duration {
+        let end = self.finished_at().unwrap_or(now);
+        self.previous.active + end.saturating_duration_since(self.started)
+    }
+
     /// When its task ended, if it has.
     pub fn finished_at(&self) -> Option<Instant> {
         self.finished.get().copied()
@@ -217,18 +280,29 @@ impl TorrentStats {
         lock(&self.state).clone()
     }
 
+    /// Sets the state, except that a torrent pausing shows so until its
+    /// task has ended, whatever it does meanwhile.
     pub fn set_state(&self, state: TorrentState) {
+        let mut current = lock(&self.state);
+        if *current == TorrentState::Pausing && !state.is_finished() {
+            return;
+        }
         if state.is_finished() {
             let _ = self.finished.set(Instant::now());
         }
-        *lock(&self.state) = state;
+        *current = state;
     }
 
-    /// Records how the torrent's task ended.
+    /// Records how the torrent's task ended. One stopped by a pause stays
+    /// `Pausing` until the manager says it is `Paused`.
     pub(crate) fn finish(&self, result: &anyhow::Result<()>) {
         let state = match result {
             Ok(()) => TorrentState::Done,
             Err(e) if e.is::<Interrupted>() || e.is::<FetchInterrupted>() => {
+                if self.state() == TorrentState::Pausing {
+                    let _ = self.finished.set(Instant::now());
+                    return;
+                }
                 TorrentState::Interrupted
             }
             Err(e) => TorrentState::Failed(format!("{e:#}")),
@@ -253,19 +327,20 @@ impl TorrentStats {
         &self.transferred
     }
 
-    /// Verified piece data received this session.
+    /// Verified piece data received this session, by earlier runs too.
     pub fn downloaded(&self) -> u64 {
-        self.transferred.downloaded.load(Ordering::Relaxed)
+        self.previous.downloaded + self.transferred.downloaded.load(Ordering::Relaxed)
     }
 
-    /// Block data sent to peers this session.
+    /// Block data sent to peers this session, by earlier runs too.
     pub fn uploaded(&self) -> u64 {
-        self.transferred.uploaded.load(Ordering::Relaxed)
+        self.previous.uploaded + self.transferred.uploaded.load(Ordering::Relaxed)
     }
 
-    /// Block data received this session, verified or not.
+    /// Block data received this session, verified or not, by earlier runs
+    /// too.
     pub fn received(&self) -> u64 {
-        self.received.load(Ordering::Relaxed)
+        self.previous.received + self.received.load(Ordering::Relaxed)
     }
 
     pub(crate) fn add_received(&self, bytes: u64) {
@@ -458,5 +533,67 @@ mod tests {
         assert!(torrent.finished_at().is_none());
         torrent.set_state(TorrentState::Done);
         assert!(torrent.finished_at().is_some());
+    }
+
+    #[test]
+    fn a_torrent_pausing_shows_so_until_it_is_paused() {
+        let torrent = TorrentStats::new([1; 20], "t", Path::new("."));
+        torrent.set_state(TorrentState::Pausing);
+        torrent.set_state(TorrentState::Downloading);
+        assert_eq!(torrent.state(), TorrentState::Pausing);
+        torrent.finish(&Err(Interrupted {
+            remaining: 1,
+            pieces: 2,
+        }
+        .into()));
+        assert_eq!(torrent.state(), TorrentState::Pausing);
+        assert!(torrent.finished_at().is_some());
+        torrent.set_state(TorrentState::Paused);
+        assert!(torrent.state().is_finished());
+
+        // A pause that comes too late shows how it ended.
+        let torrent = TorrentStats::new([1; 20], "t", Path::new("."));
+        torrent.set_state(TorrentState::Pausing);
+        torrent.finish(&Ok(()));
+        assert_eq!(torrent.state(), TorrentState::Done);
+    }
+
+    #[test]
+    fn a_torrent_run_again_keeps_its_row_and_counts() {
+        use crate::client::ConnectionSlots;
+        use crate::rate_limit::RateLimits;
+        use crate::stats::SessionStats;
+
+        let session = SessionStats::new(
+            Arc::new(RateLimits::from_kib(0, 0)),
+            ConnectionSlots::new(1),
+        );
+        let first = session.add_torrent([1; 20], "a", Path::new("."));
+        session.add_torrent([2; 20], "b", Path::new("."));
+        first.transferred().downloaded.store(100, Ordering::Relaxed);
+        first.transferred().uploaded.store(40, Ordering::Relaxed);
+        first.add_received(120);
+        // Still running: a second run of it gets a row of its own.
+        let duplicate = session.add_torrent([1; 20], "a", Path::new("."));
+        assert_eq!(session.torrents().len(), 3);
+        duplicate.set_state(TorrentState::Failed("x".into()));
+        first.set_state(TorrentState::Paused);
+
+        // Ended: the first such row is taken over.
+        let again = session.add_torrent([1; 20], "a", Path::new("."));
+        let torrents = session.torrents();
+        assert_eq!(torrents.len(), 3);
+        assert!(Arc::ptr_eq(&torrents[0], &again));
+        assert_eq!(again.added(), first.added());
+        assert!(again.started() > first.added());
+        assert_eq!((again.downloaded(), again.uploaded()), (100, 40));
+        assert_eq!(again.received(), 120);
+        // The tracker hears of this run's only.
+        assert_eq!(again.transferred().uploaded.load(Ordering::Relaxed), 0);
+        let previous = again.previous();
+        assert_eq!(previous.active, first.active(Instant::now()));
+        assert!(again.active(Instant::now()) >= previous.active);
+        again.transferred().uploaded.store(5, Ordering::Relaxed);
+        assert_eq!(again.uploaded(), 45);
     }
 }

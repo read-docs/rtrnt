@@ -1,6 +1,7 @@
 //! The bottom line: the keys, a notice, or what the session is doing.
 
 use super::keys;
+use crate::tui::Command;
 use crate::tui::app::App;
 use crate::tui::snapshot::Snapshot;
 use ratatui::Frame;
@@ -21,7 +22,8 @@ const KEYS: &[(&str, &str)] = &[
     ("q", "quit"),
 ];
 
-/// Keys shown after them where there is room.
+/// Keys shown after them where there is room, after `p` for the selected
+/// torrent.
 const MORE_KEYS: &[(&str, &str)] = &[("d u", "limits"), ("m", "mouse")];
 
 pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
@@ -32,15 +34,20 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
             Style::new().fg(theme.warn()),
         ))
     } else if snapshot.finished {
+        let text = match app.pause_command(snapshot) {
+            Some((Command::Resume(_), _)) => " nothing running, press p to resume or q to exit",
+            _ => " nothing running, press q to exit",
+        };
         Line::from(Span::styled(
-            " nothing running, press q to exit",
+            text,
             Style::new().fg(theme.warn()).add_modifier(Modifier::BOLD),
         ))
     } else {
         let mut spans = vec![Span::raw(" ")];
         spans.extend(keys(theme, KEYS));
         let width = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>();
-        for pair in MORE_KEYS {
+        let pause = app.pause_command(snapshot).map(|(_, word)| ("p", word));
+        for pair in pause.iter().chain(MORE_KEYS) {
             let more: Vec<Span> = [Span::raw("  ")]
                 .into_iter()
                 .chain(keys(theme, std::slice::from_ref(pair)))

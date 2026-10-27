@@ -15,6 +15,7 @@ const KEYS: &[(&str, &str)] = &[
     ("l", "show or hide the log"),
     ("s  S", "sort by the next column, reverse the order"),
     ("/", "filter torrents by name; esc clears it"),
+    ("p", "pause the selected torrent, or resume it"),
     ("d  u", "set the download or upload limit, in KiB/s"),
     ("m", "turn the mouse off to select text, and on again"),
     ("?", "this help"),

@@ -5,6 +5,7 @@ use crate::client::Client;
 use crate::download::{self, Interrupted};
 use crate::magnet::{self, FetchInterrupted, MagnetLink};
 use crate::source::Source;
+use crate::stats::{TorrentState, TorrentStats};
 use crate::torrent::{self, Metainfo};
 use anyhow::Result;
 use futures_util::future::BoxFuture;
@@ -13,7 +14,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{self, JoinError, JoinSet};
-use tracing::{Instrument, Span, error, info_span, warn};
+use tracing::{Instrument, Span, error, info, info_span, warn};
 
 /// Exit code for a run stopped by Ctrl-C (128 + SIGINT).
 pub const EXIT_INTERRUPTED: u8 = 130;
@@ -25,6 +26,12 @@ pub enum Command {
     Stop,
     /// Change the download and upload limits to these KiB/s, 0 for none.
     SetRateLimits(u64, u64),
+    /// Stop the running torrent with this info hash, to start it again
+    /// later.
+    Pause([u8; 20]),
+    /// Start the paused or ended torrent with this info hash again, from
+    /// where it got to.
+    Resume([u8; 20]),
 }
 
 /// Resolves when a torrent is to stop.
@@ -63,7 +70,7 @@ pub enum State {
     Running {
         stop: watch::Sender<bool>,
     },
-    /// Its task was stopped, to be started again.
+    /// Its task was stopped by a pause, to be started again.
     Paused,
     Ended(Outcome),
 }
@@ -148,35 +155,44 @@ where
     pub async fn start(&mut self, sources: Vec<Source>) {
         self.several = sources.len() > 1;
         for source in sources {
-            let span = if self.several {
-                info_span!("torrent", name = %source.label())
-            } else {
-                Span::none()
-            };
-            let torrent = match &source {
-                Source::File(path) => {
-                    match torrent::load_metainfo(path).instrument(span.clone()).await {
-                        Ok(metainfo) => Torrent::File(metainfo),
-                        Err(e) => {
-                            if self.several {
-                                span.in_scope(|| error!("{e:#}"));
-                            }
-                            self.unloaded.push(e);
-                            continue;
-                        }
+            let span = self.span(&source);
+            let torrent = match load(&source, &span).await {
+                Ok(torrent) => torrent,
+                Err(e) => {
+                    if self.several {
+                        span.in_scope(|| error!("{e:#}"));
                     }
+                    self.unloaded.push(e);
+                    continue;
                 }
-                Source::Magnet(link) => Torrent::Magnet(link.clone()),
             };
-            self.spawn(source, torrent, span);
+            let info_hash = torrent.info_hash();
+            let state = self.spawn(torrent, span);
+            self.entries.push(Entry {
+                source,
+                info_hash,
+                state,
+            });
         }
         self.idle.send_replace(self.tasks.is_empty());
     }
 
-    /// Runs `torrent` in a task of its own, as the entry for `source`.
-    fn spawn(&mut self, source: Source, torrent: Torrent, span: Span) {
+    /// What the logs of the torrent from `source` are under: its name, with
+    /// several torrents.
+    fn span(&self, source: &Source) -> Span {
+        if self.several {
+            info_span!("torrent", name = %source.label())
+        } else {
+            Span::none()
+        }
+    }
+
+    /// Runs `torrent` in a task of its own, and returns the state of its
+    /// entry.
+    fn spawn(&mut self, torrent: Torrent, span: Span) -> State {
         let info_hash = torrent.info_hash();
         let (stop, stopped) = watch::channel(false);
+        let paused = stopped.clone();
         let session = (self.stop)();
         let stop_signal: StopSignal = Box::pin(async move {
             tokio::select! {
@@ -186,15 +202,15 @@ where
         });
         let run = (self.run_torrent)(Arc::clone(&self.client), torrent, stop_signal);
         let several = self.several;
-        let task = self
-            .tasks
-            .spawn(async move { outcome(run.await, several) }.instrument(span));
+        let task = self.tasks.spawn(
+            async move {
+                let result = run.await;
+                outcome(result, several, *paused.borrow())
+            }
+            .instrument(span),
+        );
         self.running.insert(task.id(), info_hash);
-        self.entries.push(Entry {
-            source,
-            info_hash,
-            state: State::Running { stop },
-        });
+        State::Running { stop }
     }
 
     /// Runs until no torrent's task is running and `commands` is closed,
@@ -215,7 +231,7 @@ where
             tokio::select! {
                 Some(joined) = self.tasks.join_next_with_id() => self.ended(joined),
                 command = commands.recv(), if open => match command {
-                    Some(command) => self.command(command),
+                    Some(command) => self.command(command).await,
                     None => open = false,
                 },
             }
@@ -233,12 +249,86 @@ where
                 entry.info_hash == info_hash && matches!(entry.state, State::Running { .. })
             })
         {
-            entry.state = State::Ended(outcome);
+            let paused = matches!(&entry.state, State::Running { stop } if *stop.borrow());
+            entry.state = match outcome {
+                Outcome::Interrupted if paused => {
+                    let pausing = |state: &TorrentState| *state == TorrentState::Pausing;
+                    if let Some(stats) = stats_of(&self.client, info_hash, pausing) {
+                        stats.set_state(TorrentState::Paused);
+                    }
+                    State::Paused
+                }
+                Outcome::Failed(e) => {
+                    // A torrent run again that failed before it had stats
+                    // of its own still shows its earlier run's.
+                    let paused = |state: &TorrentState| *state == TorrentState::Paused;
+                    if let Some(stats) = stats_of(&self.client, info_hash, paused) {
+                        stats.set_state(TorrentState::Failed(format!("{e:#}")));
+                    }
+                    State::Ended(Outcome::Failed(e))
+                }
+                outcome => State::Ended(outcome),
+            };
         }
         self.idle.send_replace(self.tasks.is_empty());
     }
 
-    fn command(&mut self, command: Command) {
+    /// Asks the running torrent with info hash `info_hash` to stop, for a
+    /// pause; its task ends as it does on Ctrl-C.
+    fn pause(&mut self, info_hash: [u8; 20]) {
+        let Some(State::Running { stop }) = self
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.info_hash == info_hash && matches!(entry.state, State::Running { .. })
+            })
+            .map(|entry| &entry.state)
+        else {
+            return;
+        };
+        if stop.send_replace(true) {
+            return;
+        }
+        let running = |state: &TorrentState| !state.is_finished();
+        if let Some(stats) = stats_of(&self.client, info_hash, running) {
+            stats.set_state(TorrentState::Pausing);
+        }
+    }
+
+    /// Starts the paused or ended torrent with info hash `info_hash` again,
+    /// from its source. A torrent file is loaded again; a magnet link finds
+    /// the metadata its earlier run saved, if it got that far.
+    async fn resume(&mut self, info_hash: [u8; 20]) {
+        let Some(index) = self.entries.iter().position(|entry| {
+            entry.info_hash == info_hash && !matches!(entry.state, State::Running { .. })
+        }) else {
+            return;
+        };
+        let source = self.entries[index].source.clone();
+        let span = self.span(&source);
+        let state = match load(&source, &span).await {
+            Ok(torrent) if torrent.info_hash() == info_hash => {
+                span.in_scope(|| info!("resuming"));
+                self.spawn(torrent, span.clone())
+            }
+            Ok(_) => State::Ended(Outcome::Failed(anyhow::anyhow!(
+                "the torrent file has changed"
+            ))),
+            Err(e) => State::Ended(Outcome::Failed(e)),
+        };
+        if let State::Ended(Outcome::Failed(e)) = &state {
+            span.in_scope(|| error!("{e:#}"));
+            self.client.stats().notice(format!("cannot resume: {e:#}"));
+            let ended = |state: &TorrentState| state.is_finished();
+            if let Some(stats) = stats_of(&self.client, info_hash, ended) {
+                stats.set_state(TorrentState::Failed(format!("{e:#}")));
+            }
+        }
+        self.entries[index].state = state;
+        self.idle.send_replace(self.tasks.is_empty());
+    }
+
+    async fn command(&mut self, command: Command) {
         let limit = |kib: u64| match kib {
             0 => "none".to_string(),
             kib => format!("{kib} KiB/s"),
@@ -252,6 +342,8 @@ where
                     limit(up)
                 ));
             }
+            Command::Pause(info_hash) => self.pause(info_hash),
+            Command::Resume(info_hash) => self.resume(info_hash).await,
             // The feed stops the torrents itself.
             Command::Stop => {}
         }
@@ -264,7 +356,11 @@ where
         for entry in self.entries {
             match entry.state {
                 State::Ended(Outcome::Failed(e)) => failed.push(e),
-                State::Ended(Outcome::Interrupted) | State::Paused => interrupted = true,
+                State::Paused => {
+                    warn!(name = %entry.source.label(), "paused; run again to resume");
+                    interrupted = true;
+                }
+                State::Ended(Outcome::Interrupted) => interrupted = true,
                 State::Ended(Outcome::Done) | State::Running { .. } => {}
             }
         }
@@ -298,6 +394,33 @@ fn run_torrent(
     })
 }
 
+/// Gets `source` ready to start, loading a torrent file, with its logs
+/// under `span`.
+async fn load(source: &Source, span: &Span) -> Result<Torrent> {
+    Ok(match source {
+        Source::File(path) => Torrent::File(
+            torrent::load_metainfo(path)
+                .instrument(span.clone())
+                .await?,
+        ),
+        Source::Magnet(link) => Torrent::Magnet(link.clone()),
+    })
+}
+
+/// The stats of the torrent with info hash `info_hash` whose state is
+/// `wanted`: of the run the manager means, should two share it.
+fn stats_of(
+    client: &Client,
+    info_hash: [u8; 20],
+    wanted: impl Fn(&TorrentState) -> bool,
+) -> Option<Arc<TorrentStats>> {
+    client
+        .stats()
+        .torrents()
+        .into_iter()
+        .find(|stats| stats.info_hash() == info_hash && wanted(&stats.state()))
+}
+
 /// Resolves once `stop` is set; never if its sender is dropped first.
 async fn own_stop(mut stop: watch::Receiver<bool>) {
     if stop.wait_for(|&stop| stop).await.is_err() {
@@ -306,12 +429,17 @@ async fn own_stop(mut stop: watch::Receiver<bool>) {
 }
 
 /// What `result` says of how a torrent ended, logged. With `several`, a
-/// failure is logged here, since the session goes on.
-fn outcome(result: Result<()>, several: bool) -> Outcome {
+/// failure is logged here, since the session goes on. A torrent `paused`
+/// can be resumed in this session, so it does not say to run again.
+fn outcome(result: Result<()>, several: bool, paused: bool) -> Outcome {
     match result {
         Ok(()) => Outcome::Done,
         Err(e) if e.is::<Interrupted>() || e.is::<FetchInterrupted>() => {
-            warn!("{e}; run again to resume");
+            if paused {
+                info!("paused");
+            } else {
+                warn!("{e}; run again to resume");
+            }
             Outcome::Interrupted
         }
         Err(e) => {

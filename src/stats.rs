@@ -18,7 +18,8 @@ mod torrent;
 pub use peer::{PeerFlags, PeerStats};
 pub(crate) use torrent::PieceSource;
 pub use torrent::{
-    Layout, PeerSource, PieceSnapshot, TorrentState, TorrentStats, TrackerResult, TrackerStatus,
+    Layout, PeerSource, PieceSnapshot, Previous, TorrentState, TorrentStats, TrackerResult,
+    TrackerStatus,
 };
 
 /// What every torrent of a `Client` shares, and the torrents themselves.
@@ -55,15 +56,40 @@ impl SessionStats {
 
     /// Adds a torrent called `name` (until its metadata says otherwise),
     /// saved under `save_path`.
+    ///
+    /// A torrent run again, after a pause or once it ended, takes the place
+    /// of its earlier run's stats, so it keeps its row, when it was added,
+    /// and what the earlier runs downloaded and uploaded and how long they
+    /// ran. One with the same info hash still running is left alone.
     pub fn add_torrent(
         &self,
         info_hash: [u8; 20],
         name: &str,
         save_path: &Path,
     ) -> Arc<TorrentStats> {
-        let torrent = Arc::new(TorrentStats::new(info_hash, name, save_path));
-        lock(&self.torrents).push(Arc::clone(&torrent));
-        torrent
+        let mut torrents = lock(&self.torrents);
+        let earlier = torrents
+            .iter_mut()
+            .find(|torrent| torrent.info_hash() == info_hash && torrent.finished_at().is_some());
+        match earlier {
+            Some(earlier) => {
+                let previous = earlier.so_far(Instant::now());
+                let torrent = Arc::new(TorrentStats::again(
+                    info_hash,
+                    name,
+                    save_path,
+                    earlier.added(),
+                    previous,
+                ));
+                *earlier = Arc::clone(&torrent);
+                torrent
+            }
+            None => {
+                let torrent = Arc::new(TorrentStats::new(info_hash, name, save_path));
+                torrents.push(Arc::clone(&torrent));
+                torrent
+            }
+        }
     }
 
     pub(crate) fn set_dht(&self, dht: Dht) {

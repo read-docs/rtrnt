@@ -37,10 +37,13 @@ When stdout and stderr are terminals, a run shows a full-screen UI instead of pr
 | `l` | show or hide the log |
 | `s` / `S` | sort by the next column / reverse the order |
 | `/` | filter torrents by name; `esc` clears the filter |
+| `p` | pause the selected torrent, or resume it; a finished or failed torrent is run again |
 | `d` / `u` | set the download / upload limit in KiB/s, 0 for none, until the run ends; the header shows the limits next to the rates |
 | `m` | turn the mouse off, so the terminal can select text, or on again |
 | `?` | help |
 | `q`, `Ctrl-C` | stop the torrents, as Ctrl-C does without the UI; pressed again, quit at once |
+
+A pause stops the torrent as Ctrl-C does: the tracker hears `stopped`, its peers are let go, and the resume file is saved once the pieces being written are on disk. The files stay as they are. Resuming starts it again from that resume file, so nothing is hashed, and a magnet link whose metadata had arrived from the `.torrent` it saved, so the metadata is not fetched again. A complete torrent resumed seeds if `--seed-ratio` or `--seed-time` says to, and is otherwise done at once. The row keeps its place, and its totals, ratio and time active count the earlier runs; so does the seed ratio, so a pause does not start the share over (the seed time does start over). A torrent still paused when the session ends makes the exit code 130, as Ctrl-C does, and the next run resumes it.
 
 The mouse works too: click a torrent or a peer to select it, a column heading to sort by it (again to reverse), or a tab title to show it; the wheel moves the selection, or scrolls the detail panel, under the pointer. While the UI has the mouse, most terminals still select text with Shift held down, or press `m` to give the mouse back.
 
