@@ -1,5 +1,6 @@
 use crate::torrent::Info;
 use anyhow::{Context, Result, bail};
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -71,6 +72,23 @@ impl HandleCache {
 }
 
 impl Storage {
+    /// Where each file of the torrent will be, as keys for telling whether
+    /// two torrents share a file: under `out_dir` made absolute (creating
+    /// it if need be), and lowercased where the usual file systems ignore
+    /// case. Nothing else is created.
+    pub fn paths(info: &Info, out_dir: &Path) -> Result<Vec<PathBuf>> {
+        std::fs::create_dir_all(out_dir)
+            .with_context(|| format!("failed to create {}", out_dir.display()))?;
+        let out_dir = out_dir
+            .canonicalize()
+            .with_context(|| format!("failed to resolve {}", out_dir.display()))?;
+        let files = layout(info, &out_dir)?;
+        Ok(files
+            .into_iter()
+            .map(|file| fold_case(&file.path))
+            .collect())
+    }
+
     /// Creates (or opens) every file with its final size. Single-file
     /// torrents go in `out_dir/name`, multi-file ones under `out_dir/name/`.
     pub fn new(info: &Info, out_dir: &Path) -> Result<Self> {
@@ -281,8 +299,20 @@ fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result
     Ok(())
 }
 
+/// `path` as it is compared with others: lowercased on macOS and Windows,
+/// whose default file systems treat names that differ only in case as one
+/// file.
+fn fold_case(path: &Path) -> PathBuf {
+    if cfg!(any(target_os = "macos", windows)) {
+        PathBuf::from(path.to_string_lossy().to_lowercase())
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// Where each file of the torrent goes: `out_dir/name` for a single file,
-/// under `out_dir/name/` for several. Nothing is touched on disk.
+/// under `out_dir/name/` for several. Fails if two files share a path.
+/// Nothing is touched on disk.
 fn layout(info: &Info, out_dir: &Path) -> Result<Vec<FileSpan>> {
     check_component(&info.name)?;
     let root = out_dir.join(&info.name);
@@ -316,6 +346,12 @@ fn layout(info: &Info, out_dir: &Path) -> Result<Vec<FileSpan>> {
             }
         }
         _ => bail!("torrent must have exactly one of `length` or `files`"),
+    }
+    let mut seen = HashSet::new();
+    for file in &files {
+        if !seen.insert(fold_case(&file.path)) {
+            bail!("torrent lists {} twice", file.path.display());
+        }
     }
     Ok(files)
 }
@@ -462,5 +498,36 @@ mod tests {
         let mut info = multi_file_info(&[(&["ok"], 1)]);
         info.name = "..".into();
         assert!(Storage::new(&info, dir.path()).is_err());
+    }
+
+    #[test]
+    fn rejects_the_same_path_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = multi_file_info(&[(&["a"], 1), (&["sub", "b"], 1), (&["a"], 2)]);
+        let err = Storage::new(&info, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("twice"), "{err:#}");
+        assert!(Storage::paths(&info, dir.path()).is_err());
+        assert!(Storage::open_existing(&info, dir.path()).is_err());
+        assert!(!dir.path().join("root").exists());
+
+        let info = multi_file_info(&[(&["a"], 1), (&["A"], 1)]);
+        // Names that differ in case are two files only where case counts.
+        assert_eq!(
+            Storage::new(&info, dir.path()).is_err(),
+            cfg!(any(target_os = "macos", windows))
+        );
+    }
+
+    #[test]
+    fn paths_sit_under_the_absolute_output_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("new").join("out");
+        let info = multi_file_info(&[(&["a"], 1), (&["sub", "b"], 1)]);
+        let paths = Storage::paths(&info, &out).unwrap();
+        assert!(out.is_dir());
+        assert!(!out.join("root").exists());
+        let root = out.canonicalize().unwrap().join("root");
+        let expected = [root.join("a"), root.join("sub").join("b")];
+        assert_eq!(paths, expected.map(|path| fold_case(&path)));
     }
 }

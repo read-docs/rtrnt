@@ -1216,7 +1216,12 @@ const BLOCK: u32 = 16 * 1024;
 
 /// Writes every file of the torrent in place, as a finished download would.
 fn write_files(out: &Path, data: &[u8]) {
-    let dir = out.join("multi/dir");
+    write_named_files(out, "multi", data);
+}
+
+/// `write_files` for a torrent made by `make_named_torrent`.
+fn write_named_files(out: &Path, torrent: &str, data: &[u8]) {
+    let dir = out.join(torrent).join("dir");
     std::fs::create_dir_all(&dir).unwrap();
     let mut offset = 0;
     for (name, len) in FILES {
@@ -1928,6 +1933,68 @@ async fn a_client_runs_a_torrent_once() {
     );
     // Once done, the torrent may run again.
     assert!(client.claim(info_hash).is_ok());
+}
+
+/// Two torrents that write the same files: the one that starts first runs,
+/// the other fails, naming the file and the first torrent, and leaves the
+/// files, and the first's resume file, as they were.
+#[tokio::test]
+async fn a_torrent_sharing_a_file_with_a_running_one_is_refused() {
+    init_tracing();
+    let out = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let data = Arc::new(test_data());
+    let other: Vec<u8> = data.iter().map(|b| b ^ 7).collect();
+    let (mut first, first_hash) = make_named_torrent(&data, "shared");
+    let (second, second_hash) = make_named_torrent(&other, "shared");
+    assert_ne!(first_hash, second_hash);
+    let (tracker_url, _queries) = mock_tracker(Vec::new()).await;
+    first.announce = Some(tracker_url);
+    let first_path = out.path().join("first.torrent");
+    let second_path = out.path().join("second.torrent");
+    std::fs::write(&first_path, serde_bencode::to_bytes(&first).unwrap()).unwrap();
+    std::fs::write(&second_path, serde_bencode::to_bytes(&second).unwrap()).unwrap();
+    write_named_files(out.path(), "shared", &data);
+
+    let mut config = resume_config(out.path(), state.path());
+    // Seeds until stopped, so it is still running when the second starts.
+    config.seed = SeedLimits {
+        ratio: 0.0,
+        time: Duration::from_secs(3600),
+    };
+    let client = client(config);
+    let (stop, stop_rx) = oneshot::channel::<()>();
+    let running = download_file(&first_path, &client, async {
+        stop_rx.await.ok();
+    });
+    let refused = async {
+        // Wait until the first has claimed its torrent, and so its files.
+        while client.claim(first_hash).is_ok() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let err = download_file(&second_path, &client, pending())
+            .await
+            .unwrap_err();
+        stop.send(()).unwrap();
+        err
+    };
+    let (running, err) = tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::join!(running, refused)
+    })
+    .await
+    .expect("timed out");
+    running.expect("first run failed");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("a.bin") && message.contains("shared"),
+        "{message}"
+    );
+    assert_named_files_match(out.path(), "shared", &data);
+    let resumes: Vec<_> = std::fs::read_dir(state.path()).unwrap().collect();
+    assert_eq!(resumes.len(), 1, "{resumes:?}");
+    // Once the first is done, the second may take the files over.
+    let claim = client.claim(second_hash).unwrap();
+    drop(claim);
 }
 
 /// With only a time limit and nobody to upload to, seeding lasts until the

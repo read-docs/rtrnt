@@ -169,7 +169,9 @@ pub struct Session {
 ///
 /// The torrent shares the client's listening port, DHT node, rate limits,
 /// connection slots and turn to check the data on disk with the client's
-/// other torrents, and fails if the client is running it already.
+/// other torrents, and fails if the client is running it already, or is
+/// running a torrent that writes one of the same files, before it creates
+/// or reads anything.
 ///
 /// A download that is already complete on disk exits at once, unless it is
 /// to be seeded.
@@ -191,7 +193,13 @@ pub async fn download_file(
         info_hash = %hex(&info_hash),
         "loaded torrent"
     );
-    let _claim = client.claim(info_hash)?;
+    let mut claim = client.claim(info_hash)?;
+    // Before anything is created, so a torrent that shares a file with a
+    // running one leaves its files alone.
+    claim.claim_files(
+        &torrent.info.name,
+        &Storage::paths(&torrent.info, &config.output_dir)?,
+    )?;
 
     // Before announcing, so a bad output directory does not leave the
     // tracker without a `stopped`.

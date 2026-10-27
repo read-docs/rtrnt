@@ -1,6 +1,6 @@
 //! What the torrents of one session share: the settings, our peer id, the
 //! listening port, the DHT node, the rate limits, the connection slots, the
-//! hashing queue and the progress bars.
+//! hashing queue, the files the torrents write and the progress bars.
 
 use crate::dht::Dht;
 use crate::download::DownloadConfig;
@@ -9,11 +9,15 @@ use crate::peer;
 use crate::rate_limit::RateLimits;
 use anyhow::{Result, bail};
 use indicatif::MultiProgress;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, OnceCell, OwnedSemaphorePermit, Semaphore};
 use tracing::{Instrument, Span, info, info_span, warn};
+
+/// The info hash and name of the torrent that writes a file.
+type FileOwner = ([u8; 20], Arc<str>);
 
 /// Runs any number of torrents at once, each through `download_file` or
 /// `download_magnet`, sharing one listening port, one DHT node and one pair
@@ -33,6 +37,9 @@ pub struct Client {
     dht: OnceCell<Option<Dht>>,
     /// Info hashes of the torrents running, so none runs twice.
     torrents: Mutex<HashSet<[u8; 20]>>,
+    /// The files the torrents running write, keyed as `Storage::paths`
+    /// gives them, with the info hash and name of the torrent that owns each.
+    files: Mutex<HashMap<PathBuf, FileOwner>>,
 }
 
 impl Client {
@@ -58,6 +65,7 @@ impl Client {
             listener: OnceCell::new(),
             dht: OnceCell::new(),
             torrents: Mutex::new(HashSet::new()),
+            files: Mutex::new(HashMap::new()),
         }
     }
 
@@ -129,11 +137,47 @@ impl Client {
         Ok(Claim {
             client: self,
             info_hash,
+            files: None,
+        })
+    }
+
+    /// Marks `paths` (see `Storage::paths`) as written by the torrent with
+    /// `info_hash` and `name` until the returned claim is dropped. Fails,
+    /// claiming nothing, if another torrent holds any of them.
+    pub fn claim_files(
+        &self,
+        info_hash: [u8; 20],
+        name: &str,
+        paths: &[PathBuf],
+    ) -> Result<FileClaim<'_>> {
+        let mut files = self.lock_files();
+        for path in paths {
+            if let Some((owner, other)) = files.get(path)
+                && *owner != info_hash
+            {
+                bail!(
+                    "{} is also written by the torrent {other}, which is running in this session",
+                    path.display()
+                );
+            }
+        }
+        let name: Arc<str> = name.into();
+        for path in paths {
+            files.insert(path.clone(), (info_hash, Arc::clone(&name)));
+        }
+        Ok(FileClaim {
+            client: self,
+            info_hash,
+            paths: paths.to_vec(),
         })
     }
 
     fn lock_torrents(&self) -> MutexGuard<'_, HashSet<[u8; 20]>> {
         self.torrents.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn lock_files(&self) -> MutexGuard<'_, HashMap<PathBuf, FileOwner>> {
+        self.files.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -201,11 +245,43 @@ impl Drop for SlotPermit {
 pub struct Claim<'a> {
     client: &'a Client,
     info_hash: [u8; 20],
+    /// Set once the torrent's layout is known.
+    files: Option<FileClaim<'a>>,
+}
+
+impl Claim<'_> {
+    /// Claims the files of this torrent, called `name`, for as long as the
+    /// claim lasts (see `Client::claim_files`).
+    pub fn claim_files(&mut self, name: &str, paths: &[PathBuf]) -> Result<()> {
+        self.files = Some(self.client.claim_files(self.info_hash, name, paths)?);
+        Ok(())
+    }
 }
 
 impl Drop for Claim<'_> {
     fn drop(&mut self) {
         self.client.lock_torrents().remove(&self.info_hash);
+    }
+}
+
+/// The files a torrent writes, free for others once this is dropped.
+pub struct FileClaim<'a> {
+    client: &'a Client,
+    info_hash: [u8; 20],
+    paths: Vec<PathBuf>,
+}
+
+impl Drop for FileClaim<'_> {
+    fn drop(&mut self) {
+        let mut files = self.client.lock_files();
+        for path in &self.paths {
+            if files
+                .get(path)
+                .is_some_and(|(owner, _)| *owner == self.info_hash)
+            {
+                files.remove(path);
+            }
+        }
     }
 }
 
@@ -238,6 +314,70 @@ mod tests {
         assert!(client.claim([1; 20]).is_err());
         drop(claim);
         assert!(client.claim([1; 20]).is_ok());
+    }
+
+    #[test]
+    fn torrents_cannot_claim_each_others_files() {
+        let client = client(false);
+        let paths = |names: &[&str]| -> Vec<PathBuf> {
+            names
+                .iter()
+                .map(|name| PathBuf::from("/out").join(name))
+                .collect()
+        };
+        let first = client
+            .claim_files([1; 20], "first", &paths(&["a", "b"]))
+            .unwrap();
+        let err = client
+            .claim_files([2; 20], "second", &paths(&["c", "b"]))
+            .err()
+            .expect("shared file accepted");
+        let message = err.to_string();
+        assert!(
+            message.contains("/out/b") && message.contains("first"),
+            "{message}"
+        );
+        // The failed claim took nothing, not even the file that was free.
+        let _disjoint = client
+            .claim_files([3; 20], "third", &paths(&["c", "d"]))
+            .unwrap();
+        drop(first);
+        assert!(
+            client
+                .claim_files([2; 20], "second", &paths(&["b"]))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_claim_frees_its_files_when_it_ends() {
+        let client = client(false);
+        let paths = [PathBuf::from("/out/a")];
+        let mut claim = client.claim([1; 20]).unwrap();
+        claim.claim_files("first", &paths).unwrap();
+        assert!(client.claim_files([2; 20], "second", &paths).is_err());
+        drop(claim);
+        assert!(client.claim_files([2; 20], "second", &paths).is_ok());
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn names_that_differ_in_case_collide() {
+        use crate::storage::Storage;
+        let dir = tempfile::tempdir().unwrap();
+        let client = client(false);
+        let info = |name: &str| crate::torrent::Info {
+            name: name.into(),
+            piece_length: 4,
+            pieces: serde_bytes::ByteBuf::new(),
+            private: None,
+            length: Some(1),
+            files: None,
+        };
+        let lower = Storage::paths(&info("movie.mkv"), dir.path()).unwrap();
+        let upper = Storage::paths(&info("MOVIE.mkv"), dir.path()).unwrap();
+        let _first = client.claim_files([1; 20], "lower", &lower).unwrap();
+        assert!(client.claim_files([2; 20], "upper", &upper).is_err());
     }
 
     #[test]

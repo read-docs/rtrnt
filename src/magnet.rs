@@ -232,7 +232,8 @@ pub async fn saved_torrent(link: &MagnetLink, output_dir: &Path) -> Option<PathB
 ///
 /// As in `download_file`, the torrent shares the client's listening port,
 /// DHT node, rate limits, connection slots and turn to check the data on disk
-/// with the client's other torrents. `shutdown` is first polled while the
+/// with the client's other torrents, and it fails, once the metadata has
+/// arrived, if one of them writes a file it would. `shutdown` is first polled while the
 /// metadata is fetched, or, with metadata saved by an earlier run, as in
 /// `download_file`.
 pub async fn download_magnet(
@@ -252,7 +253,7 @@ pub async fn download_magnet(
         trackers = link.trackers.len(),
         "fetching metadata for magnet link"
     );
-    let _claim = client.claim(info_hash)?;
+    let mut claim = client.claim(info_hash)?;
     let peer_id = client.peer_id();
     let dht = client.dht().await;
     let mut incoming = client.listener().await.register(info_hash)?;
@@ -314,6 +315,10 @@ pub async fn download_magnet(
             pieces = torrent.num_pieces(),
             "fetched metadata"
         );
+        claim.claim_files(
+            &torrent.info.name,
+            &Storage::paths(&torrent.info, &config.output_dir)?,
+        )?;
         save_torrent(link, &config.output_dir, &tiers, &fetched.metadata).await;
         let storage = Arc::new(Storage::new(&torrent.info, &config.output_dir)?);
         // BEP 27: a private torrent's peers come from its trackers alone.

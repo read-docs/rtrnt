@@ -24,7 +24,7 @@ cargo run --release -- 'magnet:?xt=urn:btih:...&tr=udp://tracker.example:1337' -
 cargo run --release -- first.torrent second.torrent 'magnet:?xt=urn:btih:...' -o ~/Downloads
 ```
 
-Give several torrents and they are downloaded at once, each with its own progress bar, sharing one listening port, one DHT node, the rate limits and the connection limit, and checking the data already on disk one torrent at a time. One that fails does not stop the others, Ctrl-C stops them all, and the run ends when every one is done (and seeded, with `--seed-ratio` or `--seed-time`). With `--check` or `--scrape`, each torrent is handled in turn under its name.
+Give several torrents and they are downloaded at once, each with its own progress bar, sharing one listening port, one DHT node, the rate limits and the connection limit, and checking the data already on disk one torrent at a time. One that fails does not stop the others, Ctrl-C stops them all, and the run ends when every one is done (and seeded, with `--seed-ratio` or `--seed-time`). A torrent that would write a file another running one writes is refused, naming the file, before it touches anything. With `--check` or `--scrape`, each torrent is handled in turn under its name.
 
 A magnet link works wherever a .torrent file does. The torrent's metadata is fetched from peers found through the link's trackers (`tr`), its peers (`x.pe`) and the DHT, then the download carries on with the same peers. The metadata is saved as `<info hash>.torrent` in the output directory, so running the same link again resumes without fetching it, and `--check` uses that file (it fails without it). `--scrape` asks the link's trackers.
 
