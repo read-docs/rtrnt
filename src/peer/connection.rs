@@ -1,4 +1,23 @@
-use super::*;
+use crate::extension::{self, Advertised, ExtendedHandshake};
+use anyhow::{Context, Result, anyhow, bail};
+use bytes::{Buf, BytesMut};
+use std::net::SocketAddr;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::{Duration, Instant, timeout};
+use tracing::debug;
+
+use super::{
+    HANDSHAKE_TIMEOUT, Handshake, Incoming, KEEPALIVE_INTERVAL, MAX_FRAME, PeerMessage,
+    handshake_bytes, parse_handshake,
+};
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Have messages kept from a peer while the number of pieces is unknown
+/// (see `PeerConnection::defer_pieces`); more are dropped.
+const MAX_DEFERRED_HAVES: usize = 1 << 16;
 
 /// A peer sent something no honest peer would, such as a malformed
 /// extension handshake. Unlike a failed connection, this is no reason to try

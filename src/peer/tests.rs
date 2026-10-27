@@ -1,4 +1,9 @@
 use super::*;
+use crate::extension::{self, Advertised, ExtendedHandshake};
+use crate::fast;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::Instant;
 
 #[test]
 fn roundtrip_all_messages() {

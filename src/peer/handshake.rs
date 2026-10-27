@@ -1,4 +1,17 @@
-use super::*;
+use crate::extension;
+use crate::fast;
+use anyhow::{Context, Result, bail};
+use std::net::SocketAddr;
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpStream;
+use tokio::time::timeout;
+
+use super::HANDSHAKE_TIMEOUT;
+
+const PROTOCOL: &[u8; 19] = b"BitTorrent protocol";
+/// Reserved handshake bit saying we run a DHT node (BEP 5): the last bit of
+/// the last reserved byte.
+const RESERVED_DHT: u8 = 0x01;
 
 /// Our handshake.
 pub fn handshake_bytes(info_hash: &[u8; 20], peer_id: &[u8; 20]) -> [u8; 68] {

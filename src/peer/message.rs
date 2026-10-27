@@ -1,4 +1,4 @@
-use super::*;
+use anyhow::{Result, anyhow, bail};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerMessage {
