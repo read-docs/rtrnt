@@ -4,6 +4,7 @@
 mod detail;
 mod header;
 mod keybar;
+mod peers;
 mod torrents;
 
 use super::app::App;
@@ -88,6 +89,25 @@ fn bar(theme: Theme, width: usize, fraction: f64, color: Color) -> Vec<Span<'sta
         Span::styled(filled, Style::new().fg(color)),
         Span::styled("─".repeat(track), theme.border_style()),
     ]
+}
+
+const SPARKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// The last `width` of `values` as a sparkline, scaled to their peak.
+fn sparkline(values: &[f64], width: usize) -> String {
+    let values = &values[values.len().saturating_sub(width)..];
+    let peak = values.iter().copied().fold(0.0, f64::max);
+    let line: String = values
+        .iter()
+        .map(|&value| {
+            if peak <= 0.0 {
+                SPARKS[0]
+            } else {
+                SPARKS[((value / peak * 7.99) as usize).min(7)]
+            }
+        })
+        .collect();
+    format!("{line:>width$}")
 }
 
 /// `bytes` with a binary unit: one decimal under 10, none above.
@@ -256,6 +276,13 @@ mod tests {
     }
 
     #[test]
+    fn sparklines_scale_to_the_peak() {
+        assert_eq!(sparkline(&[0.0, 1.0, 2.0], 3), "▁▄█");
+        assert_eq!(sparkline(&[1.0], 3), "  █");
+        assert_eq!(sparkline(&[0.0; 2], 2), "▁▁");
+    }
+
+    #[test]
     fn text_is_cut_with_an_ellipsis() {
         assert_eq!(truncate("debian.iso", 20), "debian.iso");
         assert_eq!(truncate("debian-13.7.0-amd64.iso", 10), "debian-13…");
@@ -329,6 +356,50 @@ mod screen_tests {
         );
         assert!(lines[3].starts_with("│▌debian-13.7.0-amd64-n…  754 MiB "));
         assert!(lines[0].contains("71/200 peers") && lines[0].ends_with(" 14:02 "));
+    }
+
+    #[test]
+    fn peers_tab_lists_peers_fastest_first() {
+        let snapshot = demo::fixture();
+        let app = app(&snapshot);
+        let buffer = render(100, 32, &snapshot, &app);
+        let lines = text(&buffer, buffer.area);
+        assert!(lines[10].starts_with("│ Address                  Client                  Flags              ↓          ↑  Has"));
+        assert_eq!(
+            lines[11],
+            "│ 185.21.216.143:51413     Transmission 4.0.6      D U   F X  1.1 MiB/s   48 KiB/s  ██████████ seed│"
+        );
+        assert_eq!(
+            lines[13],
+            "│ 91.121.44.7:6881         libtorrent 2.0.11       D U   F    640 KiB/s  112 KiB/s  ████████▎─  82%│"
+        );
+        assert!(lines[18].starts_with(
+            "│ 73.92.10.211:42069       Deluge 2.2.0            d U I F        0 B/s"
+        ));
+        assert!(lines[26].starts_with("│ 9 peers  ·  D/d down unchoked/interested"));
+        assert!(lines[28].starts_with("│ ↓ ▇"), "{}", lines[28]);
+        assert!(
+            lines[28].ends_with("   4.2 MiB/s  peak 5.2 MiB/s │"),
+            "{}",
+            lines[28]
+        );
+        assert!(lines[29].contains("367 KiB/s  peak 402 KiB/s"));
+        let theme = Theme::default();
+        assert_eq!(buffer[(50, 11)].fg, theme.warn());
+        assert_eq!(buffer[(60, 11)].fg, theme.down());
+    }
+
+    #[test]
+    fn peers_scroll_and_lose_the_client_column_when_narrow() {
+        let snapshot = demo::fixture();
+        let mut app = app(&snapshot);
+        app.detail_scroll = 100;
+        let buffer = render(80, 24, &snapshot, &app);
+        let lines = text(&buffer, buffer.area);
+        assert!(lines[10].starts_with("│ Address                  Flags "));
+        // Scrolled as far as the rows go, and no further.
+        assert!(lines[11].starts_with("│ 91.121.44.7:6881"), "{}", lines[11]);
+        assert!(lines[18].starts_with("│ 3-9 of 9 peers"), "{}", lines[18]);
     }
 
     #[test]

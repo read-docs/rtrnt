@@ -58,11 +58,16 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
 
 fn draw_tab(
     frame: &mut Frame,
-    _torrent: &TorrentSnapshot,
-    _detail: Option<&Detail>,
+    torrent: &TorrentSnapshot,
+    detail: Option<&Detail>,
     app: &App,
     area: Rect,
 ) {
-    let note = Span::styled(" nothing to show yet", app.theme.dim_style());
-    frame.render_widget(Paragraph::new(note), area);
+    match app.tab {
+        Tab::Peers => super::peers::draw(frame, torrent, detail, app, area),
+        _ => {
+            let note = Span::styled(" nothing to show yet", app.theme.dim_style());
+            frame.render_widget(Paragraph::new(note), area);
+        }
+    }
 }
