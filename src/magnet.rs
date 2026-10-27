@@ -13,7 +13,7 @@
 use crate::announcer::{Announcer, Transferred};
 use crate::client::Client;
 use crate::dht::DhtSearch;
-use crate::download::{self, Session, StartPeers};
+use crate::download::{self, Limits, Session, StartPeers};
 use crate::extension::Advertised;
 use crate::metadata::MetadataFetch;
 use crate::peer_pool::PeerPool;
@@ -231,7 +231,10 @@ pub async fn saved_torrent(link: &MagnetLink, output_dir: &Path) -> Option<PathB
 /// size is known.
 ///
 /// As in `download_file`, the torrent shares the client's listening port,
-/// DHT node and rate limits with the client's other torrents.
+/// DHT node, rate limits, connection slots and turn to check the data on disk
+/// with the client's other torrents. `shutdown` is first polled while the
+/// metadata is fetched, or, with metadata saved by an earlier run, as in
+/// `download_file`.
 pub async fn download_magnet(
     link: &MagnetLink,
     client: &Client,
@@ -286,6 +289,7 @@ pub async fn download_magnet(
         info_hash,
         peer_id,
         max_peers: config.max_peers,
+        slots: client.slots(),
         incoming: &mut incoming,
         announcer: &mut announcer,
         dht: dht
@@ -334,7 +338,8 @@ pub async fn download_magnet(
             bars: client.bars().clone(),
             resume: Target::new(config, info_hash),
         });
-        let have = resume::initial_pieces(&session, config).await?;
+        let have =
+            resume::initial_pieces(&session, config, client.hashing(), shutdown.as_mut()).await?;
         let left = session.torrent.length() - download::verified_bytes(&session.torrent, &have)?;
         anyhow::Ok((session, have, left))
     };
@@ -369,7 +374,7 @@ pub async fn download_magnet(
         private: session.torrent.is_private(),
     };
     let mut connections = Vec::new();
-    for (mut conn, inbound) in fetched.connections {
+    for (mut conn, inbound, permit) in fetched.connections {
         let addr = conn.addr;
         if let Err(e) = conn.set_piece_count(num_pieces) {
             debug!(%addr, "dropping peer: {e:#}");
@@ -380,7 +385,7 @@ pub async fn download_magnet(
             debug!(%addr, "dropping peer: {e:#}");
             continue;
         }
-        connections.push((conn, inbound));
+        connections.push((conn, inbound, permit));
     }
     let start = StartPeers {
         pool: fetched.pool,
@@ -391,7 +396,10 @@ pub async fn download_magnet(
         session,
         &have,
         start,
-        config.max_peers,
+        Limits {
+            max_peers: config.max_peers,
+            slots: client.slots(),
+        },
         incoming,
         announcer,
         shutdown,

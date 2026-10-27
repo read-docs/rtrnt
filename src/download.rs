@@ -1,6 +1,6 @@
 use crate::announcer::{Announcer, Transferred};
 use crate::choker::Choker;
-use crate::client::Client;
+use crate::client::{Client, ConnectionSlots, SlotPermit};
 use crate::dht::{Dht, DhtSearch};
 use crate::extension::{self, Advertised};
 use crate::fast;
@@ -22,12 +22,12 @@ use sha1::Digest;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tracing::{Instrument, debug, info, warn};
@@ -82,7 +82,11 @@ const RESUME_SAVE_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct DownloadConfig {
     pub output_dir: PathBuf,
+    /// Most peers to be connected to at once, for each torrent.
     pub max_peers: usize,
+    /// Most peers to be connected to at once, across every torrent of a
+    /// `Client`.
+    pub max_connections: usize,
     /// Port to listen on for incoming peers; 0 picks a free one.
     pub listen_port: u16,
     pub seed: SeedLimits,
@@ -157,12 +161,15 @@ pub struct Session {
 
 /// Downloads the torrent at `torrent_path` and seeds it for as long as the
 /// client's `seed` setting says, stopping early (see `download_from_peers`)
-/// if `shutdown` resolves. It is first polled once the tracker has
-/// answered, so a signal handler behind it is only installed then.
+/// if `shutdown` resolves. It is first polled when the data on disk is
+/// checked, or, if there is none to check, once the tracker has answered, so
+/// a signal handler behind it is installed no later than that. It also ends
+/// the wait for the client's turn to check the data, and the check itself,
+/// with an `Interrupted` error.
 ///
-/// The torrent shares the client's listening port, DHT node and rate limits
-/// with the client's other torrents, and fails if the client is running it
-/// already.
+/// The torrent shares the client's listening port, DHT node, rate limits,
+/// connection slots and turn to check the data on disk with the client's
+/// other torrents, and fails if the client is running it already.
 ///
 /// A download that is already complete on disk exits at once, unless it is
 /// to be seeded.
@@ -203,7 +210,9 @@ pub async fn download_file(
         resume: Target::new(config, info_hash),
     });
 
-    let have = resume::initial_pieces(&session, config).await?;
+    let mut shutdown = std::pin::pin!(shutdown);
+    let have =
+        resume::initial_pieces(&session, config, client.hashing(), shutdown.as_mut()).await?;
     let left = session.torrent.length() - verified_bytes(&session.torrent, &have)?;
     if left == 0 {
         info!(output = %config.output_dir.display(), "already complete");
@@ -251,7 +260,10 @@ pub async fn download_file(
         session,
         &have,
         start,
-        config.max_peers,
+        Limits {
+            max_peers: config.max_peers,
+            slots: client.slots(),
+        },
         incoming,
         announcer,
         shutdown,
@@ -335,7 +347,8 @@ pub async fn check_file(torrent_path: &Path, output_dir: &Path) -> Result<()> {
         bars: MultiProgress::new(),
         resume: None,
     });
-    let have = hash_pieces(&session, pieces).await?;
+    // Nothing else is hashing, and nothing stops the check.
+    let have = hash_pieces(&session, pieces, &Semaphore::new(1), std::future::pending()).await?;
 
     let report = verify::Report::new(&session.torrent, &session.storage, &have);
     print!("{report}");
@@ -347,7 +360,17 @@ pub async fn check_file(torrent_path: &Path, output_dir: &Path) -> Result<()> {
 
 /// Hashes `pieces` on disk, showing progress, and returns which pieces of
 /// the torrent are there and intact.
-pub(crate) async fn hash_pieces(session: &Arc<Session>, pieces: Vec<usize>) -> Result<Vec<bool>> {
+///
+/// Only the holder of `hashing`'s one permit hashes at a time, so torrents
+/// that share it take turns; the bar says `queued for checking` while this
+/// one waits. If `shutdown` resolves while it waits or hashes, the check
+/// stops at the next piece and the result is an `Interrupted` error.
+pub(crate) async fn hash_pieces(
+    session: &Arc<Session>,
+    pieces: Vec<usize>,
+    hashing: &Semaphore,
+    shutdown: impl Future<Output = ()>,
+) -> Result<Vec<bool>> {
     let torrent = &session.torrent;
     if pieces.is_empty() {
         return Ok(vec![false; torrent.num_pieces()]);
@@ -356,25 +379,62 @@ pub(crate) async fn hash_pieces(session: &Arc<Session>, pieces: Vec<usize>) -> R
         .iter()
         .map(|&index| torrent.piece_len(index))
         .sum::<Result<u64>>()?;
-    let bar = session.bars.add(ProgressBar::new(total));
+    let bar = ProgressBar::new(total);
+    bar.set_prefix(bar_label(&torrent.info.name));
+    if let Ok(style) = ProgressStyle::with_template("{prefix} queued for checking") {
+        bar.set_style(style);
+    }
+    let bar = session.bars.add(bar);
+    // Drawn now, not at its first update, which only comes with our turn.
+    bar.tick();
+    let interrupted = || Interrupted {
+        remaining: torrent.num_pieces(),
+        pieces: torrent.num_pieces(),
+    };
+    let mut shutdown = std::pin::pin!(shutdown);
+
+    let turn = tokio::select! {
+        turn = hashing.acquire() => turn?,
+        () = &mut shutdown => {
+            bar.finish_and_clear();
+            session.bars.remove(&bar);
+            bail!(interrupted());
+        }
+    };
     let style = ProgressStyle::with_template(
         "checking {prefix} {bar:40.cyan/blue} {bytes}/{total_bytes} eta {eta}",
     );
     if let Ok(style) = style {
         bar.set_style(style);
     }
-    bar.set_prefix(bar_label(&torrent.info.name));
+    bar.reset_eta();
 
     let blocking = Arc::clone(session);
     let check_bar = bar.clone();
-    let have = tokio::task::spawn_blocking(move || {
-        verify::verify(&blocking.torrent, &blocking.storage, &pieces, &|len| {
-            check_bar.inc(len)
-        })
-    })
-    .await??;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancelled = Arc::clone(&cancel);
+    let mut check = tokio::task::spawn_blocking(move || {
+        verify::verify(
+            &blocking.torrent,
+            &blocking.storage,
+            &pieces,
+            &cancelled,
+            &|len| check_bar.inc(len),
+        )
+    });
+    let result = tokio::select! {
+        result = &mut check => result?,
+        () = &mut shutdown => {
+            cancel.store(true, Ordering::Relaxed);
+            // The threads stop at their next piece.
+            let _ = check.await;
+            Err(interrupted().into())
+        }
+    };
+    drop(turn);
     bar.finish_and_clear();
     session.bars.remove(&bar);
+    let have = result?;
 
     let done = have.iter().filter(|&&have| have).count();
     info!(done, pieces = have.len(), "checked data on disk");
@@ -439,10 +499,12 @@ pub async fn download_from_peers(
     let mut start = StartPeers::default();
     start.pool.add(peers.iter().copied());
     let incoming = Listener::start(listeners).register(session.info_hash)?;
-    download_with(
-        session, have, start, max_peers, incoming, announcer, shutdown,
-    )
-    .await
+    // Slots of its own, as many as the peers it may have.
+    let limits = Limits {
+        max_peers,
+        slots: ConnectionSlots::new(max_peers),
+    };
+    download_with(session, have, start, limits, incoming, announcer, shutdown).await
 }
 
 /// The peers a download starts with.
@@ -453,18 +515,29 @@ pub(crate) struct StartPeers {
     /// Addresses of incoming peers that misbehaved.
     pub(crate) banned_ips: HashSet<IpAddr>,
     /// Connections already open, such as those the metadata of a magnet
-    /// link came over, each with whether the peer connected to us.
-    pub(crate) connections: Vec<(PeerConnection, bool)>,
+    /// link came over, each with whether the peer connected to us and the
+    /// connection slot it holds.
+    pub(crate) connections: Vec<(PeerConnection, bool, SlotPermit)>,
+}
+
+/// How many peers a download may be connected to.
+pub(crate) struct Limits {
+    /// Most peers of this torrent at once.
+    pub(crate) max_peers: usize,
+    /// Every worker holds one of these while it runs, and no peer is
+    /// connected to or taken on while none is free; a slot freed in any
+    /// torrent that shares them gets us trying again.
+    pub(crate) slots: ConnectionSlots,
 }
 
 /// `download_from_peers`, starting with the peers in `start`, some of them
 /// perhaps already connected, and taking the peers that connect to us from
-/// `incoming`.
+/// `incoming`, within `limits`.
 pub(crate) async fn download_with(
     session: Arc<Session>,
     have: &[bool],
     start: StartPeers,
-    max_peers: usize,
+    limits: Limits,
     mut incoming: Registration,
     mut announcer: Option<Announcer>,
     shutdown: impl Future<Output = ()>,
@@ -474,6 +547,7 @@ pub(crate) async fn download_with(
     if have.len() != num_pieces {
         bail!("have {} piece flags for {num_pieces} pieces", have.len());
     }
+    let Limits { max_peers, slots } = limits;
     let seed = session.seed;
     // Private torrents (BEP 27) get their peers from trackers only.
     let (pex, mut pex_peers) = PeerExchange::new(!torrent.is_private());
@@ -508,12 +582,13 @@ pub(crate) async fn download_with(
     let mut workers = JoinSet::new();
     // Starts a worker that connects to `addr`, or, given the socket the peer
     // connected to us on, answers its handshake, or carries on over a
-    // connection already open.
-    let spawn = |workers: &mut JoinSet<WorkerExit>, addr, link: Link| {
+    // connection already open. The worker holds `permit` until it exits.
+    let spawn = |workers: &mut JoinSet<WorkerExit>, addr, link: Link, permit: SlotPermit| {
         let session = Arc::clone(&session);
         let swarm = Arc::clone(&swarm);
         let inbound = link.is_inbound();
         let worker = async move {
+            let _permit = permit;
             let mut pieces = 0;
             let result = peer_worker(&session, &swarm, addr, link, listen_port, &mut pieces).await;
             WorkerExit {
@@ -525,7 +600,7 @@ pub(crate) async fn download_with(
         };
         workers.spawn(worker.in_current_span());
     };
-    for (conn, inbound) in connections {
+    for (conn, inbound, permit) in connections {
         spawn(
             &mut workers,
             conn.addr,
@@ -533,6 +608,7 @@ pub(crate) async fn download_with(
                 conn: Box::new(conn),
                 inbound,
             },
+            permit,
         );
     }
     let mut dht = session
@@ -579,16 +655,28 @@ pub(crate) async fn download_with(
                 break;
             }
         }
+        // Made before a slot is looked for, so that one freed meanwhile is
+        // not missed.
+        let mut freed = std::pin::pin!(slots.freed());
         while workers.len() < max_peers {
             let Some(addr) = pool.next(Instant::now()) else {
                 break;
             };
+            let Some(permit) = slots.try_acquire() else {
+                pool.requeue(addr);
+                break;
+            };
             asked = None;
-            spawn(&mut workers, addr, Link::Connect);
+            spawn(&mut workers, addr, Link::Connect, permit);
         }
 
         let retry_at = pool.next_retry().filter(|_| workers.len() < max_peers);
-        if workers.is_empty() && retry_at.is_none() && seeding_since.is_none() {
+        // Peers still waiting for a slot are not running out.
+        if workers.is_empty()
+            && retry_at.is_none()
+            && pool.ready_len() == 0
+            && seeding_since.is_none()
+        {
             match &asked {
                 None if announcer.is_some() || dht.is_some() => {
                     info!("out of peers, asking for more");
@@ -646,11 +734,14 @@ pub(crate) async fn download_with(
                     debug!(%addr, "turning away incoming peer: too many peers");
                 } else if banned_ips.contains(&addr.ip()) {
                     debug!(%addr, "turning away banned peer");
-                } else {
+                } else if let Some(permit) = slots.try_acquire() {
                     asked = None;
-                    spawn(&mut workers, addr, Link::Accepted(peer));
+                    spawn(&mut workers, addr, Link::Accepted(peer), permit);
+                } else {
+                    debug!(%addr, "turning away incoming peer: no free connection slot");
                 }
             }
+            () = &mut freed => {}
             () = sleep_until_some(retry_at) => {}
             peers = reannounce(&mut announcer, &progress.transferred) => {
                 pool.add(peers);

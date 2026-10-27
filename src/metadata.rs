@@ -14,6 +14,7 @@
 
 use crate::announcer::{Announcer, Transferred};
 use crate::bencode;
+use crate::client::{ConnectionSlots, SlotPermit};
 use crate::dht::DhtSearch;
 use crate::download::{self, ConnectedPeers, Misbehaved};
 use crate::extension::{Advertised, UT_METADATA, UT_METADATA_ID};
@@ -414,6 +415,9 @@ pub(crate) struct MetadataFetch<'a> {
     pub peer_id: [u8; 20],
     /// Most peers connected at once.
     pub max_peers: usize,
+    /// Every connection holds one of these, which the download takes over
+    /// along with the connection.
+    pub slots: ConnectionSlots,
     /// The peers that connect to us, which may send the metadata too.
     pub incoming: &'a mut Registration,
     /// Re-announced to on its interval, for more peers.
@@ -426,10 +430,10 @@ pub(crate) struct MetadataFetch<'a> {
 pub(crate) struct Fetched {
     /// The info dictionary, which matches the info hash.
     pub metadata: Vec<u8>,
-    /// Open connections, each with whether the peer connected to us. The
-    /// number of pieces is not set on them yet (see
-    /// `PeerConnection::set_piece_count`).
-    pub connections: Vec<(PeerConnection, bool)>,
+    /// Open connections, each with whether the peer connected to us and the
+    /// connection slot it holds. The number of pieces is not set on them yet
+    /// (see `PeerConnection::set_piece_count`).
+    pub connections: Vec<(PeerConnection, bool, SlotPermit)>,
     /// Every peer known, with the connected and banned ones marked.
     pub pool: PeerPool,
     /// Addresses of incoming peers that misbehaved.
@@ -441,14 +445,15 @@ pub(crate) struct Fetched {
 struct WorkerExit {
     addr: SocketAddr,
     inbound: bool,
-    result: Result<PeerConnection>,
+    /// The connection and the slot it holds, ready for the download.
+    result: Result<(PeerConnection, SlotPermit)>,
 }
 
 /// Peers we have connected to or given up on during the fetch.
 struct Peers {
     pool: PeerPool,
     banned_ips: HashSet<IpAddr>,
-    connections: Vec<(PeerConnection, bool)>,
+    connections: Vec<(PeerConnection, bool, SlotPermit)>,
     /// Peers we are connecting to, which go back in the pool if the fetch
     /// ends before they are done.
     outbound: HashSet<SocketAddr>,
@@ -468,7 +473,7 @@ impl Peers {
             self.outbound.remove(&addr);
         }
         match result {
-            Ok(conn) => self.connections.push((conn, inbound)),
+            Ok((conn, permit)) => self.connections.push((conn, inbound, permit)),
             Err(e) if e.is::<Misbehaved>() || e.is::<ProtocolViolation>() => {
                 warn!(%addr, "banning peer: {e:#}");
                 if inbound {
@@ -496,7 +501,8 @@ struct Asked {
 
 impl MetadataFetch<'_> {
     /// Connects to peers from `pool` and the ones that connect to us, at
-    /// most `max_peers` at once, and fetches the metadata from those that
+    /// most `max_peers` at once and while `slots` has one free for each, and
+    /// fetches the metadata from those that
     /// have it, until it is complete and verified. Peers that cannot send it
     /// are dropped and retried later, as in a download; peers that send bad
     /// data are banned.
@@ -513,6 +519,7 @@ impl MetadataFetch<'_> {
             info_hash,
             peer_id,
             max_peers,
+            slots,
             incoming,
             announcer,
             mut dht,
@@ -530,12 +537,18 @@ impl MetadataFetch<'_> {
             outbound: HashSet::new(),
         };
         let mut workers = JoinSet::new();
-        let spawn = |workers: &mut JoinSet<WorkerExit>, addr, peer: Option<Incoming>| {
+        let spawn = |workers: &mut JoinSet<WorkerExit>,
+                     addr,
+                     peer: Option<Incoming>,
+                     permit: SlotPermit| {
             let shared = Arc::clone(&shared);
             let inbound = peer.is_some();
             let worker = async move {
-                let result =
-                    fetch_from_peer(&shared, info_hash, peer_id, addr, peer, listen_port).await;
+                // Kept for the download if the worker succeeds, and given
+                // back at once if it fails.
+                let result = fetch_from_peer(&shared, info_hash, peer_id, addr, peer, listen_port)
+                    .await
+                    .map(|conn| (conn, permit));
                 WorkerExit {
                     addr,
                     inbound,
@@ -552,19 +565,27 @@ impl MetadataFetch<'_> {
             if shared.lock().metadata().is_some() {
                 break;
             }
+            // Made before a slot is looked for, so that one freed meanwhile
+            // is not missed.
+            let mut freed = std::pin::pin!(slots.freed());
             while workers.len() < max_peers {
                 let Some(addr) = peers.pool.next(Instant::now()) else {
                     break;
                 };
+                let Some(permit) = slots.try_acquire() else {
+                    peers.pool.requeue(addr);
+                    break;
+                };
                 asked = None;
                 peers.outbound.insert(addr);
-                spawn(&mut workers, addr, None);
+                spawn(&mut workers, addr, None, permit);
             }
             let retry_at = peers
                 .pool
                 .next_retry()
                 .filter(|_| workers.len() < max_peers);
-            if workers.is_empty() && retry_at.is_none() {
+            // Peers still waiting for a slot are not running out.
+            if workers.is_empty() && retry_at.is_none() && peers.pool.ready_len() == 0 {
                 match &asked {
                     None if announcer.is_some() || dht.is_some() => {
                         info!("out of peers, asking for more");
@@ -598,11 +619,14 @@ impl MetadataFetch<'_> {
                         debug!(%addr, "turning away incoming peer: too many peers");
                     } else if peers.banned_ips.contains(&addr.ip()) {
                         debug!(%addr, "turning away banned peer");
-                    } else {
+                    } else if let Some(permit) = slots.try_acquire() {
                         asked = None;
-                        spawn(&mut workers, addr, Some(peer));
+                        spawn(&mut workers, addr, Some(peer), permit);
+                    } else {
+                        debug!(%addr, "turning away incoming peer: no free connection slot");
                     }
                 }
+                () = &mut freed => {}
                 () = download::sleep_until_some(retry_at) => {}
                 found = download::reannounce(announcer, &transferred) => {
                     peers.pool.add(found);

@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 use sha1::Digest;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Most threads hashing at once. Reading from disk is usually the limit, and
 /// each thread holds a whole piece in memory.
@@ -41,17 +41,21 @@ fn pieces_where(torrent: &TorrentFile, keep: impl Fn(u64, usize) -> bool) -> Res
 /// whether it is there and correct. Pieces not in `pieces` count as missing.
 ///
 /// Blocks while reading; `on_checked` gets each piece's length once it has
-/// been hashed. An I/O error stops the check.
+/// been hashed. An I/O error stops the check, and so does `cancel` being set,
+/// which is looked at between pieces and makes the result an error.
 pub fn verify(
     torrent: &TorrentFile,
     storage: &Storage,
     pieces: &[usize],
+    cancel: &AtomicBool,
     on_checked: &(dyn Fn(u64) + Sync),
 ) -> Result<Vec<bool>> {
     let next = AtomicUsize::new(0);
     let worker = || -> Result<Vec<usize>> {
         let mut good = Vec::new();
-        while let Some(&index) = pieces.get(next.fetch_add(1, Ordering::Relaxed)) {
+        while !cancel.load(Ordering::Relaxed)
+            && let Some(&index) = pieces.get(next.fetch_add(1, Ordering::Relaxed))
+        {
             match check_piece(torrent, storage, index) {
                 Ok((true, len)) => {
                     good.push(index);
@@ -85,6 +89,9 @@ pub fn verify(
     });
 
     let mut have = vec![false; torrent.num_pieces()];
+    if cancel.load(Ordering::Relaxed) {
+        return Err(anyhow!("check cancelled"));
+    }
     for result in results {
         for index in result? {
             have[index] = true;
@@ -246,9 +253,15 @@ mod tests {
         assert_eq!(candidates, [0, 1]);
 
         let checked = AtomicU64::new(0);
-        let have = verify(&torrent, &storage, &candidates, &|len| {
-            checked.fetch_add(len, Ordering::Relaxed);
-        })
+        let have = verify(
+            &torrent,
+            &storage,
+            &candidates,
+            &AtomicBool::new(false),
+            &|len| {
+                checked.fetch_add(len, Ordering::Relaxed);
+            },
+        )
         .unwrap();
         assert_eq!(have, [true, false, false]);
         assert_eq!(checked.load(Ordering::Relaxed), 8);
@@ -267,7 +280,14 @@ mod tests {
         let storage = Storage::new(&torrent.info, dir.path()).unwrap();
         let candidates = candidates(&torrent, &storage).unwrap();
         assert_eq!(candidates, [0, 1, 2]);
-        let have = verify(&torrent, &storage, &candidates, &|_| {}).unwrap();
+        let have = verify(
+            &torrent,
+            &storage,
+            &candidates,
+            &AtomicBool::new(false),
+            &|_| {},
+        )
+        .unwrap();
         assert_eq!(have, [true, true, true]);
     }
 
@@ -277,7 +297,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(&torrent.info, dir.path()).unwrap();
         assert!(candidates(&torrent, &storage).unwrap().is_empty());
-        let have = verify(&torrent, &storage, &[], &|_| {}).unwrap();
+        let have = verify(&torrent, &storage, &[], &AtomicBool::new(false), &|_| {}).unwrap();
         assert_eq!(have, [false, false, false]);
     }
 
@@ -294,7 +314,14 @@ mod tests {
         }
         let storage = Storage::open_existing(&torrent.info, dir.path()).unwrap();
         let pieces = present(&torrent, &storage).unwrap();
-        let have = verify(&torrent, &storage, &pieces, &|_| {}).unwrap();
+        let have = verify(
+            &torrent,
+            &storage,
+            &pieces,
+            &AtomicBool::new(false),
+            &|_| {},
+        )
+        .unwrap();
         (Report::new(&torrent, &storage, &have), root)
     }
 

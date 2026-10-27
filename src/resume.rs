@@ -18,6 +18,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 /// The format of the file, bumped when it changes incompatibly.
@@ -125,7 +126,16 @@ struct Saved {
 /// download directory, or `config.recheck`), every piece that may hold data
 /// from an earlier run is hashed. Either way the resume file is saved
 /// afterwards.
-pub async fn initial_pieces(session: &Arc<Session>, config: &DownloadConfig) -> Result<Vec<bool>> {
+///
+/// Hashing waits for `hashing`'s one permit (see `download::hash_pieces`),
+/// and is stopped by `shutdown`, which makes the result an `Interrupted`
+/// error.
+pub async fn initial_pieces(
+    session: &Arc<Session>,
+    config: &DownloadConfig,
+    hashing: &Semaphore,
+    shutdown: impl Future<Output = ()>,
+) -> Result<Vec<bool>> {
     let torrent = &session.torrent;
     let candidates = verify::candidates(torrent, &session.storage)?;
     let saved = match &session.resume {
@@ -133,7 +143,7 @@ pub async fn initial_pieces(session: &Arc<Session>, config: &DownloadConfig) -> 
         _ => None,
     };
     let have = match saved {
-        None => download::hash_pieces(session, candidates).await?,
+        None => download::hash_pieces(session, candidates, hashing, shutdown).await?,
         Some(saved) => {
             let storage = Arc::clone(&session.storage);
             let stamps = tokio::task::spawn_blocking(move || {
@@ -155,7 +165,7 @@ pub async fn initial_pieces(session: &Arc<Session>, config: &DownloadConfig) -> 
                 to_check = to_hash.len(),
                 "using the resume file"
             );
-            let hashed = download::hash_pieces(session, to_hash).await?;
+            let hashed = download::hash_pieces(session, to_hash, hashing, shutdown).await?;
             for (have, hashed) in have.iter_mut().zip(hashed) {
                 *have |= hashed;
             }
@@ -350,6 +360,7 @@ mod tests {
         DownloadConfig {
             output_dir: output.to_path_buf(),
             max_peers: 10,
+            max_connections: 100,
             listen_port: 0,
             seed: Default::default(),
             dht: false,
@@ -528,7 +539,14 @@ mod tests {
         write_data(out.path());
 
         // No resume file yet: everything on disk is hashed, then saved.
-        let have = initial_pieces(&session(&config), &config).await.unwrap();
+        let have = initial_pieces(
+            &session(&config),
+            &config,
+            &Semaphore::new(1),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
         assert_eq!(have, [true; 3]);
         let resume_file = state.path().join(format!("{}.resume", hex(&[7; 20])));
         assert!(resume_file.is_file());
@@ -536,7 +554,14 @@ mod tests {
         // Piece 2 is wrong now, but "b" looks unchanged, so it is believed.
         let b_time = modified(out.path(), "b");
         corrupt(out.path(), "b", 4, b_time);
-        let have = initial_pieces(&session(&config), &config).await.unwrap();
+        let have = initial_pieces(
+            &session(&config),
+            &config,
+            &Semaphore::new(1),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
         assert_eq!(have, [true; 3]);
 
         // "a" is touched (and piece 0 is wrong): its pieces are hashed, but
@@ -547,7 +572,14 @@ mod tests {
             0,
             modified(out.path(), "a") + std::time::Duration::from_secs(5),
         );
-        let have = initial_pieces(&session(&config), &config).await.unwrap();
+        let have = initial_pieces(
+            &session(&config),
+            &config,
+            &Semaphore::new(1),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
         assert_eq!(have, [false, true, true]);
 
         // `--recheck` ignores the resume file and finds piece 2 wrong too.
@@ -555,7 +587,14 @@ mod tests {
             recheck: true,
             ..config
         };
-        let have = initial_pieces(&session(&recheck), &recheck).await.unwrap();
+        let have = initial_pieces(
+            &session(&recheck),
+            &recheck,
+            &Semaphore::new(1),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
         assert_eq!(have, [false, true, false]);
     }
 
@@ -569,7 +608,14 @@ mod tests {
 
         for contents in [&b"garbage"[..], b""] {
             std::fs::write(&resume_file, contents).unwrap();
-            let have = initial_pieces(&session(&config), &config).await.unwrap();
+            let have = initial_pieces(
+                &session(&config),
+                &config,
+                &Semaphore::new(1),
+                std::future::pending(),
+            )
+            .await
+            .unwrap();
             assert_eq!(have, [true; 3]);
             // The unusable file was replaced by a good one.
             let data = std::fs::read(&resume_file).unwrap();

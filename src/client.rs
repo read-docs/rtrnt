@@ -1,5 +1,6 @@
 //! What the torrents of one session share: the settings, our peer id, the
-//! listening port, the DHT node, the rate limits and the progress bars.
+//! listening port, the DHT node, the rate limits, the connection slots, the
+//! hashing queue and the progress bars.
 
 use crate::dht::Dht;
 use crate::download::DownloadConfig;
@@ -10,17 +11,22 @@ use anyhow::{Result, bail};
 use indicatif::MultiProgress;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use tokio::sync::OnceCell;
+use tokio::sync::futures::Notified;
+use tokio::sync::{Notify, OnceCell, OwnedSemaphorePermit, Semaphore};
 use tracing::{Instrument, Span, info, info_span, warn};
 
 /// Runs any number of torrents at once, each through `download_file` or
 /// `download_magnet`, sharing one listening port, one DHT node and one pair
-/// of rate limits. The port and the DHT node are only opened once a torrent
-/// needs them.
+/// of rate limits, and holding no more than `max_connections` peer
+/// connections between them. Torrents check the data on disk one at a time.
+/// The port and the DHT node are only opened once a torrent needs them.
 pub struct Client {
     config: DownloadConfig,
     peer_id: [u8; 20],
     rate_limits: Arc<RateLimits>,
+    slots: ConnectionSlots,
+    /// One permit: held by the torrent hashing the data on disk.
+    hashing: Semaphore,
     bars: MultiProgress,
     listener: OnceCell<Arc<Listener>>,
     /// `None` if the DHT is off or could not be started.
@@ -41,10 +47,13 @@ impl Client {
             );
         }
         let rate_limits = RateLimits::from_kib(config.max_download_rate, config.max_upload_rate);
+        let slots = ConnectionSlots::new(config.max_connections);
         Self {
             config,
             peer_id: peer::generate_peer_id(),
             rate_limits: Arc::new(rate_limits),
+            slots,
+            hashing: Semaphore::new(1),
             bars,
             listener: OnceCell::new(),
             dht: OnceCell::new(),
@@ -65,6 +74,17 @@ impl Client {
     /// torrent.
     pub fn rate_limits(&self) -> Arc<RateLimits> {
         Arc::clone(&self.rate_limits)
+    }
+
+    /// The peer connections left to open, across every torrent.
+    pub fn slots(&self) -> ConnectionSlots {
+        self.slots.clone()
+    }
+
+    /// Held by the torrent that is checking the data on disk, so that
+    /// torrents check it one at a time (see `download::hash_pieces`).
+    pub fn hashing(&self) -> &Semaphore {
+        &self.hashing
     }
 
     pub fn bars(&self) -> &MultiProgress {
@@ -128,6 +148,55 @@ fn session_span() -> Span {
     }
 }
 
+/// The peer connections a session may have open at once, shared by all its
+/// torrents. Every connection, whether we opened it or the peer did, holds a
+/// `SlotPermit` until it is closed.
+#[derive(Clone)]
+pub struct ConnectionSlots {
+    semaphore: Arc<Semaphore>,
+    /// Notified whenever a permit comes back.
+    freed: Arc<Notify>,
+}
+
+impl ConnectionSlots {
+    /// `limit` slots.
+    pub fn new(limit: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(limit.min(Semaphore::MAX_PERMITS))),
+            freed: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Takes a slot, or `None` if they are all in use.
+    pub fn try_acquire(&self) -> Option<SlotPermit> {
+        let permit = Arc::clone(&self.semaphore).try_acquire_owned().ok()?;
+        Some(SlotPermit {
+            permit: Some(permit),
+            freed: Arc::clone(&self.freed),
+        })
+    }
+
+    /// Resolves once a slot comes back after this call. Created before
+    /// `try_acquire` is tried, it does not miss a slot freed in between.
+    pub fn freed(&self) -> Notified<'_> {
+        self.freed.notified()
+    }
+}
+
+/// A slot in a `ConnectionSlots`, given back when dropped.
+pub struct SlotPermit {
+    /// Taken in `drop`, so that the slot is back before anyone is woken.
+    permit: Option<OwnedSemaphorePermit>,
+    freed: Arc<Notify>,
+}
+
+impl Drop for SlotPermit {
+    fn drop(&mut self) {
+        self.permit.take();
+        self.freed.notify_waiters();
+    }
+}
+
 /// A torrent running in a `Client`.
 pub struct Claim<'a> {
     client: &'a Client,
@@ -149,6 +218,7 @@ mod tests {
         let config = DownloadConfig {
             output_dir: ".".into(),
             max_peers: 10,
+            max_connections: 100,
             listen_port: 0,
             seed: SeedLimits::default(),
             dht,
@@ -168,6 +238,49 @@ mod tests {
         assert!(client.claim([1; 20]).is_err());
         drop(claim);
         assert!(client.claim([1; 20]).is_ok());
+    }
+
+    #[test]
+    fn connection_slots_run_out_and_come_back() {
+        let slots = ConnectionSlots::new(2);
+        let first = slots.try_acquire().unwrap();
+        let _second = slots.try_acquire().unwrap();
+        assert!(slots.try_acquire().is_none());
+        drop(first);
+        assert!(slots.try_acquire().is_some());
+    }
+
+    #[test]
+    fn the_client_hands_out_one_set_of_slots() {
+        let client = client(false);
+        let held: Vec<_> = (0..100)
+            .map(|_| client.slots().try_acquire().unwrap())
+            .collect();
+        assert!(client.slots().try_acquire().is_none());
+        drop(held);
+        assert!(client.slots().try_acquire().is_some());
+    }
+
+    #[tokio::test]
+    async fn freed_wakes_when_a_slot_comes_back() {
+        let slots = ConnectionSlots::new(1);
+        let permit = slots.try_acquire().unwrap();
+        let mut freed = std::pin::pin!(slots.freed());
+        // Nothing came back yet.
+        assert!(futures_now_or_never(freed.as_mut()).is_none());
+        drop(permit);
+        freed.await;
+        assert!(slots.try_acquire().is_some());
+    }
+
+    /// Polls `future` once.
+    fn futures_now_or_never<F: Future>(future: F) -> Option<F::Output> {
+        let mut future = std::pin::pin!(future);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(output) => Some(output),
+            std::task::Poll::Pending => None,
+        }
     }
 
     #[tokio::test]

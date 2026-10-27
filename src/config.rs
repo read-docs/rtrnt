@@ -21,6 +21,8 @@ use std::time::Duration;
 pub const DEFAULT_OUTPUT_DIR: &str = ".";
 /// Peers downloaded from at once unless told otherwise.
 pub const DEFAULT_MAX_PEERS: usize = 30;
+/// Connections open at once, across every torrent, unless told otherwise.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 200;
 /// Upload ratio to seed to once the download is complete: none, so the run
 /// ends at completion unless a seed time is set.
 pub const DEFAULT_SEED_RATIO: f64 = 0.0;
@@ -40,8 +42,11 @@ pub const DEFAULT_MAX_UPLOAD_RATE: u64 = 0;
 pub struct Options {
     /// Directory to save the downloaded files in.
     pub output: Option<PathBuf>,
-    /// Maximum number of peers to download from at once.
+    /// Maximum number of peers to download from at once, for each torrent.
     pub max_peers: Option<usize>,
+    /// Maximum number of peer connections open at once, across every
+    /// torrent.
+    pub max_connections: Option<usize>,
     /// Port to listen on for incoming peers; 0 picks a free one.
     pub port: Option<u16>,
     /// Once the download is complete, keep seeding until we have uploaded
@@ -84,6 +89,7 @@ impl Options {
         Options {
             output: self.output.or(fallback.output),
             max_peers: self.max_peers.or(fallback.max_peers),
+            max_connections: self.max_connections.or(fallback.max_connections),
             port: self.port.or(fallback.port),
             seed_ratio: self.seed_ratio.or(fallback.seed_ratio),
             seed_time: self.seed_time.or(fallback.seed_time),
@@ -101,6 +107,7 @@ impl Options {
                 .output
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_OUTPUT_DIR)),
             max_peers: self.max_peers.unwrap_or(DEFAULT_MAX_PEERS),
+            max_connections: self.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
             listen_port: self.port.unwrap_or(peer::DEFAULT_LISTEN_PORT),
             seed: SeedLimits {
                 ratio: self.seed_ratio.unwrap_or(DEFAULT_SEED_RATIO),
@@ -228,6 +235,14 @@ pub fn describe(cli: &Options, file: &ConfigFile) -> String {
             source(cli.max_peers.is_some(), file.options.max_peers.is_some()),
         ),
         (
+            "max-connections",
+            config.max_connections.to_string(),
+            source(
+                cli.max_connections.is_some(),
+                file.options.max_connections.is_some(),
+            ),
+        ),
+        (
             "port",
             config.listen_port.to_string(),
             source(cli.port.is_some(), file.options.port.is_some()),
@@ -294,12 +309,30 @@ mod tests {
         let config = resolve(Options::default(), Options::default());
         assert_eq!(config.output_dir, PathBuf::from(DEFAULT_OUTPUT_DIR));
         assert_eq!(config.max_peers, DEFAULT_MAX_PEERS);
+        assert_eq!(config.max_connections, DEFAULT_MAX_CONNECTIONS);
         assert_eq!(config.listen_port, peer::DEFAULT_LISTEN_PORT);
         assert_eq!(config.seed, SeedLimits::default());
         assert!(!config.seed.enabled());
         assert!(config.dht);
         assert_eq!(config.max_download_rate, 0);
         assert_eq!(config.max_upload_rate, 0);
+    }
+
+    #[test]
+    fn max_connections_comes_from_the_command_line_then_the_file() {
+        let file = Options {
+            max_connections: Some(50),
+            ..Options::default()
+        };
+        assert_eq!(
+            resolve(Options::default(), file.clone()).max_connections,
+            50
+        );
+        let cli = Options {
+            max_connections: Some(10),
+            ..Options::default()
+        };
+        assert_eq!(resolve(cli, file).max_connections, 10);
     }
 
     #[test]
@@ -495,6 +528,7 @@ mod tests {
             path: Some(PathBuf::from("/etc/rtrnt.toml")),
             options: Options {
                 seed_ratio: Some(1.5),
+                max_connections: Some(150),
                 dht: Some(true),
                 ..options(Some("/data"), Some(80), None)
             },
@@ -505,6 +539,7 @@ mod tests {
             "# config file: /etc/rtrnt.toml\n\
              output = \"/data\"  # config file\n\
              max-peers = 5  # command line\n\
+             max-connections = 150  # config file\n\
              port = 6881  # default\n\
              seed-ratio = 1.5  # config file\n\
              seed-time = 0  # default\n\
@@ -517,6 +552,7 @@ mod tests {
         assert_eq!(
             reparsed,
             Options {
+                max_connections: Some(150),
                 seed_ratio: Some(1.5),
                 seed_time: Some(0),
                 dht: Some(false),

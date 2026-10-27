@@ -36,6 +36,10 @@ struct Args {
     /// [default: 30]
     #[arg(long)]
     max_peers: Option<usize>,
+    /// Maximum number of peer connections open at once, across all
+    /// torrents [default: 200]
+    #[arg(long)]
+    max_connections: Option<usize>,
     /// Port to listen on for incoming peers (0 picks a free one; so does a
     /// port that is taken) [default: 6881]
     #[arg(short, long)]
@@ -163,6 +167,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         dht: args.dht(),
         output: args.output,
         max_peers: args.max_peers,
+        max_connections: args.max_connections,
         port: args.port,
         seed_ratio: args.seed_ratio,
         seed_time: args.seed_time,
@@ -488,6 +493,10 @@ mod tests {
         let defaults = [
             ("output", config::DEFAULT_OUTPUT_DIR.to_string()),
             ("max_peers", config::DEFAULT_MAX_PEERS.to_string()),
+            (
+                "max_connections",
+                config::DEFAULT_MAX_CONNECTIONS.to_string(),
+            ),
             ("port", peer::DEFAULT_LISTEN_PORT.to_string()),
             ("seed_ratio", config::DEFAULT_SEED_RATIO.to_string()),
             ("seed_time", config::DEFAULT_SEED_TIME.to_string()),
