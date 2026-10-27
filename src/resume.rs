@@ -8,6 +8,7 @@
 
 use crate::bencode;
 use crate::download::{self, DownloadConfig, Session};
+use crate::stats::TorrentState;
 use crate::storage::verify;
 use crate::storage::{FileSpan, Storage};
 use crate::torrent::TorrentFile;
@@ -175,6 +176,7 @@ pub async fn initial_pieces(
     if let Some(target) = &session.resume {
         target.save(&session.storage, have.clone()).await;
     }
+    session.stats.set_state(TorrentState::Downloading);
     Ok(have)
 }
 

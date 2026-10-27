@@ -1,18 +1,26 @@
 use crate::tracker::announcer::Transferred;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 /// Bytes verified and written, shown on the progress bar, and bytes moved
 /// either way, reported to the tracker.
 pub(super) struct Progress {
     pub(super) bar: ProgressBar,
-    pub(super) transferred: Transferred,
+    pub(super) transferred: Arc<Transferred>,
 }
 
 impl Progress {
     /// A bar in `bars` for `total` bytes of the torrent called `name`, of
-    /// which `done` were already on disk.
-    pub(super) fn new(bars: &MultiProgress, name: &str, total: u64, done: u64) -> Self {
+    /// which `done` were already on disk, counting what moves in
+    /// `transferred`.
+    pub(super) fn new(
+        bars: &MultiProgress,
+        name: &str,
+        total: u64,
+        done: u64,
+        transferred: Arc<Transferred>,
+    ) -> Self {
         let bar = bars.add(ProgressBar::new(total));
         let style = ProgressStyle::with_template(
             "{prefix} {bar:40.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec} eta {eta} {msg}",
@@ -25,10 +33,7 @@ impl Progress {
         // drops it again, so data from disk does not count towards the rate.
         bar.set_position(done);
         bar.reset_eta();
-        Self {
-            bar,
-            transferred: Transferred::default(),
-        }
+        Self { bar, transferred }
     }
 
     /// Counts a verified piece.

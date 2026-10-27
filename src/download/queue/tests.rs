@@ -35,6 +35,26 @@ fn claims_only_pieces_the_peer_has() {
 }
 
 #[test]
+fn snapshot_shows_have_in_flight_and_availability() {
+    let queue = PieceQueue::new(&[true, false, false, false]);
+    let first = peer(&queue, &[true, true, false, false]);
+    let _second = peer(&queue, &[false, true, true, false]);
+    // Piece 1 is the only one `first` has that we lack.
+    let claim = queue.claim(&first, &[]).unwrap();
+    assert_eq!(claim.index, 1);
+    let snapshot = queue.snapshot();
+    assert_eq!(snapshot.have, [true, false, false, false]);
+    assert_eq!(snapshot.in_flight, [false, true, false, false]);
+    assert_eq!(snapshot.availability, [1, 2, 1, 0]);
+    claim.complete();
+    drop(first);
+    let snapshot = queue.snapshot();
+    assert_eq!(snapshot.have, [true, true, false, false]);
+    assert_eq!(snapshot.in_flight, [false; 4]);
+    assert_eq!(snapshot.availability, [0, 1, 1, 0]);
+}
+
+#[test]
 fn dropped_claim_returns_piece() {
     let queue = PieceQueue::new(&[false; 1]);
     let seed = peer(&queue, &[true]);

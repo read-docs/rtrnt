@@ -5,6 +5,9 @@ use crate::dht::DhtSearch;
 use crate::listener::Registration;
 use crate::peer::pex::PeerExchange;
 use crate::peer::{self, Incoming, PeerConnection};
+use crate::stats::{
+    PeerSource, PieceSnapshot, PieceSource, TorrentState,
+};
 use crate::tracker::announcer::{Announcer, Transferred};
 use anyhow::{Result, bail};
 use indicatif::HumanBytes;
@@ -84,6 +87,7 @@ pub(crate) async fn download_with(
     let seed = session.seed;
     // Private torrents (BEP 27) get their peers from trackers only.
     let (pex, mut pex_peers) = PeerExchange::new(!torrent.is_private());
+    let stats = &session.stats;
     let swarm = Arc::new(Swarm {
         queue: PieceQueue::new(have).seeding(seed.enabled()),
         progress: Progress::new(
@@ -91,6 +95,7 @@ pub(crate) async fn download_with(
             &torrent.info.name,
             torrent.length(),
             verified_bytes(torrent, have)?,
+            Arc::clone(stats.transferred()),
         ),
         connected: ConnectedPeers::default(),
         choker: Choker::default(),
@@ -102,6 +107,13 @@ pub(crate) async fn download_with(
         choker,
         ..
     } = &*swarm;
+    let source: Arc<dyn PieceSource> = swarm.clone();
+    stats.set_piece_source(Arc::downgrade(&source));
+    stats.set_state(if queue.is_done() {
+        TorrentState::Seeding
+    } else {
+        TorrentState::Downloading
+    });
     // Incoming peers have no address we could ban in the pool.
     let StartPeers {
         mut pool,
@@ -176,6 +188,7 @@ pub(crate) async fn download_with(
                         break;
                     }
                     info!(ratio = seed.ratio, time = ?seed.time, "download complete, seeding");
+                    stats.set_state(TorrentState::Seeding);
                     *seeding_since.insert(Instant::now())
                 }
             };
@@ -269,6 +282,7 @@ pub(crate) async fn download_with(
                     debug!(%addr, "turning away banned peer");
                 } else if let Some(permit) = slots.try_acquire() {
                     asked = None;
+                    stats.add_source(PeerSource::Incoming, 1);
                     spawn(&mut workers, addr, Link::Accepted(peer), permit);
                 } else {
                     debug!(%addr, "turning away incoming peer: no free connection slot");
@@ -277,12 +291,14 @@ pub(crate) async fn download_with(
             () = &mut freed => {}
             () = sleep_until_some(retry_at) => {}
             peers = reannounce(&mut announcer, &progress.transferred) => {
+                stats.add_source(PeerSource::Tracker, peers.len());
                 pool.add(peers);
                 if let Some(asked) = &mut asked {
                     asked.tracker = false;
                 }
             }
             peers = dht_lookup(&mut dht) => {
+                stats.add_source(PeerSource::Dht, peers.len());
                 pool.add(peers);
                 if let Some(asked) = &mut asked {
                     asked.dht_lookups = asked.dht_lookups.saturating_sub(1);
@@ -290,6 +306,7 @@ pub(crate) async fn download_with(
             }
             Some(peers) = pex_peers.recv() => {
                 if pool.ready_len() < MAX_PEX_BACKLOG {
+                    stats.add_source(PeerSource::Pex, peers.len());
                     pool.add(peers);
                 }
             }
@@ -322,6 +339,7 @@ pub(crate) async fn download_with(
 
     // Every finished write is in the files now.
     save_resume(&session, queue, &mut saved).await;
+    stats.set_final_pieces(queue.snapshot());
 
     let remaining = queue.remaining();
     if remaining == 0 {
@@ -405,6 +423,12 @@ pub(super) struct Swarm {
     pub(super) choker: Choker,
     /// Tells peers about each other (BEP 11).
     pub(super) pex: PeerExchange,
+}
+
+impl PieceSource for Swarm {
+    fn piece_snapshot(&self) -> PieceSnapshot {
+        self.queue.snapshot()
+    }
 }
 
 /// How a peer worker ended.

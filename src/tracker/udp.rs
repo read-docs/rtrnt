@@ -133,7 +133,15 @@ fn parse_udp_announce(response: &[u8], ipv6: bool) -> Result<AnnounceResponse> {
     if response.len() < 20 {
         bail!("announce response too short");
     }
-    let interval = u32::from_be_bytes([response[8], response[9], response[10], response[11]]);
+    let word = |at: usize| {
+        u32::from_be_bytes([
+            response[at],
+            response[at + 1],
+            response[at + 2],
+            response[at + 3],
+        ])
+    };
+    let (interval, leechers, seeders) = (word(8), word(12), word(16));
     let peers = if ipv6 {
         parse_compact_v6(&response[20..])
     } else {
@@ -143,6 +151,8 @@ fn parse_udp_announce(response: &[u8], ipv6: bool) -> Result<AnnounceResponse> {
         peers,
         interval: Some(interval.into()),
         min_interval: None,
+        seeders: Some(seeders),
+        leechers: Some(leechers),
     })
 }
 

@@ -19,6 +19,8 @@ fn response(interval: Option<u64>, min_interval: Option<u64>) -> AnnounceRespons
         peers: Vec::new(),
         interval,
         min_interval,
+        seeders: None,
+        leechers: None,
     }
 }
 

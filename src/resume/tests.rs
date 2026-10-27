@@ -65,6 +65,11 @@ fn session(config: &DownloadConfig) -> Arc<Session> {
         metadata: None,
         bars: MultiProgress::new(),
         resume: Target::new(config, [7; 20]),
+        stats: Arc::new(crate::stats::TorrentStats::new(
+            [7; 20],
+            "t",
+            Path::new("."),
+        )),
     })
 }
 

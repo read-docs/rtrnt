@@ -64,6 +64,10 @@ pub struct AnnounceResponse {
     pub interval: Option<u64>,
     /// Seconds the tracker requires between announces (HTTP only).
     pub min_interval: Option<u64>,
+    /// Peers with the whole torrent, if the tracker says.
+    pub seeders: Option<u32>,
+    /// Peers still downloading, if the tracker says.
+    pub leechers: Option<u32>,
 }
 
 /// A torrent's trackers in tiers (BEP 12). Tiers are tried in order, and the
@@ -87,13 +91,23 @@ impl Tiers {
     /// the first response with any, or else the first empty one; when only
     /// reporting (`completed`, `stopped`), returns the first success.
     pub async fn announce(&mut self, request: &AnnounceRequest) -> Result<AnnounceResponse> {
-        self.announce_with(request, announce_one).await
+        self.announce_with(request, announce_one, |_, _| {}).await
+    }
+
+    /// `announce`, telling `report` what each tracker asked answered.
+    pub async fn announce_reporting(
+        &mut self,
+        request: &AnnounceRequest,
+        report: impl Fn(&str, &Result<AnnounceResponse>),
+    ) -> Result<AnnounceResponse> {
+        self.announce_with(request, announce_one, report).await
     }
 
     async fn announce_with(
         &mut self,
         request: &AnnounceRequest,
         mut announce_one: impl AsyncFnMut(&str, &AnnounceRequest) -> Result<AnnounceResponse>,
+        report: impl Fn(&str, &Result<AnnounceResponse>),
     ) -> Result<AnnounceResponse> {
         if self.0.iter().all(Vec::is_empty) {
             bail!("torrent has no trackers");
@@ -102,7 +116,9 @@ impl Tiers {
         for tier in 0..self.0.len() {
             for index in 0..self.0[tier].len() {
                 let tracker = &self.0[tier][index];
-                match announce_one(tracker, request).await {
+                let result = announce_one(tracker, request).await;
+                report(tracker, &result);
+                match result {
                     Ok(response) if !response.peers.is_empty() || !request.event.wants_peers() => {
                         debug!(%tracker, event = ?request.event, peers = response.peers.len(), "announce succeeded");
                         self.promote(tier, index);

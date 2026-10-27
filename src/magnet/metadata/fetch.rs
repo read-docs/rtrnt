@@ -8,6 +8,7 @@ use crate::listener::Registration;
 use crate::magnet::FetchInterrupted;
 use crate::peer::extension::{Advertised, UT_METADATA, UT_METADATA_ID};
 use crate::peer::{Incoming, PeerConnection, PeerMessage, ProtocolViolation};
+use crate::stats::{PeerSource, TorrentState, TorrentStats};
 use crate::tracker::announcer::{Announcer, Transferred};
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashSet;
@@ -40,11 +41,27 @@ struct Shared {
     /// and when a peer leaves.
     changed: Notify,
     connected: ConnectedPeers,
+    stats: Arc<TorrentStats>,
 }
 
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, Assembly> {
         self.assembly.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Tells the stats how many metadata pieces are in, with `peers`
+    /// connected, or as many as last said if `None`.
+    fn publish(&self, peers: impl Into<Option<usize>>) {
+        let (pieces, total) = self.lock().progress();
+        let peers = peers.into().or(match self.stats.state() {
+            TorrentState::FetchingMetadata { peers, .. } => Some(peers),
+            _ => None,
+        });
+        self.stats.set_state(TorrentState::FetchingMetadata {
+            pieces,
+            total,
+            peers: peers.unwrap_or(0),
+        });
     }
 }
 
@@ -63,6 +80,8 @@ pub(crate) struct MetadataFetch<'a> {
     pub announcer: &'a mut Option<Announcer>,
     /// Searched for more peers.
     pub dht: Option<DhtSearch>,
+    /// Told how the fetch is going, and where peers come from.
+    pub stats: Arc<TorrentStats>,
 }
 
 /// A fetched info dictionary, and the peers to carry on downloading from.
@@ -162,11 +181,13 @@ impl MetadataFetch<'_> {
             incoming,
             announcer,
             mut dht,
+            stats,
         } = self;
         let shared = Arc::new(Shared {
             assembly: Mutex::new(Assembly::new(info_hash)),
             changed: Notify::new(),
             connected: ConnectedPeers::default(),
+            stats: Arc::clone(&stats),
         });
         let listen_port = incoming.port();
         let mut peers = Peers {
@@ -204,6 +225,7 @@ impl MetadataFetch<'_> {
             if shared.lock().metadata().is_some() {
                 break;
             }
+            shared.publish(workers.len());
             // Made before a slot is looked for, so that one freed meanwhile
             // is not missed.
             let mut freed = std::pin::pin!(slots.freed());
@@ -260,6 +282,7 @@ impl MetadataFetch<'_> {
                         debug!(%addr, "turning away banned peer");
                     } else if let Some(permit) = slots.try_acquire() {
                         asked = None;
+                        stats.add_source(PeerSource::Incoming, 1);
                         spawn(&mut workers, addr, Some(peer), permit);
                     } else {
                         debug!(%addr, "turning away incoming peer: no free connection slot");
@@ -268,12 +291,14 @@ impl MetadataFetch<'_> {
                 () = &mut freed => {}
                 () = download::sleep_until_some(retry_at) => {}
                 found = download::reannounce(announcer, &transferred) => {
+                    stats.add_source(PeerSource::Tracker, found.len());
                     peers.pool.add(found);
                     if let Some(asked) = &mut asked {
                         asked.tracker = false;
                     }
                 }
                 found = download::dht_lookup(&mut dht) => {
+                    stats.add_source(PeerSource::Dht, found.len());
                     peers.pool.add(found);
                     if let Some(asked) = &mut asked {
                         asked.dht_lookups = asked.dht_lookups.saturating_sub(1);
@@ -480,6 +505,7 @@ async fn fetch_pieces(shared: &Shared, conn: &mut PeerConnection) -> Result<()> 
                 data,
             }) => {
                 let added = shared.lock().add(addr, piece, total_size, data)?;
+                shared.publish(None);
                 match added {
                     Added::Stored => reply_deadline = Some(Instant::now() + REPLY_TIMEOUT),
                     Added::Ignored => {}

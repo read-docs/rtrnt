@@ -2,6 +2,7 @@ use indicatif::MultiProgress;
 use rtrnt::download::{DownloadConfig, Interrupted, SeedLimits, Session, download_from_peers};
 use rtrnt::peer::{PeerMessage, generate_peer_id};
 use rtrnt::resume;
+use rtrnt::stats::TorrentStats;
 use rtrnt::storage::Storage;
 use rtrnt::storage::verify;
 use rtrnt::torrent::TorrentFile;
@@ -130,6 +131,7 @@ fn resumable_session(
         metadata: None,
         bars: MultiProgress::new(),
         resume: resume::Target::new(config, info_hash),
+        stats: Arc::new(TorrentStats::new(info_hash, "test", Path::new("."))),
     })
 }
 

@@ -7,6 +7,7 @@ use crate::download::DownloadConfig;
 use crate::listener::Listener;
 use crate::peer;
 use crate::rate_limit::RateLimits;
+use crate::stats::SessionStats;
 use anyhow::{Result, bail};
 use indicatif::MultiProgress;
 use std::collections::{HashMap, HashSet};
@@ -40,6 +41,7 @@ pub struct Client {
     /// The files the torrents running write, keyed as `Storage::paths`
     /// gives them, with the info hash and name of the torrent that owns each.
     files: Mutex<HashMap<PathBuf, FileOwner>>,
+    stats: Arc<SessionStats>,
 }
 
 impl Client {
@@ -55,6 +57,10 @@ impl Client {
         }
         let rate_limits = RateLimits::from_kib(config.max_download_rate, config.max_upload_rate);
         let slots = ConnectionSlots::new(config.max_connections);
+        let stats = SessionStats::new(
+            (config.max_download_rate, config.max_upload_rate),
+            slots.clone(),
+        );
         Self {
             config,
             peer_id: peer::generate_peer_id(),
@@ -66,7 +72,13 @@ impl Client {
             dht: OnceCell::new(),
             torrents: Mutex::new(HashSet::new()),
             files: Mutex::new(HashMap::new()),
+            stats: Arc::new(stats),
         }
+    }
+
+    /// Live numbers about the session and its torrents.
+    pub fn stats(&self) -> &Arc<SessionStats> {
+        &self.stats
     }
 
     pub fn config(&self) -> &DownloadConfig {
@@ -102,7 +114,11 @@ impl Client {
     /// Where peers connect to us, listening on the configured port (see
     /// `Listener::bind`) from the first call on.
     pub async fn listener(&self) -> &Arc<Listener> {
-        let bind = Listener::bind(self.config.listen_port);
+        let bind = async {
+            let listener = Listener::bind(self.config.listen_port).await;
+            self.stats.set_port(listener.port());
+            listener
+        };
         self.listener
             .get_or_init(|| bind.instrument(session_span()))
             .await
@@ -116,11 +132,16 @@ impl Client {
             return None;
         }
         let port = self.config.listen_port;
+        let stats = &self.stats;
         let start = async move {
-            Dht::bind(port)
+            let dht = Dht::bind(port)
                 .await
                 .inspect_err(|e| warn!("cannot start the DHT: {e:#}"))
-                .ok()
+                .ok();
+            if let Some(dht) = &dht {
+                stats.set_dht(dht.clone());
+            }
+            dht
         };
         self.dht
             .get_or_init(|| start.instrument(session_span()))
@@ -198,6 +219,7 @@ fn session_span() -> Span {
 #[derive(Clone)]
 pub struct ConnectionSlots {
     semaphore: Arc<Semaphore>,
+    limit: usize,
     /// Notified whenever a permit comes back.
     freed: Arc<Notify>,
 }
@@ -205,10 +227,22 @@ pub struct ConnectionSlots {
 impl ConnectionSlots {
     /// `limit` slots.
     pub fn new(limit: usize) -> Self {
+        let limit = limit.min(Semaphore::MAX_PERMITS);
         Self {
-            semaphore: Arc::new(Semaphore::new(limit.min(Semaphore::MAX_PERMITS))),
+            semaphore: Arc::new(Semaphore::new(limit)),
+            limit,
             freed: Arc::new(Notify::new()),
         }
+    }
+
+    /// How many slots there are.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// How many slots are taken.
+    pub fn in_use(&self) -> usize {
+        self.limit - self.semaphore.available_permits()
     }
 
     /// Takes a slot, or `None` if they are all in use.

@@ -1,5 +1,6 @@
 use crate::peer::PeerMessage;
 use crate::peer::fast;
+use crate::stats::PieceSnapshot;
 use rand::Rng;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -210,6 +211,21 @@ impl PieceQueue {
     /// Pieces completed this session.
     pub(super) fn completed_count(&self) -> usize {
         self.lock().completed.len()
+    }
+
+    /// Which pieces we have, which are being downloaded, and how many
+    /// connected peers have each.
+    pub(super) fn snapshot(&self) -> PieceSnapshot {
+        let state = self.lock();
+        let mut in_flight = vec![false; state.have.len()];
+        for &index in state.in_flight.keys() {
+            in_flight[index] = true;
+        }
+        PieceSnapshot {
+            have: state.have.clone(),
+            in_flight,
+            availability: state.availability.clone(),
+        }
     }
 
     /// Which pieces are verified and on disk.

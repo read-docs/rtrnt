@@ -16,10 +16,11 @@ fn udp_event_codes() {
 
 #[test]
 fn udp_announce_response() {
-    let mut response = vec![0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut response = vec![0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 7, 8, 0, 0, 0, 4, 0, 0, 0, 9];
     response.extend_from_slice(&[1, 2, 3, 4, 0, 80]);
     let parsed = parse_udp_announce(&response, false).unwrap();
     assert_eq!(parsed.interval, Some(1800));
+    assert_eq!((parsed.seeders, parsed.leechers), (Some(9), Some(4)));
     assert_eq!(parsed.peers, ["1.2.3.4:80".parse().unwrap()]);
     assert!(parse_udp_announce(&response[..19], false).is_err());
 }

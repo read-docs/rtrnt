@@ -44,8 +44,11 @@ async fn announce_fake(
                     peers: vec!["1.2.3.4:80".parse().unwrap(); peers],
                     interval: None,
                     min_interval: None,
+                    seeders: None,
+                    leechers: None,
                 })
             },
+            |_, _| {},
         )
         .await;
     (result, asked)

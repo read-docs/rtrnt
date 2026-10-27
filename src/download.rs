@@ -3,6 +3,9 @@ use crate::dht::Dht;
 use crate::listener::Listener;
 use crate::rate_limit::RateLimits;
 use crate::resume::{self, Target};
+use crate::stats::{
+    PeerSource, TorrentStats,
+};
 use crate::storage::Storage;
 use crate::torrent::{self, TorrentFile};
 use crate::tracker::announcer::{Announcer, Transferred};
@@ -111,6 +114,8 @@ pub struct Session {
     /// Where the torrent's resume file is saved while it downloads, if it
     /// has one.
     pub resume: Option<Target>,
+    /// Where the download publishes its progress and its peers.
+    pub stats: Arc<TorrentStats>,
 }
 
 /// Downloads the torrent at `torrent_path` and seeds it for as long as the
@@ -134,12 +139,32 @@ pub async fn download_file(
     client: &Client,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
+    let metainfo = torrent::load_metainfo(torrent_path).await?;
+    let stats = client.stats().add_torrent(
+        metainfo.info_hash,
+        &metainfo.torrent.info.name,
+        &client.config().output_dir,
+    );
+    stats.set_torrent(&metainfo.torrent);
+    let result = download_metainfo(metainfo, client, &stats, shutdown).await;
+    stats.finish(&result);
+    result
+}
+
+/// `download_file` for a torrent loaded already, publishing its progress
+/// in `stats`.
+async fn download_metainfo(
+    metainfo: torrent::Metainfo,
+    client: &Client,
+    stats: &Arc<TorrentStats>,
+    shutdown: impl Future<Output = ()>,
+) -> Result<()> {
     let config = client.config();
     let torrent::Metainfo {
         torrent,
         info_hash,
         info_bytes,
-    } = torrent::load_metainfo(torrent_path).await?;
+    } = metainfo;
     info!(
         name = %torrent.info.name,
         size = torrent.length(),
@@ -170,6 +195,7 @@ pub async fn download_file(
         metadata: Some(info_bytes),
         bars: client.bars().clone(),
         resume: Target::new(config, info_hash),
+        stats: Arc::clone(stats),
     });
 
     let mut shutdown = std::pin::pin!(shutdown);
@@ -195,7 +221,8 @@ pub async fn download_file(
         event: AnnounceEvent::Started,
     };
     let tiers = session.torrent.tracker_tiers();
-    let (announcer, peers) = match Announcer::start(tiers, request).await {
+    let started = Announcer::start_reporting(tiers, request, Some(Arc::clone(stats)));
+    let (announcer, peers) = match started.await {
         Ok((announcer, peers)) => (Some(announcer), peers),
         // No trackers, or none answered: the DHT may still find peers.
         Err(e) if session.dht.is_some() => {
@@ -216,6 +243,7 @@ pub async fn download_file(
         info!(peers = peers.len(), "tracker announce succeeded");
     }
 
+    stats.add_source(PeerSource::Tracker, peers.len());
     let mut start = StartPeers::default();
     start.pool.add(peers);
     download_with(

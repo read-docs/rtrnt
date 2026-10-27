@@ -4,6 +4,7 @@ use rtrnt::download::{DownloadConfig, SeedLimits, Session};
 use rtrnt::peer::fast;
 use rtrnt::peer::{PeerMessage, generate_peer_id, handshake_bytes, parse_handshake};
 use rtrnt::rate_limit::RateLimits;
+use rtrnt::stats::TorrentStats;
 use rtrnt::storage::Storage;
 use rtrnt::torrent::{FileInfo, Info, TorrentFile};
 use serde_bytes::ByteBuf;
@@ -304,6 +305,7 @@ pub(crate) fn limited_session(
         metadata: Some(metadata),
         bars: MultiProgress::new(),
         resume: None,
+        stats: Arc::new(TorrentStats::new(info_hash, "test", Path::new("."))),
     })
 }
 

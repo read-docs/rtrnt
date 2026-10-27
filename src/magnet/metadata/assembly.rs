@@ -81,6 +81,12 @@ impl Assembly {
         self.metadata.as_deref()
     }
 
+    /// Metadata pieces in, and the number there are (0 until a peer says).
+    pub(crate) fn progress(&self) -> (usize, usize) {
+        let received = self.pieces.iter().filter(|piece| piece.is_some()).count();
+        (received, self.pieces.len())
+    }
+
     /// Whether `peer` sent a copy of the metadata that failed the hash
     /// check.
     pub(crate) fn is_banned(&self, peer: SocketAddr) -> bool {

@@ -2,9 +2,11 @@ use indicatif::MultiProgress;
 use rtrnt::download::{DownloadConfig, Interrupted, SeedLimits, Session, download_file};
 use rtrnt::peer::{PeerMessage, generate_peer_id};
 use rtrnt::resume;
+use rtrnt::stats::TorrentStats;
 use rtrnt::storage::Storage;
 use std::future::pending;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -365,6 +367,7 @@ async fn a_torrent_waits_its_turn_to_check_its_data() {
             term.clone(),
         ))),
         resume: resume::Target::new(&config, info_hash),
+        stats: Arc::new(TorrentStats::new(info_hash, "test", Path::new("."))),
     });
     let hashing = Semaphore::new(1);
     let turn = hashing.acquire().await.unwrap();
@@ -390,4 +393,111 @@ async fn a_torrent_waits_its_turn_to_check_its_data() {
     assert_eq!(have.unwrap(), vec![true; num_pieces]);
     // The turn is back.
     assert_eq!(hashing.available_permits(), 1);
+}
+
+/// Polls `done` until it holds, failing after a few seconds.
+async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// A torrent's stats follow its download: queued for checking while
+/// another torrent hashes, downloading with its peer listed while that peer
+/// holds back, and done with every byte counted and the peer gone.
+#[tokio::test]
+async fn stats_follow_a_download() {
+    use rtrnt::stats::{PeerSource, TorrentState};
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (mut torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (tracker_url, _queries) = mock_tracker(vec![listener.local_addr().unwrap()]).await;
+    torrent.announce = Some(tracker_url.clone());
+    let out = tempfile::tempdir().unwrap();
+    // Zeros where the data goes: every piece is checked, and none passes.
+    write_files(out.path(), &vec![0; data.len()]);
+    let path = out.path().join("multi.torrent");
+    std::fs::write(&path, serde_bencode::to_bytes(&torrent).unwrap()).unwrap();
+
+    let (go, gate) = oneshot::channel::<()>();
+    let seeder_data = Arc::clone(&data);
+    let seeder = tokio::spawn(async move {
+        let mut socket = accept_leecher(&listener, info_hash, num_pieces).await;
+        gate.await.unwrap();
+        send(&mut socket, PeerMessage::Unchoke).await;
+        serve(socket, &seeder_data).await;
+    });
+
+    let client = Arc::new(client(DownloadConfig {
+        output_dir: out.path().to_path_buf(),
+        max_peers: 10,
+        max_connections: 100,
+        listen_port: 0,
+        seed: SeedLimits::default(),
+        dht: false,
+        max_download_rate: 0,
+        max_upload_rate: 0,
+        resume_dir: None,
+        recheck: false,
+    }));
+    // Another torrent's turn at checking.
+    let turn = client.hashing().acquire().await.unwrap();
+    let download = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { download_file(&path, &client, pending()).await }
+    });
+    let stats = client.stats();
+    wait_until("torrent listed", || stats.torrents().len() == 1).await;
+    let torrent_stats = stats.torrents()[0].clone();
+    assert_eq!(torrent_stats.info_hash(), info_hash);
+    assert_eq!(torrent_stats.name(), "multi");
+    assert_eq!(torrent_stats.layout().unwrap().size, data.len() as u64);
+    wait_until("queued for checking", || {
+        torrent_stats.state() == TorrentState::QueuedForChecking
+    })
+    .await;
+    drop(turn);
+
+    wait_until("peer connected", || {
+        torrent_stats.state() == TorrentState::Downloading
+            && torrent_stats
+                .peers()
+                .first()
+                .is_some_and(|peer| peer.flags().am_interested() && peer.flags().peer_choking())
+    })
+    .await;
+    let peer = torrent_stats.peers()[0].clone();
+    assert!(!peer.inbound);
+    assert_eq!(peer.pieces() as usize, num_pieces);
+    let pieces = torrent_stats.pieces().unwrap();
+    assert_eq!(pieces.have, vec![false; num_pieces]);
+    assert_eq!(pieces.availability, vec![1; num_pieces]);
+    assert_eq!(torrent_stats.source(PeerSource::Tracker), 1);
+    let trackers = torrent_stats.trackers();
+    assert_eq!(trackers.len(), 1);
+    assert_eq!(trackers[0].url, tracker_url);
+    assert_eq!(trackers[0].peers, Some(1));
+    assert!(torrent_stats.next_announce().is_some());
+    assert_eq!(stats.connections(), 1);
+    drop(peer);
+
+    go.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(20), download)
+        .await
+        .expect("download timed out")
+        .unwrap()
+        .expect("download failed");
+    seeder.await.unwrap();
+    assert_files_match(out.path(), &data);
+    assert_eq!(torrent_stats.state(), TorrentState::Done);
+    assert!(torrent_stats.finished_at().is_some());
+    assert_eq!(torrent_stats.downloaded(), data.len() as u64);
+    assert_eq!(torrent_stats.received(), data.len() as u64);
+    assert!(torrent_stats.peers().is_empty());
+    assert_eq!(torrent_stats.pieces().unwrap().have, vec![true; num_pieces]);
+    assert_eq!(torrent_stats.next_announce(), None);
 }

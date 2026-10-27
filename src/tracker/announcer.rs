@@ -3,8 +3,10 @@
 //! finishes, and `stopped` at the end.
 
 use super::{AnnounceEvent, AnnounceRequest, AnnounceResponse, Tiers};
+use crate::stats::TorrentStats;
 use anyhow::Result;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -62,6 +64,8 @@ pub struct Announcer {
     /// tiers and hands it back, reordered to put the tracker that answered
     /// first.
     in_flight: Option<JoinHandle<(Tiers, AnnounceEvent, Result<AnnounceResponse>)>>,
+    /// Told what each tracker answered, and when the next announce is due.
+    stats: Option<Arc<TorrentStats>>,
 }
 
 impl Announcer {
@@ -72,8 +76,27 @@ impl Announcer {
         tiers: Vec<Vec<String>>,
         request: AnnounceRequest,
     ) -> Result<(Self, Vec<SocketAddr>)> {
+        Self::start_reporting(tiers, request, None).await
+    }
+
+    /// `start`, recording in `stats` what each tracker answers, now and on
+    /// every announce after.
+    pub async fn start_reporting(
+        tiers: Vec<Vec<String>>,
+        request: AnnounceRequest,
+        stats: Option<Arc<TorrentStats>>,
+    ) -> Result<(Self, Vec<SocketAddr>)> {
+        if let Some(stats) = &stats {
+            stats.set_trackers(&tiers);
+        }
         let mut announcer = Self::new(Tiers::new(tiers), request, Instant::now());
-        let response = announcer.trackers.announce(&announcer.started).await?;
+        announcer.stats = stats;
+        let started = announcer.started;
+        let stats = announcer.stats.clone();
+        let response = announcer
+            .trackers
+            .announce_reporting(&started, |url, result| report(&stats, url, result))
+            .await?;
         announcer.schedule(&response);
         Ok((announcer, response.peers))
     }
@@ -91,6 +114,7 @@ impl Announcer {
             next: now + DEFAULT_INTERVAL,
             completion: Completion::Downloading,
             in_flight: None,
+            stats: None,
         }
     }
 
@@ -104,7 +128,15 @@ impl Announcer {
             .unwrap_or(DEFAULT_INTERVAL)
             .clamp(self.min_interval, MAX_INTERVAL);
         self.next = self.last + self.interval;
+        self.publish_next();
         debug!(interval = ?self.interval, "next announce scheduled");
+    }
+
+    /// Tells the stats when the next announce is due.
+    fn publish_next(&self) {
+        if let Some(stats) = &self.stats {
+            stats.set_next_announce(Some(self.next.into_std()));
+        }
     }
 
     /// The request for `event`, reporting the bytes `downloaded` and
@@ -132,6 +164,7 @@ impl Announcer {
         if self.completion == Completion::Downloading {
             self.completion = Completion::Due;
             self.next = Instant::now();
+            self.publish_next();
         }
     }
 
@@ -139,6 +172,7 @@ impl Announcer {
     /// for when we have run out of peers.
     pub fn hurry(&mut self) {
         self.next = self.next.min(self.last + self.min_interval);
+        self.publish_next();
     }
 
     /// Waits until the next announce is due, sends it in the background
@@ -160,8 +194,11 @@ impl Announcer {
         let request = self.request(event, transferred.load());
         let handle = self.in_flight.get_or_insert_with(|| {
             let mut trackers = self.trackers.clone();
+            let stats = self.stats.clone();
             let announce = async move {
-                let result = trackers.announce(&request).await;
+                let result = trackers
+                    .announce_reporting(&request, |url, result| report(&stats, url, result))
+                    .await;
                 (trackers, request.event, result)
             };
             tokio::spawn(announce.in_current_span())
@@ -186,6 +223,7 @@ impl Announcer {
             Err(e) => {
                 warn!("re-announce failed: {e:#}");
                 self.next = self.last + self.interval;
+                self.publish_next();
                 Vec::new()
             }
         }
@@ -196,6 +234,9 @@ impl Announcer {
     /// has not heard yet, then `stopped`. Failures are only logged, and the
     /// tracker gets `STOP_TIMEOUT` in total so it cannot hold up the exit.
     pub async fn stop(mut self, transferred: &Transferred) {
+        if let Some(stats) = &self.stats {
+            stats.set_next_announce(None);
+        }
         if let Some(handle) = self.in_flight.take() {
             handle.abort();
         }
@@ -208,7 +249,11 @@ impl Announcer {
         let send = async {
             for &event in events {
                 let request = self.request(event, counts);
-                match self.trackers.announce(&request).await {
+                let stats = &self.stats;
+                let announce = self
+                    .trackers
+                    .announce_reporting(&request, |url, result| report(stats, url, result));
+                match announce.await {
                     Ok(_) => debug!(?event, "announced"),
                     Err(e) => warn!(?event, "announce failed: {e:#}"),
                 }
@@ -217,6 +262,13 @@ impl Announcer {
         if tokio::time::timeout(STOP_TIMEOUT, send).await.is_err() {
             warn!("tracker did not answer the final announce in time");
         }
+    }
+}
+
+/// Records what the tracker at `url` answered in `stats`, if any.
+fn report(stats: &Option<Arc<TorrentStats>>, url: &str, result: &Result<AnnounceResponse>) {
+    if let Some(stats) = stats {
+        stats.tracker_answered(url, result);
     }
 }
 

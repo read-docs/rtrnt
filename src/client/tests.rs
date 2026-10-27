@@ -97,7 +97,9 @@ fn connection_slots_run_out_and_come_back() {
     let first = slots.try_acquire().unwrap();
     let _second = slots.try_acquire().unwrap();
     assert!(slots.try_acquire().is_none());
+    assert_eq!((slots.in_use(), slots.limit()), (2, 2));
     drop(first);
+    assert_eq!(slots.in_use(), 1);
     assert!(slots.try_acquire().is_some());
 }
 

@@ -16,6 +16,7 @@ use crate::download::peer_pool::PeerPool;
 use crate::download::{self, Limits, Session, StartPeers};
 use crate::peer::extension::Advertised;
 use crate::resume::{self, Target};
+use crate::stats::{PeerSource, TorrentState, TorrentStats};
 use crate::storage::Storage;
 use crate::torrent;
 use crate::tracker::announcer::{Announcer, Transferred};
@@ -248,6 +249,29 @@ pub async fn download_magnet(
         info!(path = %path.display(), "using metadata saved by an earlier run");
         return download::download_file(&path, client, shutdown).await;
     }
+    let name = link.name.clone().unwrap_or_else(|| hex(&link.info_hash));
+    let stats = client
+        .stats()
+        .add_torrent(link.info_hash, &name, &config.output_dir);
+    stats.set_state(TorrentState::FetchingMetadata {
+        pieces: 0,
+        total: 0,
+        peers: 0,
+    });
+    let result = fetch_and_download(link, client, &stats, shutdown).await;
+    stats.finish(&result);
+    result
+}
+
+/// `download_magnet` without metadata saved by an earlier run, publishing
+/// its progress in `stats`.
+async fn fetch_and_download(
+    link: &MagnetLink,
+    client: &Client,
+    stats: &Arc<TorrentStats>,
+    shutdown: impl Future<Output = ()>,
+) -> Result<()> {
+    let config = client.config();
     let info_hash = link.info_hash;
     info!(
         name = link.name.as_deref().unwrap_or("unknown"),
@@ -274,9 +298,10 @@ pub async fn download_magnet(
             left: UNKNOWN_LEFT,
             event: AnnounceEvent::Started,
         };
-        match Announcer::start(tiers.clone(), request).await {
+        match Announcer::start_reporting(tiers.clone(), request, Some(Arc::clone(stats))).await {
             Ok((started, peers)) => {
                 info!(peers = peers.len(), "tracker announce succeeded");
+                stats.add_source(PeerSource::Tracker, peers.len());
                 pool.add(peers);
                 announcer = Some(started);
             }
@@ -298,6 +323,7 @@ pub async fn download_magnet(
         dht: dht
             .clone()
             .map(|dht| DhtSearch::new(dht, info_hash, listen_port)),
+        stats: Arc::clone(stats),
     };
     let fetched = match fetch.run(pool, &mut shutdown).await {
         Ok(fetched) => fetched,
@@ -317,6 +343,7 @@ pub async fn download_magnet(
             pieces = torrent.num_pieces(),
             "fetched metadata"
         );
+        stats.set_torrent(&torrent);
         claim.claim_files(
             &torrent.info.name,
             &Storage::paths(&torrent.info, &config.output_dir)?,
@@ -344,6 +371,7 @@ pub async fn download_magnet(
             metadata: Some(fetched.metadata),
             bars: client.bars().clone(),
             resume: Target::new(config, info_hash),
+            stats: Arc::clone(stats),
         });
         let have =
             resume::initial_pieces(&session, config, client.hashing(), shutdown.as_mut()).await?;

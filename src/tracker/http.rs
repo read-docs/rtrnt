@@ -53,6 +53,10 @@ struct HttpTrackerResponse {
     #[serde(rename = "min interval", default)]
     min_interval: Option<u64>,
     #[serde(default)]
+    complete: Option<u32>,
+    #[serde(default)]
+    incomplete: Option<u32>,
+    #[serde(default)]
     peers: Option<Value>,
     #[serde(default)]
     peers6: Option<serde_bytes::ByteBuf>,
@@ -79,6 +83,8 @@ fn parse_http_response(body: &[u8]) -> Result<AnnounceResponse> {
         peers,
         interval: response.interval,
         min_interval: response.min_interval,
+        seeders: response.complete,
+        leechers: response.incomplete,
     })
 }
 

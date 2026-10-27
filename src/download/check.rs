@@ -1,4 +1,7 @@
 use crate::peer::{self};
+use crate::stats::{
+    TorrentState, TorrentStats,
+};
 use crate::storage::Storage;
 use crate::storage::verify;
 use crate::torrent::{self, TorrentFile};
@@ -20,6 +23,7 @@ pub async fn check_file(torrent_path: &Path, output_dir: &Path) -> Result<()> {
     let (torrent, info_hash) = torrent::load_file(torrent_path).await?;
     let storage = Arc::new(Storage::open_existing(&torrent.info, output_dir)?);
     let pieces = verify::present(&torrent, &storage)?;
+    let stats = TorrentStats::detached(&torrent, info_hash, output_dir);
     let session = Arc::new(Session {
         torrent,
         info_hash,
@@ -31,6 +35,7 @@ pub async fn check_file(torrent_path: &Path, output_dir: &Path) -> Result<()> {
         metadata: None,
         bars: MultiProgress::new(),
         resume: None,
+        stats,
     });
     // Nothing else is hashing, and nothing stops the check.
     let have = hash_pieces(&session, pieces, &Semaphore::new(1), std::future::pending()).await?;
@@ -72,6 +77,7 @@ pub(crate) async fn hash_pieces(
     let bar = session.bars.add(bar);
     // Drawn now, not at its first update, which only comes with our turn.
     bar.tick();
+    session.stats.set_state(TorrentState::QueuedForChecking);
     let interrupted = || Interrupted {
         remaining: torrent.num_pieces(),
         pieces: torrent.num_pieces(),
@@ -93,6 +99,9 @@ pub(crate) async fn hash_pieces(
         bar.set_style(style);
     }
     bar.reset_eta();
+    session
+        .stats
+        .set_state(TorrentState::Checking { done: 0, total });
 
     let blocking = Arc::clone(session);
     let check_bar = bar.clone();
@@ -104,7 +113,7 @@ pub(crate) async fn hash_pieces(
             &blocking.storage,
             &pieces,
             &cancelled,
-            &|len| check_bar.inc(len),
+            &|len| check_bar.set_position(blocking.stats.checked(len)),
         )
     });
     let result = tokio::select! {

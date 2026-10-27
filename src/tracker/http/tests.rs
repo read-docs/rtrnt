@@ -4,12 +4,14 @@ use crate::tracker::tests::request;
 
 #[test]
 fn http_response_compact() {
-    let mut body = b"d8:intervali1800e12:min intervali60e5:peers6:".to_vec();
+    let mut body =
+        b"d8:completei5e10:incompletei2e8:intervali1800e12:min intervali60e5:peers6:".to_vec();
     body.extend_from_slice(&[1, 2, 3, 4, 0, 80]);
     body.push(b'e');
     let response = parse_http_response(&body).unwrap();
     assert_eq!(response.interval, Some(1800));
     assert_eq!(response.min_interval, Some(60));
+    assert_eq!((response.seeders, response.leechers), (Some(5), Some(2)));
     assert_eq!(response.peers, ["1.2.3.4:80".parse().unwrap()]);
 }
 
@@ -18,6 +20,7 @@ fn http_response_dict_list() {
     let body = b"d5:peersld2:ip7:1.2.3.47:peer id20:aaaaaaaaaaaaaaaaaaaa4:porti6881eed2:ip8:hostname4:porti1eeee";
     let response = parse_http_response(body).unwrap();
     assert_eq!(response.peers, ["1.2.3.4:6881".parse().unwrap()]);
+    assert_eq!((response.seeders, response.leechers), (None, None));
 }
 
 #[test]

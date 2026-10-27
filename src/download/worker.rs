@@ -3,9 +3,13 @@ use crate::peer::extension::{self, Advertised};
 use crate::peer::fast;
 use crate::peer::pex::{self};
 use crate::peer::{PeerConnection, PeerMessage};
+use crate::stats::{
+    PeerFlags, PeerStats,
+};
 use anyhow::{Result, anyhow, bail};
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::{debug, warn};
@@ -85,6 +89,8 @@ pub(super) async fn peer_worker(
     // drops requests.
     let fast = conn.supports_fast();
     debug!(%addr, inbound, fast, "connected");
+    let stats = Arc::new(PeerStats::new(addr, inbound));
+    session.stats.add_peer(&stats);
     let mut pex = pex.join(conn.peer_id, addr, !inbound);
 
     // Our pieces, first thing after the handshakes (see
@@ -154,6 +160,7 @@ pub(super) async fn peer_worker(
         }
         if has_changed {
             pieces.update(conn.peer_has());
+            stats.set_pieces(conn.peer_has().iter().filter(|&&has| has).count());
             pex.set_seed(conn.peer_has().iter().all(|&has| has));
             has_changed = false;
         }
@@ -171,6 +178,7 @@ pub(super) async fn peer_worker(
         slot.set_interested(conn.peer_interested());
         let choking = !slot.is_unchoked();
         conn.set_choking(choking).await?;
+        publish_peer(&stats, &conn, fast, torrent.is_private());
         if choking {
             // A choke drops the peer's requests, except those for its
             // allowed fast pieces. With the fast extension each dropped one
@@ -230,6 +238,7 @@ pub(super) async fn peer_worker(
             uploads.pop();
             serve_block(&mut conn, &session.storage, request).await?;
             slot.uploaded(request.length.into());
+            stats.add_uploaded(request.length.into());
             progress.uploaded(request.length.into());
             messages_since_block = 0;
         }
@@ -363,6 +372,8 @@ pub(super) async fn peer_worker(
                 }
                 pipeline.received(block.len() as u64, Instant::now());
                 slot.downloaded(block.len() as u64);
+                stats.add_downloaded(block.len() as u64);
+                session.stats.add_received(block.len() as u64);
                 if !active[pos].is_complete() {
                     continue;
                 }
@@ -474,6 +485,26 @@ pub(super) async fn peer_worker(
             } => metadata::serve(&mut conn, session.metadata.as_deref(), &payload).await?,
             _ => {}
         }
+    }
+}
+
+/// Tells `stats` how the connection `conn` stands, and the peer's client
+/// once its extension handshake names it.
+fn publish_peer(stats: &PeerStats, conn: &PeerConnection, fast: bool, private: bool) {
+    let extensions = conn.peer_extensions();
+    let pex = !private && extensions.is_some_and(|handshake| handshake.id(pex::NAME).is_some());
+    stats.set_flags(PeerFlags::new(
+        conn.am_choking(),
+        conn.is_choked(),
+        conn.am_interested(),
+        conn.peer_interested(),
+        fast,
+        pex,
+    ));
+    if !stats.has_client()
+        && let Some(client) = extensions.and_then(|handshake| handshake.client.as_deref())
+    {
+        stats.set_client(client);
     }
 }
 

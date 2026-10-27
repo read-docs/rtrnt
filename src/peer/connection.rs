@@ -281,6 +281,11 @@ impl PeerConnection {
         self.peer_choking
     }
 
+    /// Whether we told the peer we want to download from it.
+    pub fn am_interested(&self) -> bool {
+        self.am_interested
+    }
+
     /// Whether we are choking the peer, so it may not download from us.
     pub fn am_choking(&self) -> bool {
         self.am_choking
