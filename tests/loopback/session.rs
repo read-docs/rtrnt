@@ -1,4 +1,5 @@
 use indicatif::MultiProgress;
+use rtrnt::client::Client;
 use rtrnt::download::{DownloadConfig, Interrupted, SeedLimits, Session, download_file};
 use rtrnt::peer::{PeerMessage, generate_peer_id};
 use rtrnt::resume;
@@ -123,10 +124,9 @@ async fn a_client_runs_a_torrent_once() {
         stop_rx.await.ok();
     });
     let second = async {
-        // Wait until the first has claimed the torrent.
-        while client.claim(info_hash).is_ok() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        // Wait until the first has checked its data and seeds, so the stop
+        // below cannot cut its check short.
+        wait_until("first seeding", || is_seeding(&client, info_hash)).await;
         let err = download_file(&path, &client, pending()).await.unwrap_err();
         stop.send(()).unwrap();
         err
@@ -178,10 +178,9 @@ async fn a_torrent_sharing_a_file_with_a_running_one_is_refused() {
         stop_rx.await.ok();
     });
     let refused = async {
-        // Wait until the first has claimed its torrent, and so its files.
-        while client.claim(first_hash).is_ok() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        // Wait until the first has claimed its files and checked them, so
+        // the stop below cannot cut its check short.
+        wait_until("first seeding", || is_seeding(&client, first_hash)).await;
         let err = download_file(&second_path, &client, pending())
             .await
             .unwrap_err();
@@ -393,6 +392,13 @@ async fn a_torrent_waits_its_turn_to_check_its_data() {
     assert_eq!(have.unwrap(), vec![true; num_pieces]);
     // The turn is back.
     assert_eq!(hashing.available_permits(), 1);
+}
+
+/// Whether `client` is seeding the torrent with `info_hash`.
+fn is_seeding(client: &Client, info_hash: [u8; 20]) -> bool {
+    client.stats().torrents().iter().any(|torrent| {
+        torrent.info_hash() == info_hash && torrent.state() == rtrnt::stats::TorrentState::Seeding
+    })
 }
 
 /// Polls `done` until it holds, failing after a few seconds.
