@@ -2,11 +2,14 @@
 //! snapshot and the app state alone, into the area it is given.
 
 mod detail;
+mod files;
 mod header;
+mod info;
 mod keybar;
 mod peers;
 mod pieces;
 mod torrents;
+mod trackers;
 
 use super::app::App;
 use super::snapshot::Snapshot;
@@ -451,6 +454,111 @@ mod screen_tests {
         let snapshot = demo::fixture();
         let buffer = render(100, 32, &snapshot, &app);
         assert!(text(&buffer, buffer.area)[9].ends_with(" 1 cell ≈ 2 pieces ╮"));
+    }
+
+    fn tab_lines(snapshot: &Snapshot, tab: crate::tui::app::Tab) -> Vec<String> {
+        let mut app = app(snapshot);
+        app.tab = tab;
+        let buffer = render(100, 32, snapshot, &app);
+        text(&buffer, buffer.area)[10..30].to_vec()
+    }
+
+    #[test]
+    fn trackers_tab_groups_by_tier() {
+        let lines = tab_lines(&demo::fixture(), crate::tui::app::Tab::Trackers);
+        assert_eq!(
+            lines[0],
+            "│ Tier URL                                       Status                  Peers  Seeds  Leech   Next│"
+        );
+        assert_eq!(
+            lines[1],
+            "│ 1    udp://tracker.opentrackr.org:1337/announ… ok                         50   1204     87    24m│"
+        );
+        assert!(lines[3].starts_with(
+            "│      udp://tracker.example.org:6969/announce   connection timed out        —"
+        ));
+        assert!(
+            lines[4].starts_with("│ 3    https://tracker.example.net/announce      not contacted")
+        );
+        assert!(lines[6].starts_with(
+            "│      DHT                                       ok, 312 nodes             118"
+        ));
+        assert!(lines[7].starts_with(
+            "│      PeX                                       ok                         70"
+        ));
+    }
+
+    #[test]
+    fn files_tab_counts_pieces_pro_rata() {
+        let mut snapshot = demo::fixture();
+        // Two files over three pieces of 256 KiB: the middle piece is
+        // shared, and only it is had.
+        let layout = crate::stats::Layout {
+            size: 640 * 1024,
+            piece_length: 256 * 1024,
+            pieces: 3,
+            private: true,
+            files: vec![
+                ("dir/a.bin".into(), 384 * 1024),
+                ("dir/b.bin".into(), 256 * 1024),
+            ],
+        };
+        snapshot.torrents[0].layout = Some(layout);
+        snapshot.detail.as_mut().unwrap().pieces = Some(crate::stats::PieceSnapshot {
+            have: vec![false, true, false],
+            in_flight: vec![false; 3],
+            availability: vec![1; 3],
+        });
+        let lines = tab_lines(&snapshot, crate::tui::app::Tab::Files);
+        assert!(lines[0].starts_with("│ Path "));
+        assert!(lines[1].starts_with("│ dir/a.bin "));
+        assert!(
+            lines[1].ends_with(" 384 KiB  ███▍──────  33%│"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].ends_with(" 256 KiB  █████─────  50%│"),
+            "{}",
+            lines[2]
+        );
+        // A private torrent uses neither the DHT nor peer exchange.
+        let lines = tab_lines(&snapshot, crate::tui::app::Tab::Trackers);
+        assert!(lines[6].contains("DHT") && lines[6].contains("off (private torrent)"));
+    }
+
+    #[test]
+    fn info_tab_lists_the_facts() {
+        let mut snapshot = demo::fixture();
+        snapshot.torrents[0].downloaded = 4 * 1024 * 1024;
+        snapshot.torrents[0].uploaded = 1024 * 1024;
+        let lines = tab_lines(&snapshot, crate::tui::app::Tab::Info);
+        let expected = [
+            "│ state         downloading",
+            "│ info hash     0101010101010101010101010101010101010101",
+            "│ size          754 MiB  3016 pieces × 256 KiB",
+            "│ pieces        1875 / 3016",
+            "│ private       no",
+            "│ files         1",
+            "│ save path     /home/me/Downloads",
+            "│ this session  ↓ 4.0 MiB  ↑ 1.0 MiB  ratio 0.25",
+            "│ active        2h 42m 00s",
+        ];
+        for (line, expected) in lines.iter().zip(expected) {
+            assert!(line.starts_with(expected), "{line}");
+        }
+        // A magnet link says how its metadata is coming along.
+        let mut app = app(&snapshot);
+        app.selected = Some(snapshot.torrents[3].info_hash);
+        app.tab = crate::tui::app::Tab::Info;
+        let buffer = render(100, 32, &snapshot, &app);
+        let lines = text(&buffer, buffer.area);
+        assert!(
+            lines[10].starts_with("│ state         metadata  3/7 pieces from 4 peers"),
+            "{}",
+            lines[10]
+        );
+        assert!(lines[12].starts_with("│ size          not known yet"));
     }
 
     #[test]
