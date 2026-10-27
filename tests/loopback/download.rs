@@ -1,6 +1,7 @@
 use rtrnt::dht::Dht;
-use rtrnt::download::{download_from_peers, listen};
+use rtrnt::download::download_from_peers;
 use rtrnt::extension::ExtendedHandshake;
+use rtrnt::listener::listen;
 use rtrnt::peer::{PeerMessage, parse_handshake};
 use std::future::pending;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
