@@ -383,6 +383,7 @@ async fn interrupted_download_keeps_pieces_and_tells_the_tracker() {
         info_hash,
         peer_id: generate_peer_id(),
         port: 6881,
+        key: 0,
         uploaded: 0,
         downloaded: 0,
         left: total,

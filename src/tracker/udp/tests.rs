@@ -1,5 +1,6 @@
 use super::*;
 use crate::tracker::AnnounceEvent;
+use tokio::net::UdpSocket;
 
 #[test]
 fn udp_event_codes() {
@@ -61,4 +62,45 @@ fn udp_scrape_response() {
     assert!(parse_udp_scrape(&response[..response.len() - 1], 2).is_err());
     assert!(parse_udp_scrape(&response[..4], 1).is_err());
     assert_eq!(parse_udp_scrape(&response[..4], 0).unwrap(), []);
+}
+
+/// Announces each of `requests` to a tracker on localhost that answers with
+/// no peers, and returns the `key` field of each announce it received.
+async fn keys_sent(requests: &[AnnounceRequest]) -> Vec<[u8; 4]> {
+    let tracker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let url = Url::parse(&format!("udp://{}", tracker.local_addr().unwrap())).unwrap();
+    let expected = requests.len();
+    let server = tokio::spawn(async move {
+        let mut keys = Vec::new();
+        let mut buf = [0u8; 1024];
+        while keys.len() < expected {
+            let (n, from) = tracker.recv_from(&mut buf).await.unwrap();
+            let mut reply = Vec::new();
+            if buf[8..12] == UDP_ACTION_CONNECT.to_be_bytes() {
+                reply.extend_from_slice(&UDP_ACTION_CONNECT.to_be_bytes());
+                reply.extend_from_slice(&buf[12..16]);
+                reply.extend_from_slice(&7u64.to_be_bytes());
+            } else {
+                assert_eq!(n, 98);
+                keys.push(buf[88..92].try_into().unwrap());
+                reply.extend_from_slice(&UDP_ACTION_ANNOUNCE.to_be_bytes());
+                reply.extend_from_slice(&buf[12..16]);
+                reply.extend_from_slice(&[0, 0, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0]);
+            }
+            tracker.send_to(&reply, from).await.unwrap();
+        }
+        keys
+    });
+    for request in requests {
+        announce_udp(&url, request).await.unwrap();
+    }
+    server.await.unwrap()
+}
+
+#[tokio::test]
+async fn announces_of_a_session_send_the_same_key() {
+    let request = crate::tracker::tests::request();
+    let keys = keys_sent(&[request, request]).await;
+    assert_eq!(keys[0], keys[1]);
+    assert_eq!(keys[0], request.key.to_be_bytes());
 }

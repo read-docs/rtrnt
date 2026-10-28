@@ -314,6 +314,7 @@ async fn fetch_and_download(
             info_hash,
             peer_id,
             port: listen_port.unwrap_or(config.listen_port),
+            key: 0,
             uploaded: 0,
             downloaded: 0,
             left: UNKNOWN_LEFT,

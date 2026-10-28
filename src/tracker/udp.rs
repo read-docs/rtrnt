@@ -41,7 +41,7 @@ pub(super) async fn announce_udp(url: &Url, request: &AnnounceRequest) -> Result
     announce.extend_from_slice(&request.uploaded.to_be_bytes());
     announce.extend_from_slice(&request.event.udp_code().to_be_bytes());
     announce.extend_from_slice(&0u32.to_be_bytes()); // IP = default
-    announce.extend_from_slice(&rand::random::<u32>().to_be_bytes()); // key
+    announce.extend_from_slice(&request.key.to_be_bytes());
     announce.extend_from_slice(&(-1i32).to_be_bytes()); // num_want = default
     announce.extend_from_slice(&request.port.to_be_bytes());
     let response = udp_transact(&socket, announce, UDP_ACTION_ANNOUNCE).await?;

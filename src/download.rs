@@ -292,6 +292,7 @@ async fn download_loaded(
         info_hash,
         peer_id: session.peer_id,
         port,
+        key: 0,
         uploaded: 0,
         downloaded: 0,
         left,

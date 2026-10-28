@@ -121,6 +121,7 @@ impl Announcer {
             trackers,
             started: AnnounceRequest {
                 event: AnnounceEvent::Started,
+                key: rand::random(),
                 ..request
             },
             interval: DEFAULT_INTERVAL,

@@ -8,6 +8,7 @@ fn announcer(now: Instant) -> Announcer {
         info_hash: [1; 20],
         peer_id: [2; 20],
         port: 6881,
+        key: 0,
         uploaded: 0,
         downloaded: 0,
         left: 1000,
@@ -74,6 +75,19 @@ fn requests_report_progress() {
     );
     assert_eq!(request.event, AnnounceEvent::Regular);
     assert_eq!(a.request(AnnounceEvent::Completed, (5000, 0)).left, 0);
+}
+
+#[test]
+fn every_request_of_a_session_carries_the_same_key() {
+    let a = announcer(Instant::now());
+    let key = a.started.key;
+    for event in [
+        AnnounceEvent::Regular,
+        AnnounceEvent::Completed,
+        AnnounceEvent::Stopped,
+    ] {
+        assert_eq!(a.request(event, (1, 1)).key, key);
+    }
 }
 
 #[test]
