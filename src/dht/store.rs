@@ -22,7 +22,9 @@ pub struct PeerStore {
 }
 
 impl PeerStore {
-    /// Records that `peer` has the torrent. When full, the peer that
+    /// Records that `peer` has the torrent. A host keeps one entry per
+    /// torrent, so that it cannot fill the list with ports; a new port
+    /// replaces its old one. When full, the peer that
     /// announced longest ago gives way; when tracking too many torrents, a
     /// new one is ignored.
     pub fn announce(&mut self, info_hash: [u8; 20], peer: SocketAddrV4, now: Instant) {
@@ -33,8 +35,8 @@ impl PeerStore {
             }
         }
         let peers = self.torrents.entry(info_hash).or_default();
-        if let Some(known) = peers.iter_mut().find(|(addr, _)| *addr == peer) {
-            known.1 = now;
+        if let Some(known) = peers.iter_mut().find(|(addr, _)| addr.ip() == peer.ip()) {
+            *known = (peer, now);
             return;
         }
         if peers.len() >= MAX_PEERS_PER_TORRENT
@@ -94,6 +96,25 @@ mod tests {
         assert_eq!(store.get(&[1; 20], now + PEER_TTL), [peer(2)]);
         assert!(store.get(&[1; 20], later + PEER_TTL).is_empty());
         assert!(store.torrents.is_empty());
+    }
+
+    #[test]
+    fn one_host_has_one_entry_per_torrent() {
+        let now = Instant::now();
+        let mut store = PeerStore::default();
+        let ip = Ipv4Addr::new(10, 0, 0, 1);
+        for port in 1..=MAX_PEERS_PER_TORRENT as u16 {
+            store.announce([1; 20], SocketAddrV4::new(ip, port), now);
+        }
+        // Another host is unaffected.
+        store.announce([1; 20], peer(7), now);
+        let mut peers = store.get(&[1; 20], now);
+        peers.sort();
+        // The newest port stands.
+        assert_eq!(
+            peers,
+            [peer(7), SocketAddrV4::new(ip, MAX_PEERS_PER_TORRENT as u16)]
+        );
     }
 
     #[test]
