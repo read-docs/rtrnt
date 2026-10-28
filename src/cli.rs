@@ -89,6 +89,16 @@ pub(crate) struct Args {
     /// loaded or saved anyway, unless the config file says `session = true`
     #[arg(long)]
     no_session: bool,
+    /// Add the .torrent files, and the .magnet files holding a magnet link,
+    /// that appear in this directory, checked every 2 seconds; each is
+    /// renamed to <name>.added once taken, or <name>.invalid if it does not
+    /// parse. With it the run goes on with no torrent left, until Ctrl-C
+    #[arg(long, value_name = "DIR")]
+    pub(crate) watch_dir: Option<PathBuf>,
+    /// Delete the files taken from the watch directory instead of renaming
+    /// them to <name>.added (`watch-dir-delete = true` in the config file)
+    #[arg(long)]
+    watch_dir_delete: bool,
 }
 
 impl Args {
@@ -118,6 +128,12 @@ impl Args {
         self.no_session.then_some(false)
     }
 
+    /// Whether to delete what the watch directory takes: `Some(true)` with
+    /// `--watch-dir-delete`.
+    pub(crate) fn watch_dir_delete(&self) -> Option<bool> {
+        self.watch_dir_delete.then_some(true)
+    }
+
     /// Whether to load and save the session: never with --check or
     /// --scrape, and otherwise as the command line says, or else the config
     /// file (`file_session`), or else when the terminal UI is on (`tui`).
@@ -135,12 +151,15 @@ impl Args {
     }
 
     /// Fails as clap would without a torrent, unless --print-config needs
-    /// none or the UI, `use_tui`, is on to add them.
-    pub(crate) fn check_torrents(&self, use_tui: bool) -> Result<(), clap::Error> {
-        if self.torrents.is_empty() && !use_tui && !self.print_config {
+    /// none, or the UI, `use_tui`, is on to add them, or a watch directory
+    /// (`watching`, from the command line or the config file) will bring
+    /// them.
+    pub(crate) fn check_torrents(&self, use_tui: bool, watching: bool) -> Result<(), clap::Error> {
+        let watching = watching && !(self.check || self.scrape);
+        if self.torrents.is_empty() && !use_tui && !watching && !self.print_config {
             return Err(Self::command().error(
                 ErrorKind::MissingRequiredArgument,
-                "a torrent is needed, unless the terminal UI is on to add one",
+                "a torrent is needed, unless the terminal UI is on or a watch directory is set to add one",
             ));
         }
         Ok(())

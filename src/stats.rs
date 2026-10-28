@@ -8,7 +8,7 @@
 use crate::client::ConnectionSlots;
 use crate::dht::Dht;
 use crate::rate_limit::RateLimits;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
@@ -29,6 +29,8 @@ pub struct SessionStats {
     dht: OnceLock<Dht>,
     /// Set once the listening port is open.
     port: OnceLock<Option<u16>>,
+    /// The directory watched for torrents, if there is one.
+    watch_dir: OnceLock<PathBuf>,
     rate_limits: Arc<RateLimits>,
     slots: ConnectionSlots,
     /// The latest notice, and when it came.
@@ -43,6 +45,7 @@ impl SessionStats {
             torrents: Mutex::new(Vec::new()),
             dht: OnceLock::new(),
             port: OnceLock::new(),
+            watch_dir: OnceLock::new(),
             rate_limits,
             slots,
             notice: Mutex::new(None),
@@ -103,6 +106,16 @@ impl SessionStats {
 
     pub(crate) fn set_port(&self, port: Option<u16>) {
         let _ = self.port.set(port);
+    }
+
+    /// Records that `dir` is watched for torrents (see `watch`).
+    pub fn set_watch_dir(&self, dir: PathBuf) {
+        let _ = self.watch_dir.set(dir);
+    }
+
+    /// The directory watched for torrents, if there is one.
+    pub fn watch_dir(&self) -> Option<PathBuf> {
+        self.watch_dir.get().cloned()
     }
 
     /// Nodes in the DHT routing table, or `None` while no node runs.

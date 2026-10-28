@@ -5,7 +5,8 @@
 //! long option names, so `--max-peers 50` is `max-peers = 50`; the one
 //! exception is `--no-dht`, which is `dht = false` (and `--dht` overrides
 //! it from the command line), and likewise `--no-tui`, `tui = false` and
-//! `--no-session`, `session = false`.
+//! `--no-session`, `session = false`; and `--watch-dir-delete` is
+//! `watch-dir-delete = true`.
 
 use crate::download::{DownloadConfig, SeedLimits};
 use crate::peer;
@@ -31,6 +32,9 @@ pub const DEFAULT_SEED_RATIO: f64 = 0.0;
 pub const DEFAULT_SEED_TIME: u64 = 0;
 /// Whether to look for peers in the DHT unless told otherwise.
 pub const DEFAULT_DHT: bool = true;
+/// Whether to delete the files taken from the watch directory: they are
+/// renamed instead.
+pub const DEFAULT_WATCH_DIR_DELETE: bool = false;
 /// Download limit in KiB/s: none.
 pub const DEFAULT_MAX_DOWNLOAD_RATE: u64 = 0;
 /// Upload limit in KiB/s: none.
@@ -70,6 +74,12 @@ pub struct Options {
     /// Whether to remember the torrents and rate limits across runs (`--no-session`
     /// is `session = false`); unset, the terminal UI does and the rest does not.
     pub session: Option<bool>,
+    /// A directory to take `.torrent` and `.magnet` files from (see
+    /// `watch`).
+    pub watch_dir: Option<PathBuf>,
+    /// Whether to delete the files taken from the watch directory instead
+    /// of renaming them to `<name>.added`.
+    pub watch_dir_delete: Option<bool>,
 }
 
 /// Whether `ratio` is a valid seed ratio: a finite number, 0 or more.
@@ -105,6 +115,8 @@ impl Options {
             max_upload_rate: self.max_upload_rate.or(fallback.max_upload_rate),
             tui: self.tui.or(fallback.tui),
             session: self.session.or(fallback.session),
+            watch_dir: self.watch_dir.or(fallback.watch_dir),
+            watch_dir_delete: self.watch_dir_delete.or(fallback.watch_dir_delete),
         }
     }
 
@@ -186,6 +198,10 @@ pub fn parse(text: &str, home: Option<&Path>) -> Result<Options> {
     let mut options: Options = toml::from_str(text)?;
     options.output = options
         .output
+        .map(|dir| expand_tilde(dir, home))
+        .transpose()?;
+    options.watch_dir = options
+        .watch_dir
         .map(|dir| expand_tilde(dir, home))
         .transpose()?;
     Ok(options)
@@ -320,9 +336,27 @@ pub fn describe(cli: &Options, session: &Options, file: &ConfigFile) -> String {
         ),
         None => "# session: only in the terminal UI  # default\n".to_string(),
     };
+    let watch_dir = match cli.watch_dir.as_ref().or(file.options.watch_dir.as_ref()) {
+        Some(dir) => format!(
+            "watch-dir = {}  # {}\n",
+            toml::Value::from(dir.display().to_string()),
+            source(cli.watch_dir.is_some(), file.options.watch_dir.is_some())
+        ),
+        None => "# watch-dir: none  # default\n".to_string(),
+    };
+    let watch_dir_delete = format!(
+        "watch-dir-delete = {}  # {}\n",
+        cli.watch_dir_delete
+            .or(file.options.watch_dir_delete)
+            .unwrap_or(DEFAULT_WATCH_DIR_DELETE),
+        source(
+            cli.watch_dir_delete.is_some(),
+            file.options.watch_dir_delete.is_some()
+        )
+    );
     std::iter::once(header)
         .chain(settings)
-        .chain([tui, session_line])
+        .chain([tui, session_line, watch_dir, watch_dir_delete])
         .collect()
 }
 

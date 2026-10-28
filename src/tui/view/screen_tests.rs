@@ -469,6 +469,22 @@ fn the_header_shows_the_limits_next_to_the_rates() {
 }
 
 #[test]
+fn the_header_names_the_watch_directory() {
+    let mut snapshot = demo::fixture();
+    let app = app(&snapshot);
+    let header = |snapshot: &Snapshot| {
+        text(&render(140, 32, snapshot, &app), Rect::new(0, 0, 140, 1))[0].clone()
+    };
+    assert!(!header(&snapshot).contains("watching"));
+    snapshot.session.watch_dir = Some("/home/me/incoming".into());
+    let line = header(&snapshot);
+    assert!(
+        line.contains("port 6881  watching /home/me/incoming"),
+        "{line}"
+    );
+}
+
+#[test]
 fn the_prompt_line_sits_over_the_key_bar() {
     let snapshot = demo::fixture();
     let mut app = app(&snapshot);

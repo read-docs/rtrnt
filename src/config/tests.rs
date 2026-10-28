@@ -254,7 +254,9 @@ fn describe_names_each_source() {
          max-download-rate = 0  # default\n\
          max-upload-rate = 64  # command line\n\
          # tui: when stdout and stderr are terminals  # default\n\
-         # session: only in the terminal UI  # default\n"
+         # session: only in the terminal UI  # default\n\
+         # watch-dir: none  # default\n\
+         watch-dir-delete = false  # default\n"
     );
     // The settings part is valid TOML that parses to the same values.
     let reparsed = parse(&text, None).unwrap();
@@ -267,6 +269,7 @@ fn describe_names_each_source() {
             dht: Some(false),
             max_download_rate: Some(0),
             max_upload_rate: Some(64),
+            watch_dir_delete: Some(false),
             ..options(Some("/data"), Some(5), Some(6881))
         }
     );
@@ -333,5 +336,44 @@ fn the_session_setting_is_read_from_the_file() {
     assert_eq!(
         parse("session = false\n", None).unwrap().session,
         Some(false)
+    );
+}
+
+#[test]
+fn the_watch_directory_comes_from_the_command_line_or_the_file() {
+    let file = parse(
+        "watch-dir = \"~/incoming\"\nwatch-dir-delete = true\n",
+        Some(Path::new("/home/me")),
+    )
+    .unwrap();
+    assert_eq!(file.watch_dir, Some(PathBuf::from("/home/me/incoming")));
+    assert_eq!(file.watch_dir_delete, Some(true));
+
+    let cli = Options {
+        watch_dir: Some(PathBuf::from("/drop")),
+        ..Options::default()
+    };
+    let config = ConfigFile {
+        path: None,
+        options: file,
+    };
+    let text = describe(&cli, &Options::default(), &config);
+    assert!(
+        text.contains("watch-dir = \"/drop\"  # command line\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("watch-dir-delete = true  # config file\n"),
+        "{text}"
+    );
+    let text = describe(&Options::default(), &Options::default(), &config);
+    assert!(
+        text.contains("watch-dir = \"/home/me/incoming\"  # config file\n"),
+        "{text}"
+    );
+    // What is printed reads back.
+    assert_eq!(
+        parse(&text, None).unwrap().watch_dir,
+        Some(PathBuf::from("/home/me/incoming"))
     );
 }

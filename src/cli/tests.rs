@@ -47,7 +47,7 @@ fn no_torrent_is_accepted_only_with_the_ui() {
     let accepted = |args: &[&str], terminals: bool, file_tui: Option<bool>| {
         let args = Args::try_parse_from(args).unwrap();
         let use_tui = args.use_tui(file_tui, || terminals);
-        args.check_torrents(use_tui).is_ok()
+        args.check_torrents(use_tui, false).is_ok()
     };
     assert!(accepted(&["rtrnt"], true, None));
     assert!(accepted(&["rtrnt", "--tui"], false, Some(false)));
@@ -60,8 +60,23 @@ fn no_torrent_is_accepted_only_with_the_ui() {
     assert!(accepted(&["rtrnt", "--print-config"], false, None));
     assert!(accepted(&["rtrnt", "x.torrent", "--no-tui"], false, None));
     let args = Args::try_parse_from(["rtrnt", "--no-tui"]).unwrap();
-    let error = args.check_torrents(false).unwrap_err();
+    // A watch directory, from the command line or the file, brings them.
+    assert!(args.check_torrents(false, true).is_ok());
+    let args = Args::try_parse_from(["rtrnt", "--no-tui", "--check"]).unwrap();
+    assert!(args.check_torrents(false, true).is_err());
+    let args = Args::try_parse_from(["rtrnt", "--no-tui"]).unwrap();
+    let error = args.check_torrents(false, false).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+}
+
+#[test]
+fn the_watch_directory_flags() {
+    let args = Args::try_parse_from(["rtrnt", "--watch-dir", "/drop"]).unwrap();
+    assert_eq!(args.watch_dir, Some(PathBuf::from("/drop")));
+    assert_eq!(args.watch_dir_delete(), None);
+    let args =
+        Args::try_parse_from(["rtrnt", "--watch-dir", "/drop", "--watch-dir-delete"]).unwrap();
+    assert_eq!(args.watch_dir_delete(), Some(true));
 }
 
 /// The defaults are written into the help by hand, since clap does not

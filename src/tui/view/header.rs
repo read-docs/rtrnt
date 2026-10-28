@@ -27,6 +27,9 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
     if let Some(port) = session.port {
         facts.push(format!("port {port}"));
     }
+    if let Some(dir) = &session.watch_dir {
+        facts.push(format!("watching {}", dir.display()));
+    }
     let mut spans = vec![
         Span::styled(" rtrnt ", bold(theme.down())),
         Span::styled("│ ", Style::new().fg(theme.border())),

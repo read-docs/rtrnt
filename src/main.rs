@@ -15,6 +15,7 @@ use rtrnt::session::{self, SavedSession, SessionStore};
 use rtrnt::source::Source;
 use rtrnt::tui::log_buffer::LogBuffer;
 use rtrnt::tui::{self, SessionFeed};
+use rtrnt::watch::Watcher;
 use rtrnt::{config, torrent, tracker};
 use shutdown::Shutdown;
 use std::io::IsTerminal;
@@ -42,8 +43,12 @@ async fn main() -> anyhow::Result<ExitCode> {
     let file = config::load(args.config.as_deref());
     let terminals = || std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
     let file_tui = file.as_ref().ok().and_then(|file| file.options.tui);
+    let file_watches = file
+        .as_ref()
+        .is_ok_and(|file| file.options.watch_dir.is_some());
     let use_tui = args.use_tui(file_tui, terminals);
-    if let Err(e) = args.check_torrents(use_tui) {
+    let watching = args.watch_dir.is_some() || file_watches;
+    if let Err(e) = args.check_torrents(use_tui, watching) {
         e.exit();
     }
 
@@ -68,6 +73,7 @@ async fn main() -> anyhow::Result<ExitCode> {
 
     let file = file?;
     let cli_session = args.session();
+    let cli_watch_delete = args.watch_dir_delete();
     // The session is kept by the terminal UI unless the settings say
     // otherwise; --print-config says what a run in the UI would load.
     let ui_would_run = if args.print_config {
@@ -88,6 +94,8 @@ async fn main() -> anyhow::Result<ExitCode> {
         max_download_rate: args.max_download_rate,
         max_upload_rate: args.max_upload_rate,
         session: cli_session,
+        watch_dir: args.watch_dir,
+        watch_dir_delete: cli_watch_delete,
     };
     let store = if use_session {
         let store = SessionStore::in_state_dir();
@@ -121,6 +129,11 @@ async fn main() -> anyhow::Result<ExitCode> {
     if let Some(path) = &file.path {
         info!(path = %path.display(), "loaded config file");
     }
+    let watch_dir = cli.watch_dir.clone().or(file.options.watch_dir.clone());
+    let watch_delete = cli
+        .watch_dir_delete
+        .or(file.options.watch_dir_delete)
+        .unwrap_or(config::DEFAULT_WATCH_DIR_DELETE);
     let config = config::resolve(cli.or(from_session), file.options);
     if args.check || args.scrape {
         let (config, check_mode) = (&config, args.check);
@@ -141,6 +154,10 @@ async fn main() -> anyhow::Result<ExitCode> {
         move || Arc::clone(&shutdown).signal()
     });
     let mut sources = args.torrents;
+    // The watch directory keeps its copies of .torrent files in the
+    // session's store, or else in the state directory even though the
+    // session is not kept, so the renamed original is not needed.
+    let watch_store = store.clone().or_else(SessionStore::in_state_dir);
     if let Some(store) = store {
         manager = manager.with_session(store);
         // The session's torrents first, then the command line's.
@@ -158,7 +175,7 @@ async fn main() -> anyhow::Result<ExitCode> {
             })
             .await;
     }
-    if use_tui {
+    if use_tui || watch_dir.is_some() {
         manager.expect_more();
     }
     let options = StartOptions {
@@ -171,8 +188,22 @@ async fn main() -> anyhow::Result<ExitCode> {
     };
     manager.start(sources, options).await;
     let (commands, commands_rx) = mpsc::unbounded_channel();
+    if let Some(dir) = watch_dir {
+        info!(dir = %dir.display(), "watching for torrents");
+        client.stats().set_watch_dir(dir.clone());
+        let watcher = Watcher::new(
+            dir,
+            watch_delete,
+            watch_store,
+            commands.clone(),
+            Arc::clone(client.stats()),
+        );
+        // It lets go of its sender when Ctrl-C comes, so the run can end.
+        tokio::spawn(watcher.run(Arc::clone(&shutdown).signal()));
+    }
     if !use_tui {
-        // Nothing sends commands, so the run ends with the last torrent.
+        // Only the watcher, if there is one, sends commands: without it the
+        // run ends with the last torrent.
         drop(commands);
         return manager.run(commands_rx).await;
     }

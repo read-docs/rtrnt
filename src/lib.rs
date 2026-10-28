@@ -20,3 +20,4 @@ pub mod storage;
 pub mod torrent;
 pub mod tracker;
 pub mod tui;
+pub mod watch;

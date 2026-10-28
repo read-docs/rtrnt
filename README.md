@@ -70,9 +70,13 @@ The terminal UI remembers its torrents between runs. The session file, `$XDG_STA
 
 Without the UI nothing is loaded or saved, so `rtrnt --no-tui x.torrent` still downloads that one torrent and exits. `session = true` in the config file keeps the session there too (the run then also restarts the session's torrents), `session = false` or `--no-session` turns it off in the UI. It is never used with `--check` or `--scrape`.
 
+### Watch directory
+
+`--watch-dir <DIR>` (`watch-dir` in the config file) takes the `.torrent` files, and the `.magnet` files whose first line is a magnet link, that appear in a directory, as rTorrent and Transmission do. The directory is looked at every 2 seconds, and a file is taken once its size and modification time are the same on two looks in a row, so a download a browser has not finished is left alone. A file that does not parse is renamed to `<name>.invalid` and a notice says why. Otherwise the torrent is added as by `a` in the UI, and the file is renamed to `<name>.added`, or deleted with `--watch-dir-delete` (`watch-dir-delete = true`). A `.torrent` is first copied into `$XDG_STATE_HOME/rtrnt/torrents/` (the session's store, which is used for this even when the session is not kept), and the torrent runs from the copy, so the rename or delete does not lose it; if there is no state directory the file is used where it is and left alone. The header shows the directory. With a watch directory the run does not end with the last torrent and none is needed on the command line: without the UI it goes on until Ctrl-C, which stops the watching as well.
+
 ### Config file
 
-Every option except `--check`, `--recheck`, `--scrape`, `--config` and `--print-config` can also be set in `~/.config/rtrnt/config.toml` (or `$XDG_CONFIG_HOME/rtrnt/config.toml`), or in a file given with `--config <PATH>`. Keys are the long option names, except that `--no-dht` is `dht = false`, `--no-tui` is `tui = false` and `--no-session` is `session = false`, and every key is optional:
+Every option except `--check`, `--recheck`, `--scrape`, `--config` and `--print-config` can also be set in `~/.config/rtrnt/config.toml` (or `$XDG_CONFIG_HOME/rtrnt/config.toml`), or in a file given with `--config <PATH>`. Keys are the long option names, except that `--no-dht` is `dht = false`, `--no-tui` is `tui = false`, `--no-session` is `session = false` and `--watch-dir-delete` is `watch-dir-delete = true`, and every key is optional:
 
 ```toml
 output = "~/Downloads"
@@ -85,6 +89,8 @@ dht = false
 max-download-rate = 2048
 max-upload-rate = 256
 tui = false
+watch-dir = "~/torrents"
+watch-dir-delete = false
 ```
 
 A flag on the command line overrides the file, and the file overrides the built-in defaults. `--print-config` shows the effective settings and where each one came from. Unknown keys are errors, so typos don't go unnoticed.
@@ -170,6 +176,7 @@ src/
 │   ├── http.rs      # HTTP trackers
 │   ├── udp.rs       # UDP trackers (BEP 15)
 │   └── announcer.rs # Re-announces and completed/stopped events
+├── watch.rs       # The watch directory: torrents dropped there are added
 └── tui/           # Terminal UI
     ├── mod.rs        # Event loop, terminal setup and restore
     ├── app.rs        # Selection, tabs, sort, input line; rate history

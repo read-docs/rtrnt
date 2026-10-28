@@ -460,6 +460,7 @@ impl DemoFeed {
                 connections: 71,
                 max_connections: 200,
                 rate_limits: self.rate_limits,
+                watch_dir: None,
             },
             torrents,
             detail,
