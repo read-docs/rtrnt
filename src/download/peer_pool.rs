@@ -50,13 +50,14 @@ impl PeerPool {
         self.ready.pop_front()
     }
 
-    /// How many peers wait to be tried for the first time or after a
-    /// backoff that is over, not counting those still backing off.
-    /// Every peer ever added.
+    /// Every peer ever added, whatever its state: connected, retrying,
+    /// banned or waiting to be tried.
     pub(crate) fn len(&self) -> usize {
         self.known.len()
     }
 
+    /// How many peers wait to be tried for the first time or after a
+    /// backoff that is over, not counting those still backing off.
     pub(crate) fn ready_len(&self) -> usize {
         self.ready.len()
     }
