@@ -40,7 +40,7 @@ fn schedules_on_the_trackers_interval_within_bounds() {
     ] {
         a.schedule(&response(interval, min_interval));
         assert_eq!(
-            a.next,
+            a.timer.next,
             now + expected,
             "interval {interval:?}, min {min_interval:?}"
         );
@@ -53,11 +53,11 @@ fn hurry_respects_min_interval() {
     let mut a = announcer(now);
     a.schedule(&response(Some(1800), Some(120)));
     a.hurry();
-    assert_eq!(a.next, now + Duration::from_secs(120));
+    assert_eq!(a.timer.next, now + Duration::from_secs(120));
     // Never pushes an announce back.
-    a.next = now + Duration::from_secs(10);
+    a.timer.next = now + Duration::from_secs(10);
     a.hurry();
-    assert_eq!(a.next, now + Duration::from_secs(10));
+    assert_eq!(a.timer.next, now + Duration::from_secs(10));
 }
 
 #[test]
@@ -87,11 +87,11 @@ fn completion_makes_the_next_announce_due_at_once() {
     a.schedule(&response(Some(1800), Some(600)));
     a.complete();
     assert_eq!(a.completion, Completion::Due);
-    assert!(a.next <= Instant::now());
+    assert!(a.timer.next <= Instant::now());
     // Only once: a download finishes a single time.
     a.completion = Completion::Sent;
-    a.next = now + Duration::from_secs(1800);
+    a.timer.next = now + Duration::from_secs(1800);
     a.complete();
     assert_eq!(a.completion, Completion::Sent);
-    assert_eq!(a.next, now + Duration::from_secs(1800));
+    assert_eq!(a.timer.next, now + Duration::from_secs(1800));
 }

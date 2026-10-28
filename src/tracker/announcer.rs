@@ -3,15 +3,15 @@
 //! finishes, and `stopped` at the end.
 
 use super::{AnnounceEvent, AnnounceRequest, AnnounceResponse, Tiers};
+use crate::periodic::Periodic;
 use crate::stats::TorrentStats;
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::task::JoinHandle;
 use tokio::time::Instant;
-use tracing::{Instrument, debug, info, warn};
+use tracing::{debug, info, warn};
 
 /// Used when the tracker does not say how often to announce.
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -55,15 +55,11 @@ pub struct Announcer {
     interval: Duration,
     /// Shortest gap between announces the tracker allows.
     min_interval: Duration,
-    /// When the last announce was sent.
-    last: Instant,
-    /// When the next announce is due.
-    next: Instant,
+    /// When announces are sent. Each runs in the background, of the given
+    /// event, on a copy of the tiers that it hands back, reordered to put
+    /// the tracker that answered first.
+    timer: Periodic<(Tiers, AnnounceEvent, Result<AnnounceResponse>)>,
     completion: Completion,
-    /// A background announce, of the given event. It works on a copy of the
-    /// tiers and hands it back, reordered to put the tracker that answered
-    /// first.
-    in_flight: Option<JoinHandle<(Tiers, AnnounceEvent, Result<AnnounceResponse>)>>,
     /// Told what each tracker answered, and when the next announce is due.
     stats: Option<Arc<TorrentStats>>,
 }
@@ -110,10 +106,8 @@ impl Announcer {
             },
             interval: DEFAULT_INTERVAL,
             min_interval: MIN_INTERVAL,
-            last: now,
-            next: now + DEFAULT_INTERVAL,
+            timer: Periodic::new(now, now + DEFAULT_INTERVAL),
             completion: Completion::Downloading,
-            in_flight: None,
             stats: None,
         }
     }
@@ -127,7 +121,7 @@ impl Announcer {
         self.interval = secs(response.interval)
             .unwrap_or(DEFAULT_INTERVAL)
             .clamp(self.min_interval, MAX_INTERVAL);
-        self.next = self.last + self.interval;
+        self.timer.next = self.timer.last + self.interval;
         self.publish_next();
         debug!(interval = ?self.interval, "next announce scheduled");
     }
@@ -135,19 +129,28 @@ impl Announcer {
     /// Tells the stats when the next announce is due.
     fn publish_next(&self) {
         if let Some(stats) = &self.stats {
-            stats.set_next_announce(Some(self.next.into_std()));
+            stats.set_next_announce(Some(self.timer.next.into_std()));
         }
     }
 
     /// The request for `event`, reporting the bytes `downloaded` and
     /// `uploaded` since `started`.
-    fn request(&self, event: AnnounceEvent, (downloaded, uploaded): (u64, u64)) -> AnnounceRequest {
+    fn request(&self, event: AnnounceEvent, counts: (u64, u64)) -> AnnounceRequest {
+        Self::request_from(&self.started, event, counts)
+    }
+
+    /// `request`, from the `started` request.
+    fn request_from(
+        started: &AnnounceRequest,
+        event: AnnounceEvent,
+        (downloaded, uploaded): (u64, u64),
+    ) -> AnnounceRequest {
         AnnounceRequest {
             event,
             downloaded,
             uploaded,
-            left: self.started.left.saturating_sub(downloaded),
-            ..self.started
+            left: started.left.saturating_sub(downloaded),
+            ..*started
         }
     }
 
@@ -163,7 +166,7 @@ impl Announcer {
     pub fn complete(&mut self) {
         if self.completion == Completion::Downloading {
             self.completion = Completion::Due;
-            self.next = Instant::now();
+            self.timer.next = Instant::now();
             self.publish_next();
         }
     }
@@ -171,7 +174,7 @@ impl Announcer {
     /// Brings the next announce forward to the earliest the tracker allows,
     /// for when we have run out of peers.
     pub fn hurry(&mut self) {
-        self.next = self.next.min(self.last + self.min_interval);
+        self.timer.hurry(self.min_interval);
         self.publish_next();
     }
 
@@ -183,34 +186,28 @@ impl Announcer {
     /// Cancel-safe: an announce already sent is kept, and the next call
     /// waits for its answer.
     pub async fn poll(&mut self, transferred: &Transferred) -> Vec<SocketAddr> {
-        if self.in_flight.is_none() {
-            tokio::time::sleep_until(self.next).await;
-            self.last = Instant::now();
-        }
         let event = match self.completion {
             Completion::Due => AnnounceEvent::Completed,
             _ => AnnounceEvent::Regular,
         };
-        let request = self.request(event, transferred.load());
-        let handle = self.in_flight.get_or_insert_with(|| {
-            let mut trackers = self.trackers.clone();
-            let stats = self.stats.clone();
-            let announce = async move {
+        let (started, tiers, stats) = (&self.started, &self.trackers, &self.stats);
+        let send = || {
+            let request = Self::request_from(started, event, transferred.load());
+            let (mut trackers, stats) = (tiers.clone(), stats.clone());
+            async move {
                 let result = trackers
                     .announce_reporting(&request, |url, result| report(&stats, url, result))
                     .await;
-                (trackers, request.event, result)
-            };
-            tokio::spawn(announce.in_current_span())
-        });
-        let (event, result) = match handle.await {
+                (trackers, event, result)
+            }
+        };
+        let (event, result) = match self.timer.poll(None, send).await {
             Ok((trackers, event, result)) => {
                 self.trackers = trackers;
                 (event, result)
             }
             Err(e) => (AnnounceEvent::Regular, Err(e.into())),
         };
-        self.in_flight = None;
         match result {
             Ok(response) => {
                 if event == AnnounceEvent::Completed {
@@ -222,7 +219,7 @@ impl Announcer {
             }
             Err(e) => {
                 warn!("re-announce failed: {e:#}");
-                self.next = self.last + self.interval;
+                self.timer.next = self.timer.last + self.interval;
                 self.publish_next();
                 Vec::new()
             }
@@ -237,9 +234,7 @@ impl Announcer {
         if let Some(stats) = &self.stats {
             stats.set_next_announce(None);
         }
-        if let Some(handle) = self.in_flight.take() {
-            handle.abort();
-        }
+        self.timer.cancel();
         let counts = transferred.load();
         let events: &[AnnounceEvent] = if self.completion == Completion::Due {
             &[AnnounceEvent::Completed, AnnounceEvent::Stopped]

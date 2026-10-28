@@ -9,6 +9,7 @@ pub mod listener;
 pub mod magnet;
 pub mod manager;
 pub mod peer;
+mod periodic;
 pub mod rate_limit;
 pub mod resume;
 pub mod selection;
