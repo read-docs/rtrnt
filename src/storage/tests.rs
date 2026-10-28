@@ -374,3 +374,31 @@ fn delete_files_ignores_files_that_were_never_created() {
     assert!(delete_files(&info, dir.path()).is_empty());
     assert!(!dir.path().join("root").exists());
 }
+
+#[test]
+fn files_in_finds_the_files_overlapping_a_range() {
+    let dir = tempfile::tempdir().unwrap();
+    // a: 0..3, empty: 3..3, b: 3..9, empty2: 9..9, c: 9..10
+    let info = multi_file_info(&[
+        (&["a"], 3),
+        (&["empty"], 0),
+        (&["b"], 6),
+        (&["empty2"], 0),
+        (&["c"], 1),
+    ]);
+    let storage = Storage::new(&info, dir.path(), &FileSelection::default()).unwrap();
+    let files_in = |start, end| storage.files_in(start..end).collect::<Vec<_>>();
+
+    assert_eq!(files_in(0, 10), [0, 2, 4]);
+    assert_eq!(files_in(0, 1), [0]);
+    // A range that ends or starts exactly on a boundary leaves the next or
+    // previous file out, and empty files are never listed.
+    assert_eq!(files_in(0, 3), [0]);
+    assert_eq!(files_in(3, 9), [2]);
+    assert_eq!(files_in(2, 4), [0, 2]);
+    assert_eq!(files_in(8, 10), [2, 4]);
+    assert_eq!(files_in(9, 10), [4]);
+    // Nothing is held by an empty range on a boundary, or past the end.
+    assert_eq!(files_in(3, 3), Vec::<usize>::new());
+    assert_eq!(files_in(10, 12), Vec::<usize>::new());
+}

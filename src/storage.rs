@@ -336,6 +336,12 @@ impl Storage {
         Ok(())
     }
 
+    /// Indexes of the files holding bytes of `range`, in order. Empty files
+    /// hold none.
+    fn files_in(&self, range: std::ops::Range<u64>) -> impl Iterator<Item = usize> {
+        files_between(&self.files, range.start, range.end)
+    }
+
     /// Splits `offset..offset + len` into per-file pieces: the file's index,
     /// the position within that file, and the matching range of the buffer.
     fn segments(
@@ -344,18 +350,16 @@ impl Storage {
         len: usize,
     ) -> impl Iterator<Item = (usize, u64, std::ops::Range<usize>)> {
         let end = offset + len as u64;
-        self.files
-            .iter()
-            .enumerate()
-            .filter_map(move |(index, file)| {
-                let start = offset.max(file.offset);
-                let stop = end.min(file.offset + file.length);
-                (start < stop).then(|| {
-                    let buf_start = (start - offset) as usize;
-                    let buf_end = (stop - offset) as usize;
-                    (index, start - file.offset, buf_start..buf_end)
-                })
+        self.files_in(offset..end).filter_map(move |index| {
+            let file = &self.files[index];
+            let start = offset.max(file.offset);
+            let stop = end.min(file.offset + file.length);
+            (start < stop).then(|| {
+                let buf_start = (start - offset) as usize;
+                let buf_end = (stop - offset) as usize;
+                (index, start - file.offset, buf_start..buf_end)
             })
+        })
     }
 }
 
