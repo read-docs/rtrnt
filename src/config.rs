@@ -4,7 +4,8 @@
 //! config file, else from its built-in default. Keys in the file are the
 //! long option names, so `--max-peers 50` is `max-peers = 50`; the one
 //! exception is `--no-dht`, which is `dht = false` (and `--dht` overrides
-//! it from the command line), and likewise `--no-tui`, `tui = false`.
+//! it from the command line), and likewise `--no-tui`, `tui = false` and
+//! `--no-session`, `session = false`.
 
 use crate::download::{DownloadConfig, SeedLimits};
 use crate::peer;
@@ -66,6 +67,9 @@ pub struct Options {
     /// Whether to show the terminal UI; unset, it shows when stdout and
     /// stderr are terminals.
     pub tui: Option<bool>,
+    /// Whether to remember the torrents and rate limits across runs (`--no-session`
+    /// is `session = false`); unset, the terminal UI does and the rest does not.
+    pub session: Option<bool>,
 }
 
 /// Whether `ratio` is a valid seed ratio: a finite number, 0 or more.
@@ -100,6 +104,7 @@ impl Options {
             max_download_rate: self.max_download_rate.or(fallback.max_download_rate),
             max_upload_rate: self.max_upload_rate.or(fallback.max_upload_rate),
             tui: self.tui.or(fallback.tui),
+            session: self.session.or(fallback.session),
         }
     }
 
@@ -216,15 +221,24 @@ fn expand_tilde(path: PathBuf, home: Option<&Path>) -> Result<PathBuf> {
 }
 
 /// Describes the effective settings as TOML, each followed by a comment
-/// saying whether it came from the command line, the config file or the
-/// built-in default.
-pub fn describe(cli: &Options, file: &ConfigFile) -> String {
+/// saying whether it came from the command line, the session, the config
+/// file or the built-in default. `session` holds the rate limits the
+/// session file has, which rank between the command line and the config
+/// file.
+pub fn describe(cli: &Options, session: &Options, file: &ConfigFile) -> String {
     let source = |in_cli: bool, in_file: bool| match (in_cli, in_file) {
         (true, _) => "command line",
         (false, true) => "config file",
         (false, false) => "default",
     };
-    let config = resolve(cli.clone(), file.options.clone());
+    let rate_source = |in_cli: bool, in_session: bool, in_file: bool| {
+        if !in_cli && in_session {
+            "session"
+        } else {
+            source(in_cli, in_file)
+        }
+    };
+    let config = resolve(cli.clone().or(session.clone()), file.options.clone());
     let output = toml::Value::from(config.output_dir.display().to_string());
     let lines = [
         (
@@ -268,16 +282,18 @@ pub fn describe(cli: &Options, file: &ConfigFile) -> String {
         (
             "max-download-rate",
             config.max_download_rate.to_string(),
-            source(
+            rate_source(
                 cli.max_download_rate.is_some(),
+                session.max_download_rate.is_some(),
                 file.options.max_download_rate.is_some(),
             ),
         ),
         (
             "max-upload-rate",
             config.max_upload_rate.to_string(),
-            source(
+            rate_source(
                 cli.max_upload_rate.is_some(),
+                session.max_upload_rate.is_some(),
                 file.options.max_upload_rate.is_some(),
             ),
         ),
@@ -297,9 +313,16 @@ pub fn describe(cli: &Options, file: &ConfigFile) -> String {
         ),
         None => "# tui: when stdout and stderr are terminals  # default\n".to_string(),
     };
+    let session_line = match cli.session.or(file.options.session) {
+        Some(on) => format!(
+            "session = {on}  # {}\n",
+            source(cli.session.is_some(), file.options.session.is_some())
+        ),
+        None => "# session: only in the terminal UI  # default\n".to_string(),
+    };
     std::iter::once(header)
         .chain(settings)
-        .chain(std::iter::once(tui))
+        .chain([tui, session_line])
         .collect()
 }
 

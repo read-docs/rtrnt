@@ -14,4 +14,5 @@ mod resume;
 mod seeding;
 mod selection;
 mod session;
+mod session_file;
 mod tracker;

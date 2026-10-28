@@ -11,6 +11,7 @@ use rtrnt::client::Client;
 use rtrnt::download::{self, DownloadConfig};
 use rtrnt::magnet;
 use rtrnt::manager::{Command, EXIT_INTERRUPTED, Manager, Recheck, StartOptions};
+use rtrnt::session::{self, SavedSession, SessionStore};
 use rtrnt::source::Source;
 use rtrnt::tui::log_buffer::LogBuffer;
 use rtrnt::tui::{self, SessionFeed};
@@ -22,7 +23,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, watch};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -39,9 +40,9 @@ async fn main() -> anyhow::Result<ExitCode> {
     // Read before logging starts, which depends on it; any error is printed
     // on the way out.
     let file = config::load(args.config.as_deref());
-    let use_tui = args.use_tui(file.as_ref().ok().and_then(|file| file.options.tui), || {
-        std::io::stdout().is_terminal() && std::io::stderr().is_terminal()
-    });
+    let terminals = || std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
+    let file_tui = file.as_ref().ok().and_then(|file| file.options.tui);
+    let use_tui = args.use_tui(file_tui, terminals);
     if let Err(e) = args.check_torrents(use_tui) {
         e.exit();
     }
@@ -66,6 +67,15 @@ async fn main() -> anyhow::Result<ExitCode> {
     };
 
     let file = file?;
+    let cli_session = args.session();
+    // The session is kept by the terminal UI unless the settings say
+    // otherwise; --print-config says what a run in the UI would load.
+    let ui_would_run = if args.print_config {
+        args.tui().or(file_tui).unwrap_or_else(terminals)
+    } else {
+        use_tui
+    };
+    let use_session = args.use_session(file.options.session, ui_would_run);
     let cli = config::Options {
         dht: args.dht(),
         tui: args.tui(),
@@ -77,15 +87,41 @@ async fn main() -> anyhow::Result<ExitCode> {
         seed_time: args.seed_time,
         max_download_rate: args.max_download_rate,
         max_upload_rate: args.max_upload_rate,
+        session: cli_session,
+    };
+    let store = if use_session {
+        let store = SessionStore::in_state_dir();
+        if store.is_none() {
+            warn!("no state directory (set $XDG_STATE_HOME or $HOME), so the session is not kept");
+        }
+        store
+    } else {
+        None
+    };
+    let saved = match &store {
+        Some(store) => store.load().unwrap_or_else(|e| {
+            warn!("starting without the saved session: {e:#}");
+            if !args.print_config {
+                store.set_aside();
+            }
+            SavedSession::default()
+        }),
+        None => SavedSession::default(),
+    };
+    // Between the command line and the config file.
+    let from_session = config::Options {
+        max_download_rate: saved.rate_limits.map(|limits| limits.download),
+        max_upload_rate: saved.rate_limits.map(|limits| limits.upload),
+        ..config::Options::default()
     };
     if args.print_config {
-        print!("{}", config::describe(&cli, &file));
+        print!("{}", config::describe(&cli, &from_session, &file));
         return Ok(ExitCode::SUCCESS);
     }
     if let Some(path) = &file.path {
         info!(path = %path.display(), "loaded config file");
     }
-    let config = config::resolve(cli, file.options);
+    let config = config::resolve(cli.or(from_session), file.options);
     if args.check || args.scrape {
         let (config, check_mode) = (&config, args.check);
         return each_in_turn(&args.torrents, |source| async move {
@@ -104,6 +140,24 @@ async fn main() -> anyhow::Result<ExitCode> {
         let shutdown = Arc::clone(&shutdown);
         move || Arc::clone(&shutdown).signal()
     });
+    let mut sources = args.torrents;
+    if let Some(store) = store {
+        manager = manager.with_session(store);
+        // The session's torrents first, then the command line's.
+        let mut cli = Vec::new();
+        for source in sources {
+            let info_hash = session::info_hash_of(&source).await;
+            cli.push((source, info_hash));
+        }
+        let (torrents, rest) = session::merge(saved.torrents, cli);
+        sources = rest;
+        manager
+            .restore(SavedSession {
+                torrents,
+                rate_limits: saved.rate_limits,
+            })
+            .await;
+    }
     if use_tui {
         manager.expect_more();
     }
@@ -115,7 +169,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         },
         selection: None,
     };
-    manager.start(args.torrents, options).await;
+    manager.start(sources, options).await;
     let (commands, commands_rx) = mpsc::unbounded_channel();
     if !use_tui {
         // Nothing sends commands, so the run ends with the last torrent.

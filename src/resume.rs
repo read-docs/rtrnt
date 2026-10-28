@@ -9,6 +9,7 @@
 use crate::bencode;
 use crate::download::{self, DownloadConfig, Session};
 use crate::selection::{self, FileSelection, Priority};
+use crate::state::{self, write_atomically};
 use crate::stats::TorrentState;
 use crate::storage::verify;
 use crate::storage::{FileSpan, Storage, files_between};
@@ -89,19 +90,11 @@ impl Target {
     }
 }
 
-/// Where resume files go when no directory is given:
-/// `$XDG_STATE_HOME/rtrnt/resume`, or `~/.local/state/rtrnt/resume` when
-/// that is unset. `None` if neither directory is known.
-///
-/// This is the XDG location on every platform, macOS included, like the
-/// config file.
+/// Where resume files go when no directory is given: `resume` in the state
+/// directory (see `state::state_dir`), so `$XDG_STATE_HOME/rtrnt/resume` or
+/// `~/.local/state/rtrnt/resume`. `None` if neither directory is known.
 pub fn default_dir(xdg_state_home: Option<OsString>, home: Option<&Path>) -> Option<PathBuf> {
-    // The XDG spec says to ignore a relative (or empty) value.
-    let state_dir = match xdg_state_home.map(PathBuf::from) {
-        Some(dir) if dir.is_absolute() => dir,
-        _ => home?.join(".local").join("state"),
-    };
-    Some(state_dir.join("rtrnt").join("resume"))
+    Some(state::state_dir(xdg_state_home, home)?.join("resume"))
 }
 
 /// The contents of a resume file.
@@ -363,20 +356,6 @@ fn stamp(path: &Path) -> Stamp {
         Some((meta.len(), i64::try_from(since_epoch.as_nanos()).ok()?))
     };
     read().unwrap_or((0, -1))
-}
-
-/// Writes `data` to a temporary file next to `path` and renames it over
-/// `path`, so a reader never sees half a file.
-fn write_atomically(path: &Path, data: &[u8]) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("failed to create {}", dir.display()))?;
-    }
-    let mut temp = path.as_os_str().to_owned();
-    temp.push(".tmp");
-    let temp = PathBuf::from(temp);
-    std::fs::write(&temp, data).with_context(|| format!("failed to write {}", temp.display()))?;
-    std::fs::rename(&temp, path).with_context(|| format!("failed to replace {}", path.display()))
 }
 
 fn hex(bytes: &[u8]) -> String {

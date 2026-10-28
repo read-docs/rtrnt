@@ -64,9 +64,15 @@ Options: `-o, --output <DIR>` (default `.`), `--max-peers <N>` per torrent (defa
 
 Progress is saved in a resume file per torrent, `$XDG_STATE_HOME/rtrnt/resume/<info hash>.resume` (`~/.local/state/rtrnt/resume/` when that is unset), every 30 seconds while pieces complete and at exit. A restart trusts the pieces it lists as long as the files still have the size and modification time they had then, so a clean exit rehashes nothing, and after a crash only the files written since the last save are hashed. `--recheck` ignores the file; `--check` never reads it. The file also keeps which files of the torrent are skipped or come first, once something sets that.
 
+### Session
+
+The terminal UI remembers its torrents between runs. The session file, `$XDG_STATE_HOME/rtrnt/session` (`~/.local/state/rtrnt/session` when that is unset), holds the torrents in the table's order, whether each was paused, and the rate limits once they are set from the UI (`d`, `u`). It is saved after every change and when the run ends; a torrent running when you quit is saved as running, so the next run starts it again, and a paused one comes back paused. A `.torrent` file is copied to `$XDG_STATE_HOME/rtrnt/torrents/<info hash>.torrent` when it is added, so moving or deleting the original does not lose the torrent; removing the torrent deletes the copy. At startup the session's torrents come first, then those on the command line (one the session has already is not added twice, and one it has paused is resumed). The rate limits are taken from the command line, then the session, then the config file, then the default; `--print-config` says `session` where the session's limits apply. A session file that cannot be read (another version, say) is moved to `session.bad` and the run starts empty.
+
+Without the UI nothing is loaded or saved, so `rtrnt --no-tui x.torrent` still downloads that one torrent and exits. `session = true` in the config file keeps the session there too (the run then also restarts the session's torrents), `session = false` or `--no-session` turns it off in the UI. It is never used with `--check` or `--scrape`.
+
 ### Config file
 
-Every option except `--check`, `--recheck`, `--scrape`, `--config` and `--print-config` can also be set in `~/.config/rtrnt/config.toml` (or `$XDG_CONFIG_HOME/rtrnt/config.toml`), or in a file given with `--config <PATH>`. Keys are the long option names, except that `--no-dht` is `dht = false` and `--no-tui` is `tui = false`, and every key is optional:
+Every option except `--check`, `--recheck`, `--scrape`, `--config` and `--print-config` can also be set in `~/.config/rtrnt/config.toml` (or `$XDG_CONFIG_HOME/rtrnt/config.toml`), or in a file given with `--config <PATH>`. Keys are the long option names, except that `--no-dht` is `dht = false`, `--no-tui` is `tui = false` and `--no-session` is `session = false`, and every key is optional:
 
 ```toml
 output = "~/Downloads"
@@ -148,7 +154,9 @@ src/
 ├── rate_limit.rs  # Upload and download rate limits (shared token buckets)
 ├── resume.rs      # Resume files: what was on disk last time
 ├── selection.rs   # Which files to download, and which first; piece priorities
+├── session.rs     # The session file and the store of .torrent copies
 ├── source.rs      # What to download: a .torrent file or a magnet link
+├── state.rs       # The state directory and atomic writes
 ├── stats.rs       # Counters the engine publishes for the UI: torrents, peers, trackers
 ├── stats/
 │   ├── torrent.rs   # One torrent: state, pieces, trackers, peer sources

@@ -240,7 +240,7 @@ fn describe_names_each_source() {
             ..options(Some("/data"), Some(80), None)
         },
     };
-    let text = describe(&cli, &file);
+    let text = describe(&cli, &Options::default(), &file);
     assert_eq!(
         text,
         "# config file: /etc/rtrnt.toml\n\
@@ -253,7 +253,8 @@ fn describe_names_each_source() {
          dht = false  # command line\n\
          max-download-rate = 0  # default\n\
          max-upload-rate = 64  # command line\n\
-         # tui: when stdout and stderr are terminals  # default\n"
+         # tui: when stdout and stderr are terminals  # default\n\
+         # session: only in the terminal UI  # default\n"
     );
     // The settings part is valid TOML that parses to the same values.
     let reparsed = parse(&text, None).unwrap();
@@ -270,7 +271,11 @@ fn describe_names_each_source() {
         }
     );
     // A whole ratio is written as a float, and still parses.
-    let text = describe(&Options::default(), &ConfigFile::default());
+    let text = describe(
+        &Options::default(),
+        &Options::default(),
+        &ConfigFile::default(),
+    );
     assert!(text.starts_with("# no config file\n"), "{text}");
     assert!(text.contains("seed-ratio = 0.0  # default\n"), "{text}");
     parse(&text, None).unwrap();
@@ -281,7 +286,52 @@ fn describe_names_each_source() {
             ..Options::default()
         },
     };
-    let text = describe(&Options::default(), &file);
-    assert!(text.ends_with("tui = false  # config file\n"), "{text}");
+    let text = describe(&Options::default(), &Options::default(), &file);
+    assert!(text.contains("tui = false  # config file\n"), "{text}");
     assert_eq!(parse(&text, None).unwrap().tui, Some(false));
+}
+
+#[test]
+fn describe_ranks_the_session_between_the_command_line_and_the_file() {
+    let cli = Options {
+        max_upload_rate: Some(64),
+        ..Options::default()
+    };
+    let session = Options {
+        max_download_rate: Some(10),
+        max_upload_rate: Some(20),
+        ..Options::default()
+    };
+    let file = ConfigFile {
+        path: None,
+        options: Options {
+            max_download_rate: Some(1),
+            max_upload_rate: Some(2),
+            session: Some(false),
+            ..Options::default()
+        },
+    };
+    let text = describe(&cli, &session, &file);
+    assert!(
+        text.contains("max-download-rate = 10  # session\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("max-upload-rate = 64  # command line\n"),
+        "{text}"
+    );
+    assert!(text.contains("session = false  # config file\n"), "{text}");
+    let none = describe(&Options::default(), &Options::default(), &file);
+    assert!(
+        none.contains("max-download-rate = 1  # config file\n"),
+        "{none}"
+    );
+}
+
+#[test]
+fn the_session_setting_is_read_from_the_file() {
+    assert_eq!(
+        parse("session = false\n", None).unwrap().session,
+        Some(false)
+    );
 }

@@ -180,3 +180,16 @@ fn seed_and_rate_flags_are_optional() {
     assert_eq!(args.max_upload_rate, Some(0));
     assert!(Args::try_parse_from(["rtrnt", "x.torrent", "--seed-ratio", "-1"]).is_err());
 }
+
+#[test]
+fn the_session_follows_the_ui_unless_told_otherwise() {
+    let args = Args::try_parse_from(["rtrnt", "a.torrent"]).unwrap();
+    assert!(args.use_session(None, true));
+    assert!(!args.use_session(None, false));
+    assert!(!args.use_session(Some(false), true));
+    assert!(args.use_session(Some(true), false));
+    let args = Args::try_parse_from(["rtrnt", "a.torrent", "--no-session"]).unwrap();
+    assert!(!args.use_session(Some(true), true));
+    let args = Args::try_parse_from(["rtrnt", "a.torrent", "--check"]).unwrap();
+    assert!(!args.use_session(Some(true), true));
+}

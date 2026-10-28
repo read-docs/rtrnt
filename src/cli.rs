@@ -84,6 +84,11 @@ pub(crate) struct Args {
     /// false` in the config file)
     #[arg(long, overrides_with = "tui")]
     no_tui: bool,
+    /// Do not load or save the session file, which the terminal UI keeps
+    /// (`session = false` in the config file); without the UI nothing is
+    /// loaded or saved anyway, unless the config file says `session = true`
+    #[arg(long)]
+    no_session: bool,
 }
 
 impl Args {
@@ -105,6 +110,19 @@ impl Args {
             (true, false) => Some(true),
             (false, false) => None,
         }
+    }
+
+    /// Whether the session was turned off on the command line: `Some(false)`
+    /// with `--no-session`.
+    pub(crate) fn session(&self) -> Option<bool> {
+        self.no_session.then_some(false)
+    }
+
+    /// Whether to load and save the session: never with --check or
+    /// --scrape, and otherwise as the command line says, or else the config
+    /// file (`file_session`), or else when the terminal UI is on (`tui`).
+    pub(crate) fn use_session(&self, file_session: Option<bool>, tui: bool) -> bool {
+        !(self.check || self.scrape) && self.session().or(file_session).unwrap_or(tui)
     }
 
     /// Whether to show the terminal UI: never with --check, --scrape or

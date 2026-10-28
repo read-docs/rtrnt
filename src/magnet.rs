@@ -116,6 +116,22 @@ impl MagnetLink {
         Ok(link)
     }
 
+    /// The link as a URI that `parse` reads back to this link.
+    pub fn to_uri(&self) -> String {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.append_pair("xt", &format!("urn:btih:{}", hex(&self.info_hash)));
+        if let Some(name) = &self.name {
+            query.append_pair("dn", name);
+        }
+        for tracker in &self.trackers {
+            query.append_pair("tr", tracker);
+        }
+        for peer in &self.peers {
+            query.append_pair("x.pe", &peer.to_string());
+        }
+        format!("magnet:?{}", query.finish())
+    }
+
     /// The trackers in tiers (BEP 12): each in a tier of its own, in the
     /// order listed, as libtorrent does.
     pub fn tracker_tiers(&self) -> Vec<Vec<String>> {

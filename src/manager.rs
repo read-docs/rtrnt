@@ -6,6 +6,7 @@ use crate::download::{self, CheckedOnly, Interrupted};
 use crate::magnet::{self, FetchInterrupted, MagnetLink};
 use crate::resume;
 use crate::selection::FileSelection;
+use crate::session::{SavedLimits, SavedSession, SavedTorrent, SessionStore};
 use crate::source::Source;
 use crate::stats::{TorrentState, TorrentStats};
 use crate::storage::{self, Storage};
@@ -155,6 +156,10 @@ pub struct Manager<S, R> {
     several: bool,
     /// True while no task is running.
     idle: watch::Sender<bool>,
+    /// Where the session is remembered, if it is.
+    store: Option<SessionStore>,
+    /// The limits to save: those the session had, until the UI sets others.
+    saved_limits: Option<SavedLimits>,
 }
 
 impl<S, F> Manager<S, RunTorrent>
@@ -188,7 +193,18 @@ where
             unloaded: Vec::new(),
             several: false,
             idle: watch::Sender::new(true),
+            store: None,
+            saved_limits: None,
         }
+    }
+
+    /// Remembers the session in `store` from now on: its torrents, as they
+    /// change, and the rate limits the UI sets. A `.torrent` file a torrent
+    /// is added from is copied into the store, and the entry runs from the
+    /// copy, which goes when the torrent is removed.
+    pub fn with_session(mut self, store: SessionStore) -> Self {
+        self.store = Some(store);
+        self
     }
 
     /// Turns true whenever no torrent's task is running.
@@ -224,6 +240,7 @@ where
                 }
             };
             let info_hash = torrent.info_hash();
+            let source = self.keep_copy(source, info_hash).await;
             let state = self.spawn(torrent, options.clone(), span);
             self.entries.push(Entry {
                 source,
@@ -232,6 +249,129 @@ where
             });
         }
         self.idle.send_replace(self.tasks.is_empty());
+        self.save_session().await;
+    }
+
+    /// Puts the torrents of a saved session back, in its order and before
+    /// any `start`: a paused one as paused, with a row to show it, and the
+    /// others running. One the session has twice, or whose source no longer
+    /// loads, is left out, and the latter is logged and counts as failed.
+    /// The session's rate limits are kept for the next save, unless the UI
+    /// sets others; applying them is up to the caller (see `config`).
+    pub async fn restore(&mut self, session: SavedSession) {
+        self.saved_limits = session.rate_limits;
+        for saved in session.torrents {
+            if self.entries.iter().any(|e| e.info_hash == saved.info_hash) {
+                continue;
+            }
+            let span = self.span(&saved.source);
+            let torrent = match load(&saved.source, &span).await {
+                Ok(torrent) if torrent.info_hash() == saved.info_hash => torrent,
+                loaded => {
+                    let e = loaded
+                        .err()
+                        .unwrap_or_else(|| anyhow!("the torrent file has changed"));
+                    span.in_scope(|| error!("cannot restore: {e:#}"));
+                    self.client
+                        .stats()
+                        .notice(format!("cannot restore {}: {e:#}", saved.source.label()));
+                    self.unloaded.push(e);
+                    continue;
+                }
+            };
+            let state = if saved.paused {
+                self.show_paused(&torrent, &saved.source);
+                State::Paused
+            } else {
+                self.spawn(torrent, StartOptions::default(), span)
+            };
+            self.entries.push(Entry {
+                source: saved.source,
+                info_hash: saved.info_hash,
+                state,
+            });
+        }
+        self.idle.send_replace(self.tasks.is_empty());
+        self.save_session().await;
+    }
+
+    /// Gives a paused torrent that has not run this session a row, in the
+    /// state a pause leaves, which a resume takes the place of.
+    fn show_paused(&self, torrent: &Torrent, source: &Source) {
+        let name = source.label();
+        let stats = self.client.stats().add_torrent(
+            torrent.info_hash(),
+            &name,
+            &self.client.config().output_dir,
+        );
+        if let Torrent::File(metainfo) = torrent {
+            stats.set_torrent(&metainfo.torrent);
+        }
+        stats.set_state(TorrentState::Paused);
+    }
+
+    /// With a session store, copies the `.torrent` file `source` names into
+    /// it, and returns the source of the copy; anything else, or a copy
+    /// that cannot be made (logged), is returned as it is.
+    async fn keep_copy(&self, source: Source, info_hash: [u8; 20]) -> Source {
+        let (Some(store), Source::File(path)) = (&self.store, &source) else {
+            return source;
+        };
+        let (store, from) = (store.clone(), path.clone());
+        let stored = task::spawn_blocking(move || store.store_torrent(&from, info_hash)).await;
+        match stored {
+            Ok(Ok(copy)) => Source::File(copy),
+            Ok(Err(e)) => {
+                warn!("cannot keep a copy of the torrent for the session: {e:#}");
+                source
+            }
+            Err(e) => {
+                warn!("cannot keep a copy of the torrent for the session: {e}");
+                source
+            }
+        }
+    }
+
+    /// The session as it is now, for the session file. A torrent that is
+    /// paused, or stopping to be, is saved as paused; one running or ended,
+    /// as running, so that a session that quits (which ends its torrents)
+    /// finds them running next time. One being removed is left out.
+    fn session(&self) -> SavedSession {
+        let torrents = self
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                let paused = match &entry.state {
+                    State::Paused => true,
+                    State::Running { stop } => *stop.borrow(),
+                    State::Restarting { .. } | State::Ended(_) => false,
+                    State::Removing { .. } => return None,
+                };
+                Some(SavedTorrent {
+                    info_hash: entry.info_hash,
+                    source: entry.source.clone(),
+                    paused,
+                })
+            })
+            .collect();
+        SavedSession {
+            torrents,
+            rate_limits: self.saved_limits,
+        }
+    }
+
+    /// Writes the session file, if the session is remembered, on the
+    /// blocking pool. A failure is logged and the session goes on.
+    async fn save_session(&self) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let session = self.session();
+        match task::spawn_blocking(move || store.save(&session)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("cannot save the session: {e:#}"),
+            Err(e) => warn!("cannot save the session: {e}"),
+        }
     }
 
     /// What the logs of the torrent from `source` are under: its name, with
@@ -278,6 +418,7 @@ where
     /// exit code says whether a download was cut short.
     pub async fn run(mut self, commands: mpsc::UnboundedReceiver<Command>) -> Result<ExitCode> {
         self.drive(commands).await;
+        self.save_session().await;
         self.exit_code()
     }
 
@@ -352,6 +493,7 @@ where
             };
         }
         self.idle.send_replace(self.tasks.is_empty());
+        self.save_session().await;
     }
 
     /// Asks the running torrent with info hash `info_hash` to stop, for a
@@ -601,6 +743,7 @@ where
             return;
         }
         span.in_scope(|| info!("added"));
+        let source = self.keep_copy(source, info_hash).await;
         let state = self.spawn(torrent, StartOptions::default(), span);
         self.entries.push(Entry {
             source,
@@ -624,6 +767,7 @@ where
         }
         let span = self.span(&entry.source);
         if !delete {
+            self.drop_copy(&entry).await;
             span.in_scope(|| info!("removed"));
             self.client.stats().notice(format!("removed {name}"));
             return;
@@ -631,6 +775,7 @@ where
         let failures = delete_data(&self.client, &entry)
             .instrument(span.clone())
             .await;
+        self.drop_copy(&entry).await;
         span.in_scope(|| {
             for e in &failures {
                 warn!("{e:#}");
@@ -648,6 +793,23 @@ where
         self.client.stats().notice(notice);
     }
 
+    /// Deletes the copy of the `.torrent` the session kept for `entry`, if
+    /// it has one, since nothing refers to it any more.
+    async fn drop_copy(&self, entry: &Entry) {
+        let (Some(store), Source::File(path)) = (&self.store, &entry.source) else {
+            return;
+        };
+        if !store.holds(path) {
+            return;
+        }
+        let (store, info_hash) = (store.clone(), entry.info_hash);
+        match task::spawn_blocking(move || store.forget_torrent(info_hash)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("{e:#}"),
+            Err(e) => warn!("{e}"),
+        }
+    }
+
     async fn command(&mut self, command: Command) {
         let limit = |kib: u64| match kib {
             0 => "none".to_string(),
@@ -656,6 +818,10 @@ where
         match command {
             Command::SetRateLimits(down, up) => {
                 self.client.set_rate_limits(down, up);
+                self.saved_limits = Some(SavedLimits {
+                    download: down,
+                    upload: up,
+                });
                 self.client.stats().notice(format!(
                     "rate limits: download {}, upload {}",
                     limit(down),
@@ -670,6 +836,7 @@ where
             // The feed stops the torrents itself.
             Command::Stop => {}
         }
+        self.save_session().await;
     }
 
     fn exit_code(self) -> Result<ExitCode> {

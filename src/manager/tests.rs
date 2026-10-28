@@ -8,8 +8,12 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn client() -> Arc<Client> {
+    client_in(".".as_ref())
+}
+
+fn client_in(output_dir: &std::path::Path) -> Arc<Client> {
     let config = DownloadConfig {
-        output_dir: ".".into(),
+        output_dir: output_dir.to_path_buf(),
         max_peers: 10,
         max_connections: 100,
         listen_port: 0,
@@ -709,4 +713,295 @@ async fn a_magnet_link_without_metadata_is_not_rechecked() {
     assert!(notice.ends_with("nothing to check yet"), "{notice}");
     assert!(matches!(manager.entries()[0].state, State::Paused));
     assert_eq!(runs.load(Ordering::Relaxed), 1);
+}
+
+/// A runner that holds every torrent until it is stopped.
+async fn until_stopped(
+    _: Arc<Client>,
+    _: Torrent,
+    _: StartOptions,
+    stop: StopSignal,
+) -> Result<()> {
+    stop.await;
+    Err(Interrupted {
+        remaining: 1,
+        pieces: 2,
+    }
+    .into())
+}
+
+/// Writes a valid one-piece `.torrent` called `name` into `dir`, and
+/// returns its path and info hash.
+fn torrent_file(dir: &std::path::Path, name: &str) -> (std::path::PathBuf, [u8; 20]) {
+    let torrent = crate::torrent::TorrentFile {
+        announce: None,
+        announce_list: None,
+        info: Info {
+            name: name.to_string(),
+            piece_length: 16 * 1024,
+            pieces: serde_bytes::ByteBuf::from(vec![0; 20]),
+            private: None,
+            length: Some(16 * 1024),
+            files: None,
+        },
+    };
+    let path = dir.join(format!("{name}.torrent"));
+    std::fs::write(&path, serde_bencode::to_bytes(&torrent).unwrap()).unwrap();
+    let metainfo = crate::torrent::parse_metainfo(&std::fs::read(&path).unwrap()).unwrap();
+    (path, metainfo.info_hash)
+}
+
+fn saved_session(store: &SessionStore) -> SavedSession {
+    store.load().unwrap()
+}
+
+/// The (info hash, paused) of each torrent in the session file.
+fn saved_state(store: &SessionStore) -> Vec<([u8; 20], bool)> {
+    saved_session(store)
+        .torrents
+        .iter()
+        .map(|saved| (saved.info_hash, saved.paused))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_session_is_saved_after_each_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path().to_path_buf());
+    let mut manager = Manager::with_runner(client(), never, fake_run).with_session(store.clone());
+    manager.expect_more();
+    let (running, done) = ([UNTIL_STOPPED; 20], [DONE; 20]);
+    manager
+        .start(
+            vec![magnet(UNTIL_STOPPED), magnet(DONE)],
+            StartOptions::default(),
+        )
+        .await;
+    assert_eq!(saved_state(&store), [(running, false), (done, false)]);
+    assert_eq!(saved_session(&store).rate_limits, None);
+
+    // Pausing shows at once, and stays once the task has ended.
+    manager.command(Command::Pause(running)).await;
+    assert_eq!(saved_state(&store), [(running, true), (done, false)]);
+    while !manager.tasks.is_empty() {
+        let joined = manager.tasks.join_next_with_id().await.unwrap();
+        manager.ended(joined).await;
+    }
+    assert_eq!(saved_state(&store), [(running, true), (done, false)]);
+
+    manager.command(Command::Resume(running)).await;
+    assert_eq!(saved_state(&store), [(running, false), (done, false)]);
+
+    manager.command(Command::SetRateLimits(100, 0)).await;
+    assert_eq!(
+        saved_session(&store).rate_limits,
+        Some(SavedLimits {
+            download: 100,
+            upload: 0
+        })
+    );
+
+    manager.command(Command::Add(magnet(FAILED))).await;
+    assert_eq!(saved_state(&store).len(), 3);
+    manager
+        .command(Command::Remove {
+            info_hash: done,
+            delete: false,
+        })
+        .await;
+    assert_eq!(
+        saved_state(&store),
+        [(running, false), ([FAILED; 20], false)]
+    );
+}
+
+#[tokio::test]
+async fn a_session_that_quits_saves_its_torrents_as_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path().to_path_buf());
+    // The session stops at once, which ends the torrent as interrupted.
+    let mut manager =
+        Manager::with_runner(client(), || async {}, fake_run).with_session(store.clone());
+    manager.expect_more();
+    manager
+        .start(vec![magnet(UNTIL_STOPPED)], StartOptions::default())
+        .await;
+    manager.run(closed()).await.unwrap();
+    assert_eq!(saved_state(&store), [([UNTIL_STOPPED; 20], false)]);
+}
+
+#[tokio::test]
+async fn a_torrent_file_is_copied_and_the_copy_goes_with_the_torrent() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path().join("state"));
+    let (path, hash) = torrent_file(dir.path(), "t");
+    let runs = Arc::new(AtomicUsize::new(0));
+    let counting = {
+        let runs = Arc::clone(&runs);
+        move |client, torrent, options, stop| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Box::pin(until_stopped(client, torrent, options, stop))
+                as BoxFuture<'static, Result<()>>
+        }
+    };
+    let mut manager = Manager::with_runner(client(), never, counting).with_session(store.clone());
+    manager.expect_more();
+    manager.start(Vec::new(), StartOptions::default()).await;
+    manager
+        .command(Command::Add(Source::File(path.clone())))
+        .await;
+
+    let copy = store.torrent_path(hash);
+    assert!(copy.exists());
+    assert_eq!(manager.entries()[0].source, Source::File(copy.clone()));
+    assert_eq!(
+        saved_session(&store).torrents[0].source,
+        Source::File(copy.clone())
+    );
+
+    // The original can go: pausing and resuming load the copy.
+    std::fs::remove_file(&path).unwrap();
+    manager.command(Command::Pause(hash)).await;
+    let joined = manager.tasks.join_next_with_id().await.unwrap();
+    manager.ended(joined).await;
+    manager.command(Command::Resume(hash)).await;
+    assert_eq!(runs.load(Ordering::Relaxed), 2);
+    assert!(matches!(manager.entries()[0].state, State::Running { .. }));
+
+    // Removing it removes the copy, and the session file forgets it.
+    manager
+        .command(Command::Remove {
+            info_hash: hash,
+            delete: false,
+        })
+        .await;
+    let joined = manager.tasks.join_next_with_id().await.unwrap();
+    manager.ended(joined).await;
+    assert!(manager.entries().is_empty());
+    assert!(!copy.exists());
+    assert!(saved_session(&store).torrents.is_empty());
+}
+
+#[tokio::test]
+async fn deleting_a_torrent_with_its_files_deletes_the_copy_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path().join("state"));
+    let (path, hash) = torrent_file(dir.path(), "t");
+    let mut manager =
+        Manager::with_runner(client_in(&dir.path().join("out")), never, until_stopped)
+            .with_session(store.clone());
+    manager.expect_more();
+    manager.command(Command::Add(Source::File(path))).await;
+    // Paused, so it goes at once.
+    manager.command(Command::Pause(hash)).await;
+    let joined = manager.tasks.join_next_with_id().await.unwrap();
+    manager.ended(joined).await;
+    manager
+        .command(Command::Remove {
+            info_hash: hash,
+            delete: true,
+        })
+        .await;
+    assert!(manager.entries().is_empty());
+    assert!(!store.torrent_path(hash).exists());
+}
+
+#[tokio::test]
+async fn a_torrent_added_from_the_store_keeps_its_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path().join("state"));
+    let (path, hash) = torrent_file(dir.path(), "t");
+    // As the watch directory does: copy, then add the copy.
+    let copy = store.store_torrent(&path, hash).unwrap();
+    let mut manager =
+        Manager::with_runner(client(), never, until_stopped).with_session(store.clone());
+    manager.expect_more();
+    manager
+        .command(Command::Add(Source::File(copy.clone())))
+        .await;
+    assert_eq!(manager.entries()[0].source, Source::File(copy));
+}
+
+#[tokio::test]
+async fn a_saved_session_is_restored_in_order_and_paused_torrents_stay_paused() {
+    let client = client();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path().to_path_buf());
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, counting(&runs))
+        .with_session(store.clone());
+    manager.expect_more();
+    let saved = |how: u8, paused: bool| SavedTorrent {
+        info_hash: [how; 20],
+        source: magnet(how),
+        paused,
+    };
+    let limits = SavedLimits {
+        download: 7,
+        upload: 8,
+    };
+    manager
+        .restore(SavedSession {
+            torrents: vec![
+                saved(UNTIL_STOPPED, true),
+                saved(DONE, false),
+                // Listed twice, it is restored once.
+                saved(UNTIL_STOPPED, false),
+            ],
+            rate_limits: Some(limits),
+        })
+        .await;
+    manager
+        .start(vec![magnet(FAILED)], StartOptions::default())
+        .await;
+
+    let hashes: Vec<_> = manager.entries().iter().map(|e| e.info_hash).collect();
+    assert_eq!(hashes, [[UNTIL_STOPPED; 20], [DONE; 20], [FAILED; 20]]);
+    assert!(matches!(manager.entries()[0].state, State::Paused));
+    // Only the torrents not paused ran, and the paused one has a row.
+    assert_eq!(runs.load(Ordering::Relaxed), 2);
+    let rows = client.stats().torrents();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].info_hash(), [UNTIL_STOPPED; 20]);
+    assert_eq!(rows[0].state(), TorrentState::Paused);
+    // What the session had is saved again, limits included, until the UI
+    // changes them.
+    assert_eq!(saved_session(&store).rate_limits, Some(limits));
+    assert_eq!(
+        saved_state(&store),
+        [
+            ([UNTIL_STOPPED; 20], true),
+            ([DONE; 20], false),
+            ([FAILED; 20], false)
+        ]
+    );
+
+    // A resume runs it, taking the row's place.
+    manager.command(Command::Resume([UNTIL_STOPPED; 20])).await;
+    assert_eq!(runs.load(Ordering::Relaxed), 3);
+    assert_eq!(client.stats().torrents().len(), 1);
+}
+
+#[tokio::test]
+async fn a_saved_torrent_that_no_longer_loads_is_reported_and_dropped() {
+    let client = client();
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, fake_run);
+    manager.expect_more();
+    manager
+        .restore(SavedSession {
+            torrents: vec![SavedTorrent {
+                info_hash: [1; 20],
+                source: Source::File("/no/such/file.torrent".into()),
+                paused: true,
+            }],
+            rate_limits: None,
+        })
+        .await;
+    assert!(manager.entries().is_empty());
+    let (_, notice) = client.stats().last_notice().unwrap();
+    assert!(
+        notice.starts_with("cannot restore file.torrent: "),
+        "{notice}"
+    );
+    assert_eq!(manager.run(closed()).await.unwrap(), ExitCode::FAILURE);
 }
