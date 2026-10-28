@@ -187,7 +187,6 @@ struct State {
     store: PeerStore,
     /// Our queries waiting for an answer, by transaction id.
     pending: HashMap<u16, Pending>,
-    next_tid: u16,
     /// Resolved bootstrap routers. They help lookups but stay out of the
     /// table: they hold no peers and do not want the traffic.
     routers: HashSet<SocketAddrV4>,
@@ -200,7 +199,6 @@ impl State {
             tokens: Tokens::new(now),
             store: PeerStore::default(),
             pending: HashMap::new(),
-            next_tid: rand::random(),
             routers: HashSet::new(),
         }
     }
@@ -335,12 +333,12 @@ impl Node {
             bail!("too many DHT queries in flight");
         }
         let (reply, receiver) = oneshot::channel();
-        // Fewer than 65536 are pending, so a free id turns up.
-        let mut tid = state.next_tid;
+        // At most `MAX_PENDING` of 65536 ids are taken, so a free one turns
+        // up. Random ids keep an off-path sender from guessing ours.
+        let mut tid: u16 = rand::random();
         while state.pending.contains_key(&tid) {
-            tid = tid.wrapping_add(1);
+            tid = rand::random();
         }
-        state.next_tid = tid.wrapping_add(1);
         state.pending.insert(tid, Pending { addr, reply });
         Ok((tid, receiver))
     }
