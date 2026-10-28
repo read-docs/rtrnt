@@ -23,16 +23,20 @@ impl Shutdown {
     /// second one, or one that comes while no torrent waits for this, exits
     /// at once.
     ///
-    /// Until a torrent first polls this, Ctrl-C keeps its default behavior
-    /// of killing the process.
-    pub(crate) async fn signal(self: Arc<Self>) {
+    /// A torrent waits from the moment it calls this, not from the first
+    /// poll, so a Ctrl-C while it starts is not lost. Until a torrent first
+    /// polls the result, Ctrl-C keeps its default behavior of killing the
+    /// process.
+    pub(crate) fn signal(self: Arc<Self>) -> impl Future<Output = ()> + Send + 'static {
         let mut stop = self.stop.subscribe();
-        let handler = Arc::clone(&self);
-        self.handler.call_once(move || {
-            tokio::spawn(handler.handle_ctrl_c());
-        });
-        // Fails only once the sender is gone, but `self` holds it.
-        let _ = stop.wait_for(|&stop| stop).await;
+        async move {
+            let handler = Arc::clone(&self);
+            self.handler.call_once(move || {
+                tokio::spawn(handler.handle_ctrl_c());
+            });
+            // Fails only once the sender is gone, but `self` holds it.
+            let _ = stop.wait_for(|&stop| stop).await;
+        }
     }
 
     async fn handle_ctrl_c(self: Arc<Self>) {
@@ -66,4 +70,17 @@ impl Shutdown {
 fn exit_now() -> ! {
     tui::restore_terminal();
     std::process::exit(EXIT_INTERRUPTED.into());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_stop_asked_for_before_the_first_poll_is_not_lost() {
+        let shutdown = Shutdown::new();
+        let signal = Arc::clone(&shutdown).signal();
+        assert!(shutdown.request_stop());
+        signal.await;
+    }
 }
