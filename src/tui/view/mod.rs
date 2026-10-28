@@ -15,6 +15,8 @@ mod remove;
 mod torrents;
 mod trackers;
 
+pub use log::LINES as LOG_LINES;
+
 use super::app::{App, Sort, Tab};
 use super::snapshot::Snapshot;
 use super::theme::Theme;

@@ -26,6 +26,61 @@ fn keeps_the_last_lines_only() {
     assert_eq!(lines[CAPACITY - 1].message, (CAPACITY + 4).to_string());
 }
 
+fn line(message: impl ToString) -> LogLine {
+    LogLine {
+        time: SystemTime::now(),
+        level: Level::INFO,
+        torrent: None,
+        message: message.to_string(),
+    }
+}
+
+fn messages(lines: Vec<LogLine>) -> Vec<String> {
+    lines.into_iter().map(|line| line.message).collect()
+}
+
+#[test]
+fn tail_returns_the_newest_lines_oldest_first() {
+    let buffer = LogBuffer::default();
+    for i in 0..5 {
+        buffer.push(line(i));
+    }
+    assert_eq!(messages(buffer.tail(2)), ["3", "4"]);
+    assert_eq!(messages(buffer.tail(5)), ["0", "1", "2", "3", "4"]);
+}
+
+#[test]
+fn tail_of_more_than_the_buffer_holds_returns_everything() {
+    let buffer = LogBuffer::default();
+    assert!(buffer.tail(10).is_empty());
+    buffer.push(line("only"));
+    assert_eq!(messages(buffer.tail(10)), ["only"]);
+    assert_eq!(messages(buffer.tail(usize::MAX)), ["only"]);
+}
+
+#[test]
+fn tail_of_zero_is_empty() {
+    let buffer = LogBuffer::default();
+    buffer.push(line("a"));
+    assert!(buffer.tail(0).is_empty());
+}
+
+#[test]
+fn tail_after_the_buffer_wrapped_skips_the_dropped_lines() {
+    let buffer = LogBuffer::default();
+    for i in 0..CAPACITY + 3 {
+        buffer.push(line(i));
+    }
+    let last = CAPACITY + 2;
+    assert_eq!(
+        messages(buffer.tail(3)),
+        [last - 2, last - 1, last].map(|i| i.to_string())
+    );
+    let all = buffer.tail(CAPACITY + 10);
+    assert_eq!(all.len(), CAPACITY);
+    assert_eq!(all[0].message, "3");
+}
+
 #[test]
 fn takes_the_torrent_name_from_its_span() {
     let lines = capture(|| {

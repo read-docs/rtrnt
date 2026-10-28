@@ -12,6 +12,8 @@ use tracing::Level;
 
 /// Height of the pane, borders included.
 pub const HEIGHT: u16 = 6;
+/// Log lines the pane shows: its height less the borders.
+pub const LINES: usize = HEIGHT as usize - 2;
 /// Width of the torrent name column.
 const NAME: usize = 18;
 

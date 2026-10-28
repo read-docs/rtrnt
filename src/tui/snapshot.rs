@@ -2,6 +2,7 @@
 //! data, no locks, so views can be drawn (and tested) from it alone.
 
 use super::log_buffer::{LogBuffer, LogLine};
+use super::view::LOG_LINES;
 use crate::selection::Priority;
 use crate::stats::{
     Layout, PeerFlags, PeerSource, PieceSnapshot, SessionStats, TorrentState, TorrentStats,
@@ -23,6 +24,7 @@ pub struct Snapshot {
     pub torrents: Vec<TorrentSnapshot>,
     /// Peers, pieces and trackers of the selected torrent.
     pub detail: Option<Detail>,
+    /// The newest lines, as many as the log pane shows.
     pub logs: Vec<LogLine>,
     /// The latest notice, while it is fresh.
     pub notice: Option<String>,
@@ -170,8 +172,9 @@ pub struct Sources {
 }
 
 impl Snapshot {
-    /// Copies out the state of `stats` and the lines in `logs`, with the
-    /// insides of the torrent with info hash `selected`, if any.
+    /// Copies out the state of `stats` and the last lines of `logs` that the
+    /// log pane has room for, with the insides of the torrent with info hash
+    /// `selected`, if any.
     pub fn take(
         stats: &SessionStats,
         logs: &LogBuffer,
@@ -202,7 +205,7 @@ impl Snapshot {
                 .map(|(order, torrent)| torrent_snapshot(torrent, order, now))
                 .collect(),
             detail,
-            logs: logs.lines(),
+            logs: logs.tail(LOG_LINES),
             notice: stats
                 .last_notice()
                 .filter(|(at, _)| now.saturating_duration_since(*at) < NOTICE_SHOWN)

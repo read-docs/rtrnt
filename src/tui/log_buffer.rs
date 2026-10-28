@@ -76,6 +76,13 @@ impl LogBuffer {
         self.lock().kept.iter().cloned().collect()
     }
 
+    /// The last `n` lines kept, oldest first; all of them if there are fewer.
+    pub fn tail(&self, n: usize) -> Vec<LogLine> {
+        let lines = self.lock();
+        let skip = lines.kept.len().saturating_sub(n);
+        lines.kept.iter().skip(skip).cloned().collect()
+    }
+
     /// Warnings and errors logged in the last `within` before `now`.
     pub fn problems_since(&self, now: SystemTime, within: Duration) -> Vec<LogLine> {
         let since = now.checked_sub(within).unwrap_or(SystemTime::UNIX_EPOCH);
