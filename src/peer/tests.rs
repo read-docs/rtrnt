@@ -17,11 +17,11 @@ fn roundtrip_all_messages() {
         PeerMessage::Bitfield {
             bitfield: vec![0b1010_0000, 0xff],
         },
-        PeerMessage::Request {
+        PeerMessage::Request(BlockRef {
             index: 1,
             begin: 16384,
             length: 16384,
-        },
+        }),
         PeerMessage::Piece {
             index: 1,
             begin: 0,
@@ -32,11 +32,11 @@ fn roundtrip_all_messages() {
             begin: 0,
             block: vec![],
         },
-        PeerMessage::Cancel {
+        PeerMessage::Cancel(BlockRef {
             index: 1,
             begin: 2,
             length: 3,
-        },
+        }),
         PeerMessage::Port { port: 6881 },
         PeerMessage::Extended {
             id: 0,
@@ -49,11 +49,11 @@ fn roundtrip_all_messages() {
         PeerMessage::SuggestPiece { piece_index: 7 },
         PeerMessage::HaveAll,
         PeerMessage::HaveNone,
-        PeerMessage::RejectRequest {
+        PeerMessage::RejectRequest(BlockRef {
             index: 1,
             begin: 16384,
             length: 16384,
-        },
+        }),
         PeerMessage::AllowedFast { piece_index: 9 },
         PeerMessage::Unknown { id: 21 },
     ];
@@ -521,11 +521,11 @@ async fn fast_messages_without_the_fast_extension_are_a_protocol_violation() {
         PeerMessage::HaveNone,
         PeerMessage::SuggestPiece { piece_index: 0 },
         PeerMessage::AllowedFast { piece_index: 0 },
-        PeerMessage::RejectRequest {
+        PeerMessage::RejectRequest(BlockRef {
             index: 0,
             begin: 0,
             length: 16384,
-        },
+        }),
     ];
     for message in fast_messages {
         assert!(message.is_fast());

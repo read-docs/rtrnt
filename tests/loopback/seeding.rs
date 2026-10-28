@@ -1,5 +1,5 @@
 use rtrnt::download::{DownloadConfig, SeedLimits, download_file, download_from_peers};
-use rtrnt::peer::{PeerMessage, generate_peer_id};
+use rtrnt::peer::{BlockRef, PeerMessage, generate_peer_id};
 use rtrnt::tracker::announcer::Announcer;
 use rtrnt::tracker::{AnnounceEvent, AnnounceRequest};
 use std::future::pending;
@@ -43,11 +43,11 @@ async fn serves_blocks_to_a_peer_that_connects_to_us() {
         assert_eq!(next_message(&mut socket).await, Some(PeerMessage::Unchoke));
 
         // The cancel arrives with the requests, before the block is sent.
-        let cancel = PeerMessage::Cancel {
+        let cancel = PeerMessage::Cancel(BlockRef {
             index: 0,
             begin: BLOCK,
             length: BLOCK,
-        };
+        });
         let batch = [
             request(0, 0, BLOCK),
             request(2, 0, BLOCK),

@@ -1,6 +1,6 @@
 use rtrnt::download::{download_from_peers, download_metainfo};
 use rtrnt::manager::{Command, Manager, StartOptions};
-use rtrnt::peer::PeerMessage;
+use rtrnt::peer::{BlockRef, PeerMessage};
 use rtrnt::selection::{FilePicks, FileSelection, Priority};
 use rtrnt::source::Source;
 use rtrnt::stats::TorrentState;
@@ -223,11 +223,11 @@ async fn the_choice_of_files_is_kept_across_runs_and_can_change() {
                 tokio::spawn(async move {
                     send(&mut socket, PeerMessage::Unchoke).await;
                     while let Some(message) = read_message(&mut socket).await {
-                        if let PeerMessage::Request {
+                        if let PeerMessage::Request(BlockRef {
                             index,
                             begin,
                             length,
-                        } = message
+                        }) = message
                         {
                             requested.lock().unwrap().push(index);
                             send(&mut socket, piece(&data, index, begin, length)).await;

@@ -1,6 +1,6 @@
 use indicatif::MultiProgress;
 use rtrnt::download::{DownloadConfig, Interrupted, SeedLimits, Session, download_from_peers};
-use rtrnt::peer::{PeerMessage, generate_peer_id};
+use rtrnt::peer::{BlockRef, PeerMessage, generate_peer_id};
 use rtrnt::resume;
 use rtrnt::selection::FileSelection;
 use rtrnt::stats::TorrentStats;
@@ -64,11 +64,11 @@ async fn resumes_from_data_on_disk() {
         let mut socket = accept_leecher(&listener, info_hash, num_pieces).await;
         send(&mut socket, PeerMessage::Unchoke).await;
         while let Some(message) = read_message(&mut socket).await {
-            let PeerMessage::Request {
+            let PeerMessage::Request(BlockRef {
                 index,
                 begin,
                 length,
-            } = message
+            }) = message
             else {
                 continue;
             };
@@ -185,11 +185,11 @@ async fn interrupted_after_one_piece(
         let mut not_interested = Some(not_interested);
         while let Some(message) = read_message(&mut socket).await {
             match message {
-                PeerMessage::Request {
+                PeerMessage::Request(BlockRef {
                     index,
                     begin,
                     length,
-                } => send(&mut socket, piece(&seeder_data, index, begin, length)).await,
+                }) => send(&mut socket, piece(&seeder_data, index, begin, length)).await,
                 PeerMessage::NotInterested => {
                     not_interested.take().map(|tx| tx.send(()));
                 }
@@ -253,11 +253,11 @@ async fn resumes_from_the_resume_file_without_hashing() {
         let mut socket = accept_leecher(&listener, info_hash, num_pieces).await;
         send(&mut socket, PeerMessage::Unchoke).await;
         while let Some(message) = read_message(&mut socket).await {
-            if let PeerMessage::Request {
+            if let PeerMessage::Request(BlockRef {
                 index,
                 begin,
                 length,
-            } = message
+            }) = message
             {
                 requested_tx.send(index).unwrap();
                 send(&mut socket, piece(&seeder_data, index, begin, length)).await;
@@ -354,11 +354,11 @@ async fn interrupted_download_keeps_pieces_and_tells_the_tracker() {
         let mut not_interested = Some(not_interested);
         while let Some(message) = read_message(&mut socket).await {
             match message {
-                PeerMessage::Request {
+                PeerMessage::Request(BlockRef {
                     index,
                     begin,
                     length,
-                } => {
+                }) => {
                     let start = index as usize * PIECE_LENGTH as usize + begin as usize;
                     let block = seeder_data[start..start + length as usize].to_vec();
                     send(

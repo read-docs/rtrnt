@@ -2,7 +2,7 @@ use indicatif::MultiProgress;
 use rtrnt::client::Client;
 use rtrnt::download::{DownloadConfig, SeedLimits, Session};
 use rtrnt::peer::fast;
-use rtrnt::peer::{PeerMessage, generate_peer_id, handshake_bytes, parse_handshake};
+use rtrnt::peer::{BlockRef, PeerMessage, generate_peer_id, handshake_bytes, parse_handshake};
 use rtrnt::rate_limit::RateLimits;
 use rtrnt::selection::FileSelection;
 use rtrnt::stats::TorrentStats;
@@ -167,11 +167,11 @@ pub(crate) async fn send_batch(socket: &mut TcpStream, messages: &[PeerMessage])
 }
 
 pub(crate) fn request(index: u32, begin: u32, length: u32) -> PeerMessage {
-    PeerMessage::Request {
+    PeerMessage::Request(BlockRef {
         index,
         begin,
         length,
-    }
+    })
 }
 
 /// The Piece message answering a request for `length` bytes of `data` at
@@ -188,11 +188,11 @@ pub(crate) fn piece(data: &[u8], index: u32, begin: u32, length: u32) -> PeerMes
 /// Answers block requests from `data` until the leecher disconnects.
 pub(crate) async fn serve(mut socket: TcpStream, data: &[u8]) {
     while let Some(message) = read_message(&mut socket).await {
-        if let PeerMessage::Request {
+        if let PeerMessage::Request(BlockRef {
             index,
             begin,
             length,
-        } = message
+        }) = message
         {
             let start = index as usize * PIECE_LENGTH as usize + begin as usize;
             let block = data[start..start + length as usize].to_vec();
@@ -223,11 +223,11 @@ pub(crate) async fn seeder(
     let mut choked_once = false;
     let mut corrupted_once = false;
     while let Some(message) = read_message(&mut socket).await {
-        let PeerMessage::Request {
+        let PeerMessage::Request(BlockRef {
             index,
             begin,
             length,
-        } = message
+        }) = message
         else {
             continue;
         };
@@ -515,9 +515,9 @@ pub(crate) async fn next_extended(socket: &mut TcpStream, id: u8) -> Vec<u8> {
 }
 
 pub(crate) fn cancel(index: u32, begin: u32, length: u32) -> PeerMessage {
-    PeerMessage::Cancel {
+    PeerMessage::Cancel(BlockRef {
         index,
         begin,
         length,
-    }
+    })
 }

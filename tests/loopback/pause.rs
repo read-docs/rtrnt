@@ -1,6 +1,6 @@
 use rtrnt::download::SeedLimits;
 use rtrnt::manager::{Command, Manager, StartOptions};
-use rtrnt::peer::PeerMessage;
+use rtrnt::peer::{BlockRef, PeerMessage};
 use rtrnt::source::Source;
 use rtrnt::stats::TorrentState;
 use std::future::pending;
@@ -58,11 +58,11 @@ async fn a_paused_download_resumes_where_it_stopped() {
         let mut first_done = Some(first_done);
         while let Some(message) = read_message(&mut socket).await {
             match message {
-                PeerMessage::Request {
+                PeerMessage::Request(BlockRef {
                     index,
                     begin,
                     length,
-                } => send(&mut socket, piece(&seeder_data, index, begin, length)).await,
+                }) => send(&mut socket, piece(&seeder_data, index, begin, length)).await,
                 PeerMessage::NotInterested => {
                     first_done.take().map(|tx| tx.send(()));
                 }
@@ -75,11 +75,11 @@ async fn a_paused_download_resumes_where_it_stopped() {
         send(&mut socket, PeerMessage::Unchoke).await;
         let mut requested = Vec::new();
         while let Some(message) = read_message(&mut socket).await {
-            if let PeerMessage::Request {
+            if let PeerMessage::Request(BlockRef {
                 index,
                 begin,
                 length,
-            } = message
+            }) = message
             {
                 requested.push(index);
                 send(&mut socket, piece(&seeder_data, index, begin, length)).await;

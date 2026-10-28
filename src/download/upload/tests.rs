@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn request_must_lie_inside_the_piece_and_be_one_block_at_most() {
-    let request = |begin, length| BlockRequest {
+    let request = |begin, length| BlockRef {
         index: 0,
         begin,
         length,
@@ -33,7 +33,7 @@ fn request_must_lie_inside_the_piece_and_be_one_block_at_most() {
 
 #[test]
 fn uploads_are_served_in_order_cancelled_and_capped() {
-    let request = |begin| BlockRequest {
+    let request = |begin| BlockRef {
         index: 1,
         begin,
         length: BLOCK_SIZE,
@@ -62,7 +62,7 @@ fn uploads_are_served_in_order_cancelled_and_capped() {
 
 #[test]
 fn retained_uploads_keep_their_order_and_dropped_ones_are_returned() {
-    let request = |index| BlockRequest {
+    let request = |index| BlockRef {
         index,
         begin: 0,
         length: BLOCK_SIZE,

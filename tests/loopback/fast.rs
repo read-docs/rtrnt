@@ -1,6 +1,6 @@
 use rtrnt::download::download_from_peers;
 use rtrnt::peer::fast;
-use rtrnt::peer::{PeerMessage, generate_peer_id, handshake_bytes, parse_handshake};
+use rtrnt::peer::{BlockRef, PeerMessage, generate_peer_id, handshake_bytes, parse_handshake};
 use std::future::pending;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -48,11 +48,11 @@ async fn connect_fast(addr: SocketAddr, info_hash: [u8; 20]) -> TcpStream {
 }
 
 fn reject(index: u32, begin: u32, length: u32) -> PeerMessage {
-    PeerMessage::RejectRequest {
+    PeerMessage::RejectRequest(BlockRef {
         index,
         begin,
         length,
-    }
+    })
 }
 
 /// Several messages encoded back to back, to send in one write.
@@ -231,11 +231,11 @@ async fn downloads_from_a_fast_peer_that_chokes_and_rejects() {
         let mut asked = Vec::new();
         while let Some(message) = recv_within(&mut messages, quiet).await {
             match message {
-                PeerMessage::Request {
+                PeerMessage::Request(BlockRef {
                     index,
                     begin,
                     length,
-                } => asked.push((index, begin, length)),
+                }) => asked.push((index, begin, length)),
                 other => panic!("expected a request, got {other:?}"),
             }
         }
@@ -261,11 +261,11 @@ async fn downloads_from_a_fast_peer_that_chokes_and_rejects() {
         let mut rejected = None;
         let mut asked_again = false;
         while let Some(message) = recv_within(&mut messages, long).await {
-            let PeerMessage::Request {
+            let PeerMessage::Request(BlockRef {
                 index,
                 begin,
                 length,
-            } = message
+            }) = message
             else {
                 continue;
             };
@@ -395,7 +395,7 @@ async fn cancels_requests_a_choked_fast_peer_never_answers() {
             tokio::select! {
                 message = messages.recv() => match message {
                     None => break true,
-                    Some(PeerMessage::Request { index, begin, length }) => {
+                    Some(PeerMessage::Request(BlockRef { index, begin, length })) => {
                         requested.push((index, begin, length));
                         if answered.is_none() {
                             // Connected, so the clock can stop without the
@@ -407,7 +407,7 @@ async fn cancels_requests_a_choked_fast_peer_never_answers() {
                             writer.write_all(&reply.encode()).await.unwrap();
                         }
                     }
-                    Some(PeerMessage::Cancel { index, begin, length }) => {
+                    Some(PeerMessage::Cancel(BlockRef { index, begin, length })) => {
                         cancelled.push((index, begin, length));
                     }
                     Some(_) => {}

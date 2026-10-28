@@ -3,7 +3,7 @@ use rtrnt::magnet::metadata::{self, Message};
 use rtrnt::magnet::{self, MagnetLink, download_magnet};
 use rtrnt::manager::StartOptions;
 use rtrnt::peer::extension::{ExtendedHandshake, UT_METADATA, UT_METADATA_ID};
-use rtrnt::peer::{PeerMessage, generate_peer_id, handshake_bytes, parse_handshake};
+use rtrnt::peer::{BlockRef, PeerMessage, generate_peer_id, handshake_bytes, parse_handshake};
 use rtrnt::torrent::{self, TorrentFile};
 use sha1::Digest;
 use std::future::pending;
@@ -100,11 +100,11 @@ fn magnet_seeder(
                         let id = UT_METADATA_ID;
                         send(&mut socket, PeerMessage::Extended { id, payload }).await;
                     }
-                    PeerMessage::Request {
+                    PeerMessage::Request(BlockRef {
                         index,
                         begin,
                         length,
-                    } => {
+                    }) => {
                         blocks.fetch_add(1, Ordering::SeqCst);
                         send(&mut socket, piece(&data, index, begin, length)).await;
                     }

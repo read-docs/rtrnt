@@ -1,4 +1,4 @@
-use crate::peer::{PeerConnection, PeerMessage};
+use crate::peer::{BlockRef, PeerConnection, PeerMessage};
 use crate::rate_limit::Allowance;
 use crate::torrent::TorrentFile;
 use anyhow::{Result, anyhow, bail};
@@ -8,7 +8,6 @@ use tokio::time::Instant;
 use tracing::debug;
 
 use super::queue::{PeerPieces, PieceClaim, PieceQueue};
-use super::upload::BlockRequest;
 use super::{BLOCK_SIZE, Misbehaved};
 
 /// Block requests in flight to a new peer, before its rate is known.
@@ -95,7 +94,7 @@ pub(super) async fn request_blocks<'q>(
 pub(super) async fn drop_completed(
     conn: &mut PeerConnection,
     active: &mut Vec<ActivePiece<'_>>,
-    mut cancelled: Option<&mut HashSet<BlockRequest>>,
+    mut cancelled: Option<&mut HashSet<BlockRef>>,
 ) -> Result<()> {
     let mut cancels = Vec::new();
     active.retain(|piece| {
@@ -126,7 +125,7 @@ pub(super) async fn expire_requests(
     active: &mut [ActivePiece<'_>],
     now: Instant,
     timeout: Duration,
-    mut cancelled: Option<&mut HashSet<BlockRequest>>,
+    mut cancelled: Option<&mut HashSet<BlockRef>>,
 ) -> Result<()> {
     let mut cancels = Vec::new();
     for piece in active {
@@ -257,8 +256,8 @@ impl<'a> ActivePiece<'a> {
     }
 
     /// The request for block `block`.
-    fn block_request(&self, block: usize) -> BlockRequest {
-        BlockRequest {
+    fn block_request(&self, block: usize) -> BlockRef {
+        BlockRef {
             index: self.index,
             begin: block as u32 * BLOCK_SIZE,
             length: self.block_len(block),
@@ -295,20 +294,11 @@ impl<'a> ActivePiece<'a> {
         self.next_request = (block + 1..self.blocks.len())
             .find(|&b| self.blocks[b] == BlockState::Wanted)
             .unwrap_or(self.blocks.len());
-        let BlockRequest {
-            index,
-            begin,
-            length,
-        } = self.block_request(block);
-        PeerMessage::Request {
-            index,
-            begin,
-            length,
-        }
+        self.block_request(block).request()
     }
 
     /// Every request still outstanding.
-    fn outstanding(&self) -> impl Iterator<Item = BlockRequest> + '_ {
+    fn outstanding(&self) -> impl Iterator<Item = BlockRef> + '_ {
         (0..self.blocks.len())
             .filter(|&block| matches!(self.blocks[block], BlockState::Requested(_)))
             .map(|block| self.block_request(block))
@@ -335,7 +325,7 @@ impl<'a> ActivePiece<'a> {
     /// Takes back the requests that were sent `timeout` or longer before
     /// `now` and are still unanswered, so their blocks are asked for again,
     /// and returns them.
-    pub(super) fn expire(&mut self, now: Instant, timeout: Duration) -> Vec<BlockRequest> {
+    pub(super) fn expire(&mut self, now: Instant, timeout: Duration) -> Vec<BlockRef> {
         let mut expired = Vec::new();
         for block in 0..self.blocks.len() {
             if let BlockState::Requested(sent) = self.blocks[block]

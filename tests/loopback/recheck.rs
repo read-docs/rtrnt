@@ -1,5 +1,5 @@
 use rtrnt::manager::{Command, Manager, StartOptions};
-use rtrnt::peer::PeerMessage;
+use rtrnt::peer::{BlockRef, PeerMessage};
 use rtrnt::source::Source;
 use rtrnt::stats::TorrentState;
 use std::future::pending;
@@ -38,11 +38,11 @@ async fn a_rechecked_torrent_fetches_the_piece_found_corrupt() {
         let mut socket = accept_leecher(&seeder, info_hash, num_pieces).await;
         send(&mut socket, PeerMessage::Unchoke).await;
         while let Some(message) = read_message(&mut socket).await {
-            if let PeerMessage::Request {
+            if let PeerMessage::Request(BlockRef {
                 index,
                 begin,
                 length,
-            } = message
+            }) = message
             {
                 requested_tx.send(index).unwrap();
                 send(&mut socket, piece(&seeder_data, index, begin, length)).await;

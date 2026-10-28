@@ -2,7 +2,7 @@ use rtrnt::dht::Dht;
 use rtrnt::download::download_from_peers;
 use rtrnt::listener::listen;
 use rtrnt::peer::extension::ExtendedHandshake;
-use rtrnt::peer::{PeerMessage, parse_handshake};
+use rtrnt::peer::{BlockRef, PeerMessage, parse_handshake};
 use rtrnt::storage::StorageError;
 use std::future::pending;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -76,11 +76,11 @@ async fn replaces_peers_that_fail() {
         let mut socket = accept_leecher(&flaky, info_hash, num_pieces).await;
         send(&mut socket, PeerMessage::Unchoke).await;
         while let Some(message) = read_message(&mut socket).await {
-            if let PeerMessage::Request {
+            if let PeerMessage::Request(BlockRef {
                 index,
                 begin,
                 length,
-            } = message
+            }) = message
             {
                 let start = index as usize * PIECE_LENGTH as usize + begin as usize;
                 let block = flaky_data[start..start + length as usize].to_vec();
@@ -153,11 +153,11 @@ async fn a_disk_error_stops_the_download_and_shows_its_cause() {
         send(&mut socket, PeerMessage::Unchoke).await;
         let mut broken = false;
         while let Some(message) = read_message(&mut socket).await {
-            let PeerMessage::Request {
+            let PeerMessage::Request(BlockRef {
                 index,
                 begin,
                 length,
-            } = message
+            }) = message
             else {
                 continue;
             };
@@ -223,10 +223,10 @@ async fn endgame_finishes_despite_a_stalled_peer() {
         let mut cancel_seen = Some(cancel_seen);
         while let Some(message) = read_message(&mut socket).await {
             match message {
-                PeerMessage::Request { .. } => {
+                PeerMessage::Request(_) => {
                     stalled_requested.take().map(|tx| tx.send(()));
                 }
-                PeerMessage::Cancel { .. } => {
+                PeerMessage::Cancel(_) => {
                     cancel_seen.take().map(|tx| tx.send(()));
                 }
                 _ => {}
@@ -371,11 +371,11 @@ async fn pipelines_requests_across_pieces() {
         let mut queued = Vec::new();
         while queued.len() < 4 {
             match read_message(&mut socket).await {
-                Some(PeerMessage::Request {
+                Some(PeerMessage::Request(BlockRef {
                     index,
                     begin,
                     length,
-                }) => queued.push((index, begin, length)),
+                })) => queued.push((index, begin, length)),
                 Some(_) => {}
                 None => return queued,
             }
@@ -485,11 +485,11 @@ async fn never_exceeds_the_request_queue_a_peer_announces() {
         let mut most_outstanding = 0;
         loop {
             match tokio::time::timeout(Duration::from_millis(100), messages.recv()).await {
-                Ok(Some(PeerMessage::Request {
+                Ok(Some(PeerMessage::Request(BlockRef {
                     index,
                     begin,
                     length,
-                })) => {
+                }))) => {
                     outstanding.push((index, begin, length));
                     most_outstanding = most_outstanding.max(outstanding.len());
                 }

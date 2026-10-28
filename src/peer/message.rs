@@ -1,5 +1,45 @@
 use anyhow::{Result, anyhow, bail};
 
+/// A block of a piece, as named by the messages that request, cancel and
+/// reject it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BlockRef {
+    pub index: u32,
+    pub begin: u32,
+    pub length: u32,
+}
+
+impl BlockRef {
+    /// The Request for this block.
+    pub fn request(self) -> PeerMessage {
+        PeerMessage::Request(self)
+    }
+
+    /// The Cancel that withdraws a request for this block.
+    pub fn cancel(self) -> PeerMessage {
+        PeerMessage::Cancel(self)
+    }
+
+    /// The Reject (fast extension) that turns a request for this block down.
+    pub fn reject(self) -> PeerMessage {
+        PeerMessage::RejectRequest(self)
+    }
+
+    fn encode(&self, payload: &mut Vec<u8>) {
+        payload.extend_from_slice(&self.index.to_be_bytes());
+        payload.extend_from_slice(&self.begin.to_be_bytes());
+        payload.extend_from_slice(&self.length.to_be_bytes());
+    }
+
+    fn decode(body: &[u8]) -> Result<Self> {
+        Ok(Self {
+            index: be_u32(body, 0)?,
+            begin: be_u32(body, 4)?,
+            length: be_u32(body, 8)?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerMessage {
     KeepAlive,
@@ -13,21 +53,13 @@ pub enum PeerMessage {
     Bitfield {
         bitfield: Vec<u8>,
     },
-    Request {
-        index: u32,
-        begin: u32,
-        length: u32,
-    },
+    Request(BlockRef),
     Piece {
         index: u32,
         begin: u32,
         block: Vec<u8>,
     },
-    Cancel {
-        index: u32,
-        begin: u32,
-        length: u32,
-    },
+    Cancel(BlockRef),
     Port {
         port: u16,
     },
@@ -47,11 +79,7 @@ pub enum PeerMessage {
     /// Fast extension: the sender has no piece. Stands in for a Bitfield.
     HaveNone,
     /// Fast extension: the sender will not serve this request.
-    RejectRequest {
-        index: u32,
-        begin: u32,
-        length: u32,
-    },
+    RejectRequest(BlockRef),
     /// Fast extension: the sender serves requests for this piece even while
     /// it chokes the receiver (once it has the piece).
     AllowedFast {
@@ -72,7 +100,7 @@ impl PeerMessage {
             PeerMessage::SuggestPiece { .. }
                 | PeerMessage::HaveAll
                 | PeerMessage::HaveNone
-                | PeerMessage::RejectRequest { .. }
+                | PeerMessage::RejectRequest(_)
                 | PeerMessage::AllowedFast { .. }
         )
     }
@@ -94,15 +122,9 @@ impl PeerMessage {
                 payload.push(5);
                 payload.extend_from_slice(bitfield);
             }
-            PeerMessage::Request {
-                index,
-                begin,
-                length,
-            } => {
+            PeerMessage::Request(block) => {
                 payload.push(6);
-                payload.extend_from_slice(&index.to_be_bytes());
-                payload.extend_from_slice(&begin.to_be_bytes());
-                payload.extend_from_slice(&length.to_be_bytes());
+                block.encode(&mut payload);
             }
             PeerMessage::Piece {
                 index,
@@ -114,15 +136,9 @@ impl PeerMessage {
                 payload.extend_from_slice(&begin.to_be_bytes());
                 payload.extend_from_slice(block);
             }
-            PeerMessage::Cancel {
-                index,
-                begin,
-                length,
-            } => {
+            PeerMessage::Cancel(block) => {
                 payload.push(8);
-                payload.extend_from_slice(&index.to_be_bytes());
-                payload.extend_from_slice(&begin.to_be_bytes());
-                payload.extend_from_slice(&length.to_be_bytes());
+                block.encode(&mut payload);
             }
             PeerMessage::Port { port } => {
                 payload.push(9);
@@ -134,15 +150,9 @@ impl PeerMessage {
             }
             PeerMessage::HaveAll => payload.push(0x0e),
             PeerMessage::HaveNone => payload.push(0x0f),
-            PeerMessage::RejectRequest {
-                index,
-                begin,
-                length,
-            } => {
+            PeerMessage::RejectRequest(block) => {
                 payload.push(0x10);
-                payload.extend_from_slice(&index.to_be_bytes());
-                payload.extend_from_slice(&begin.to_be_bytes());
-                payload.extend_from_slice(&length.to_be_bytes());
+                block.encode(&mut payload);
             }
             PeerMessage::AllowedFast { piece_index } => {
                 payload.push(0x11);
@@ -194,11 +204,7 @@ impl PeerMessage {
             },
             6 => {
                 expect_len(12)?;
-                PeerMessage::Request {
-                    index: be_u32(body, 0)?,
-                    begin: be_u32(body, 4)?,
-                    length: be_u32(body, 8)?,
-                }
+                PeerMessage::Request(BlockRef::decode(body)?)
             }
             7 => {
                 if body.len() < 8 {
@@ -212,11 +218,7 @@ impl PeerMessage {
             }
             8 => {
                 expect_len(12)?;
-                PeerMessage::Cancel {
-                    index: be_u32(body, 0)?,
-                    begin: be_u32(body, 4)?,
-                    length: be_u32(body, 8)?,
-                }
+                PeerMessage::Cancel(BlockRef::decode(body)?)
             }
             9 => {
                 expect_len(2)?;
@@ -234,11 +236,7 @@ impl PeerMessage {
             0x0f => expect_len(0).map(|_| PeerMessage::HaveNone)?,
             0x10 => {
                 expect_len(12)?;
-                PeerMessage::RejectRequest {
-                    index: be_u32(body, 0)?,
-                    begin: be_u32(body, 4)?,
-                    length: be_u32(body, 8)?,
-                }
+                PeerMessage::RejectRequest(BlockRef::decode(body)?)
             }
             0x11 => {
                 expect_len(4)?;

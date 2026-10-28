@@ -2,7 +2,7 @@ use crate::magnet::metadata;
 use crate::peer::extension::{self, Advertised};
 use crate::peer::fast;
 use crate::peer::pex::{self};
-use crate::peer::{PeerConnection, PeerMessage};
+use crate::peer::{BlockRef, PeerConnection, PeerMessage};
 use crate::stats::{PeerFlags, PeerStats};
 use anyhow::{Result, anyhow, bail};
 use std::collections::HashSet;
@@ -17,7 +17,7 @@ use super::requests::{
     ActivePiece, Pipeline, drop_completed, expire_requests, release_choked, request_blocks,
 };
 use super::swarm::{Link, Swarm, sleep_until_some};
-use super::upload::{BlockRequest, Uploads, serve_block};
+use super::upload::{Uploads, serve_block};
 use super::{Misbehaved, Session};
 
 /// Peers that send this many corrupt pieces are dropped.
@@ -150,7 +150,7 @@ pub(super) async fn peer_worker(
     };
     // Fast extension: requests we cancelled that the peer has not answered
     // yet. It still answers each, with the block or a Reject.
-    let mut cancelled: HashSet<BlockRequest> = HashSet::new();
+    let mut cancelled: HashSet<BlockRef> = HashSet::new();
     loop {
         // Registered before anything is checked, so that a change in the
         // queue from here on still wakes the idle wait below.
@@ -201,8 +201,7 @@ pub(super) async fn peer_worker(
             let allowed = offered.as_deref().unwrap_or_default();
             let dropped = uploads.retain(|request| allowed.contains(&request.index));
             if fast && !dropped.is_empty() {
-                let rejects: Vec<PeerMessage> =
-                    dropped.into_iter().map(BlockRequest::reject).collect();
+                let rejects: Vec<PeerMessage> = dropped.into_iter().map(BlockRef::reject).collect();
                 conn.send_all(&rejects).await?;
             }
         }
@@ -389,7 +388,7 @@ pub(super) async fn peer_worker(
                 begin,
                 block,
             } => {
-                let answered = BlockRequest {
+                let answered = BlockRef {
                     index,
                     begin,
                     length: block.len() as u32,
@@ -434,16 +433,8 @@ pub(super) async fn peer_worker(
                     debug!(%addr, index, "piece complete");
                 }
             }
-            PeerMessage::Request {
-                index,
-                begin,
-                length,
-            } => {
-                let request = BlockRequest {
-                    index,
-                    begin,
-                    length,
-                };
+            PeerMessage::Request(request) => {
+                let BlockRef { index, .. } = request;
                 // We only ever advertise pieces we have, so asking for
                 // another is a protocol violation.
                 if !queue.has(index as usize) {
@@ -465,32 +456,19 @@ pub(super) async fn peer_worker(
                     }
                 }
             }
-            PeerMessage::Cancel {
-                index,
-                begin,
-                length,
-            } => {
-                let request = BlockRequest {
-                    index,
-                    begin,
-                    length,
-                };
+            PeerMessage::Cancel(request) => {
                 // With the fast extension even a cancelled request gets an
                 // answer: a Reject if its block was not sent yet.
                 if uploads.cancel(&request) && fast {
                     conn.send(&request.reject()).await?;
                 }
             }
-            PeerMessage::RejectRequest {
-                index,
-                begin,
-                length,
-            } => {
-                let request = BlockRequest {
+            PeerMessage::RejectRequest(request) => {
+                let BlockRef {
                     index,
                     begin,
                     length,
-                };
+                } = request;
                 // The answer to a request we cancelled.
                 if cancelled.remove(&request) {
                     continue;

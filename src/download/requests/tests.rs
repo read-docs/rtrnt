@@ -1,4 +1,5 @@
 use super::*;
+use crate::peer::BlockRef;
 use sha1::Digest;
 
 fn peer<'a>(queue: &'a PieceQueue, has: &[bool]) -> PeerPieces<'a> {
@@ -29,7 +30,9 @@ fn active_piece_requests_blocks_in_order_and_assembles_them() {
     let (data, mut piece) = active(&queue, &seed);
     let mut lengths = Vec::new();
     while piece.has_unrequested() {
-        let PeerMessage::Request { begin, length, .. } = piece.request_next(Instant::now()) else {
+        let PeerMessage::Request(BlockRef { begin, length, .. }) =
+            piece.request_next(Instant::now())
+        else {
             panic!("not a request");
         };
         lengths.push((begin, length));
@@ -105,14 +108,14 @@ fn active_piece_cancels_only_outstanding_requests() {
     piece.request_next(Instant::now());
     piece.request_next(Instant::now());
     piece.add_block(0, block(&data, 0)).unwrap();
-    let cancels: Vec<PeerMessage> = piece.outstanding().map(BlockRequest::cancel).collect();
+    let cancels: Vec<PeerMessage> = piece.outstanding().map(BlockRef::cancel).collect();
     assert_eq!(
         cancels,
-        [PeerMessage::Cancel {
+        [PeerMessage::Cancel(BlockRef {
             index: 0,
             begin: BLOCK_SIZE,
             length: BLOCK_SIZE,
-        }]
+        })]
     );
 }
 
@@ -121,10 +124,12 @@ fn rejected_blocks_are_requested_again_first() {
     let queue = PieceQueue::all_wanted(&[false; 1]);
     let seed = peer(&queue, &[true]);
     let (data, mut piece) = active(&queue, &seed);
-    let request = |block: u32| PeerMessage::Request {
-        index: 0,
-        begin: block * BLOCK_SIZE,
-        length: BLOCK_SIZE.min(data.len() as u32 - block * BLOCK_SIZE),
+    let request = |block: u32| {
+        PeerMessage::Request(BlockRef {
+            index: 0,
+            begin: block * BLOCK_SIZE,
+            length: BLOCK_SIZE.min(data.len() as u32 - block * BLOCK_SIZE),
+        })
     };
     assert_eq!(piece.request_next(Instant::now()), request(0));
     assert_eq!(piece.request_next(Instant::now()), request(1));
@@ -142,7 +147,7 @@ fn rejected_blocks_are_requested_again_first() {
     assert_eq!(piece.request_next(Instant::now()), request(0));
     assert_eq!(piece.request_next(Instant::now()), request(2));
     assert!(!piece.has_unrequested());
-    let outstanding: Vec<BlockRequest> = piece.outstanding().collect();
+    let outstanding: Vec<BlockRef> = piece.outstanding().collect();
     assert_eq!(outstanding.len(), 3);
 
     assert!(piece.add_block(BLOCK_SIZE, block(&data, 1)).unwrap());
@@ -168,7 +173,7 @@ fn unanswered_requests_expire_and_are_asked_for_again() {
     let timeout = Duration::from_secs(60);
     let start = Instant::now();
     let at = |secs| start + Duration::from_secs(secs);
-    let request = |block: u32, length: u32| BlockRequest {
+    let request = |block: u32, length: u32| BlockRef {
         index: 0,
         begin: block * BLOCK_SIZE,
         length,
@@ -192,11 +197,11 @@ fn unanswered_requests_expire_and_are_asked_for_again() {
     assert!(piece.expire(at(60), timeout).is_empty());
     assert_eq!(
         piece.request_next(at(61)),
-        PeerMessage::Request {
+        PeerMessage::Request(BlockRef {
             index: 0,
             begin: 0,
             length: BLOCK_SIZE,
-        }
+        })
     );
 
     // The third block expires on its own clock, the first one's new request

@@ -1,5 +1,5 @@
 use rtrnt::download::{SeedLimits, download_from_peers};
-use rtrnt::peer::PeerMessage;
+use rtrnt::peer::{BlockRef, PeerMessage};
 use rtrnt::rate_limit::RateLimits;
 use std::future::pending;
 use std::sync::Arc;
@@ -20,11 +20,11 @@ async fn counting_seeder(
     send(&mut socket, PeerMessage::Unchoke).await;
     let mut sent = 0;
     while let Some(message) = read_message(&mut socket).await {
-        if let PeerMessage::Request {
+        if let PeerMessage::Request(BlockRef {
             index,
             begin,
             length,
-        } = message
+        }) = message
         {
             send(&mut socket, piece(&data, index, begin, length)).await;
             sent += u64::from(length);
