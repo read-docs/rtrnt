@@ -13,6 +13,19 @@ pub mod verify;
 /// macOS's default soft limit is 256 descriptors shared with peer sockets.
 const MAX_OPEN_FILES: usize = 64;
 
+/// Reading or writing the torrent's files failed, which is the disk's fault
+/// and no peer's. The cause is in the error's chain.
+#[derive(Debug)]
+pub struct StorageError;
+
+impl std::fmt::Display for StorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("disk error")
+    }
+}
+
+impl std::error::Error for StorageError {}
+
 /// One file of the torrent, placed in the concatenated byte stream.
 #[derive(Debug)]
 pub struct FileSpan {
@@ -206,7 +219,9 @@ impl Storage {
     pub async fn write_piece(self: &Arc<Self>, index: usize, data: Vec<u8>) -> Result<()> {
         let storage = Arc::clone(self);
         let offset = index as u64 * self.piece_length;
-        tokio::task::spawn_blocking(move || storage.write_at(offset, &data)).await?
+        tokio::task::spawn_blocking(move || storage.write_at(offset, &data))
+            .await?
+            .context(StorageError)
     }
 
     /// Reads `length` bytes from offset `begin` in piece `index` on the
@@ -219,7 +234,9 @@ impl Storage {
     ) -> Result<Vec<u8>> {
         let storage = Arc::clone(self);
         let offset = index as u64 * self.piece_length + u64::from(begin);
-        tokio::task::spawn_blocking(move || storage.read_at(offset, length as usize)).await?
+        tokio::task::spawn_blocking(move || storage.read_at(offset, length as usize))
+            .await?
+            .context(StorageError)
     }
 
     pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {

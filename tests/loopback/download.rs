@@ -3,6 +3,7 @@ use rtrnt::download::download_from_peers;
 use rtrnt::listener::listen;
 use rtrnt::peer::extension::ExtendedHandshake;
 use rtrnt::peer::{PeerMessage, parse_handshake};
+use rtrnt::storage::StorageError;
 use std::future::pending;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -128,6 +129,77 @@ async fn replaces_peers_that_fail() {
     .expect("download failed");
 
     assert_files_match(out.path(), &data);
+}
+
+/// A file that cannot be written ends the download with the I/O error, as
+/// the disk's fault, instead of blaming the peer and running out of peers.
+#[tokio::test]
+async fn a_disk_error_stops_the_download_and_shows_its_cause() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+    let out = tempfile::tempdir().unwrap();
+    let session = session(torrent, info_hash, out.path());
+
+    // Once the first block of a piece past the first has been asked for, a
+    // directory takes the place of b.bin, which nothing can open for writing.
+    let b = out.path().join("multi/dir/b.bin");
+    let seeder = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seeder_addr = seeder.local_addr().unwrap();
+    let seeder_data = Arc::clone(&data);
+    tokio::spawn(async move {
+        let mut socket = accept_leecher(&seeder, info_hash, num_pieces).await;
+        send(&mut socket, PeerMessage::Unchoke).await;
+        let mut broken = false;
+        while let Some(message) = read_message(&mut socket).await {
+            let PeerMessage::Request {
+                index,
+                begin,
+                length,
+            } = message
+            else {
+                continue;
+            };
+            if index > 0 && !broken {
+                std::fs::remove_file(&b).unwrap();
+                std::fs::create_dir(&b).unwrap();
+                broken = true;
+            }
+            let start = index as usize * PIECE_LENGTH as usize + begin as usize;
+            let block = seeder_data[start..start + length as usize].to_vec();
+            send(
+                &mut socket,
+                PeerMessage::Piece {
+                    index,
+                    begin,
+                    block,
+                },
+            )
+            .await;
+        }
+    });
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(20),
+        download_from_peers(
+            session,
+            &vec![false; num_pieces],
+            &[seeder_addr],
+            1,
+            Vec::new(),
+            None,
+            pending(),
+        ),
+    )
+    .await
+    .expect("download timed out")
+    .expect_err("download succeeded");
+
+    assert!(err.is::<StorageError>(), "{err:#}");
+    let message = format!("{err:#}");
+    assert!(message.contains("b.bin"), "{message}");
+    assert!(!message.contains("no peers left"), "{message}");
 }
 
 /// One seeder takes a piece and never sends it. Endgame must fetch that piece

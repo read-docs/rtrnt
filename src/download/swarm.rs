@@ -7,6 +7,7 @@ use crate::peer::pex::PeerExchange;
 use crate::peer::{self, Incoming, PeerConnection};
 use crate::selection;
 use crate::stats::{PeerSource, PieceSnapshot, PieceSource, TorrentState};
+use crate::storage::StorageError;
 use crate::tracker::announcer::{Announcer, Transferred};
 use anyhow::{Result, bail};
 use indicatif::HumanBytes;
@@ -166,6 +167,8 @@ pub(crate) async fn download_with(
     let mut choking = std::pin::pin!(choker.run(|| queue.is_done()));
     let mut shutdown = std::pin::pin!(shutdown);
     let mut interrupted = false;
+    // The disk error that ended the run, if one did.
+    let mut disk_error = None;
     // Whether the download finishes this session, rather than having been
     // complete on disk.
     let downloading = !queue.is_done();
@@ -271,6 +274,13 @@ pub(crate) async fn download_with(
                             pool.ban(addr);
                         }
                     }
+                    // The disk is at fault, not the peer, and no other peer
+                    // would fare better: the torrent stops.
+                    Err(e) if e.is::<StorageError>() => {
+                        warn!(%addr, "stopping: {e:#}");
+                        disk_error = Some(e);
+                        break;
+                    }
                     Err(e) => {
                         debug!(%addr, pieces, "peer dropped: {e:#}");
                         // We cannot connect back to the port an incoming
@@ -358,6 +368,9 @@ pub(crate) async fn download_with(
     }
     if let Some(announcer) = announcer {
         announcer.stop(&progress.transferred).await;
+    }
+    if let Some(e) = disk_error {
+        return Err(e);
     }
     if remaining > 0 {
         if interrupted {
