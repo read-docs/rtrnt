@@ -21,18 +21,20 @@ use crossterm::event::{
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute, terminal};
 use futures_util::StreamExt;
-use log_buffer::LogBuffer;
+use log_buffer::{LogBuffer, LogLine};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use snapshot::Snapshot;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::ThreadId;
+use std::time::{Duration, Instant, SystemTime};
 use theme::Theme;
 use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
+use tracing::Level;
 
 /// How often the stats are read and the screen drawn.
 pub const TICK: Duration = Duration::from_millis(250);
@@ -47,6 +49,12 @@ pub trait Feed {
     /// on `Stop` with nothing to wait for. What comes of other commands
     /// shows in later snapshots, or as a notice.
     fn command(&mut self, command: Command) -> bool;
+
+    /// Where the log goes, which is also where a panic of another thread
+    /// than the UI's is put while the UI has the terminal.
+    fn logs(&self) -> Option<LogBuffer> {
+        None
+    }
 }
 
 /// The feed of a real session.
@@ -77,6 +85,10 @@ impl<S: FnMut() -> bool> SessionFeed<S> {
 }
 
 impl<S: FnMut() -> bool> Feed for SessionFeed<S> {
+    fn logs(&self) -> Option<LogBuffer> {
+        Some(self.logs.clone())
+    }
+
     fn snapshot(&mut self, selected: Option<[u8; 20]>, finished: bool) -> Snapshot {
         Snapshot::take(&self.stats, &self.logs, selected, finished)
     }
@@ -114,7 +126,7 @@ pub async fn run(
     mut finished: watch::Receiver<bool>,
     dir: PathBuf,
 ) -> io::Result<Exit> {
-    let _guard = TerminalGuard::enter()?;
+    let _guard = TerminalGuard::enter(feed.logs())?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut app = App::new(Theme::detect());
     app.dir = dir;
@@ -209,15 +221,35 @@ pub fn restore_terminal() {
     }
 }
 
+/// The thread that draws, and where the panics of the others go.
+struct Ui {
+    thread: ThreadId,
+    logs: Option<LogBuffer>,
+}
+
+/// Set while a `TerminalGuard` holds the terminal.
+static UI: Mutex<Option<Ui>> = Mutex::new(None);
+
+fn ui() -> MutexGuard<'static, Option<Ui>> {
+    UI.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Holds the terminal in raw mode on the alternate screen, with the mouse
 /// captured, until dropped.
 struct TerminalGuard;
 
 impl TerminalGuard {
-    fn enter() -> io::Result<Self> {
+    /// Takes the terminal for the calling thread. A panic of that thread
+    /// puts it back; one of any other thread is logged to `logs`, if any,
+    /// instead of being printed over the screen.
+    fn enter(logs: Option<LogBuffer>) -> io::Result<Self> {
         install_panic_hook();
         terminal::enable_raw_mode()?;
         ACTIVE.store(true, Ordering::SeqCst);
+        *ui() = Some(Ui {
+            thread: std::thread::current().id(),
+            logs,
+        });
         // From here on a failure drops the guard, which restores.
         let guard = Self;
         execute!(
@@ -232,18 +264,81 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        *ui() = None;
         restore_terminal();
     }
 }
 
-/// Makes a panic restore the terminal before its message is printed.
+/// Makes a panic of the UI's thread restore the terminal before its message
+/// is printed. A panic of another thread, which leaves the UI running, goes
+/// to the log instead of over the screen.
 fn install_panic_hook() {
     static INSTALLED: std::sync::Once = std::sync::Once::new();
     INSTALLED.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
+            let elsewhere = ui()
+                .as_ref()
+                .filter(|ui| ui.thread != std::thread::current().id())
+                .and_then(|ui| ui.logs.clone());
+            if let Some(logs) = elsewhere {
+                logs.push(LogLine {
+                    time: SystemTime::now(),
+                    level: Level::ERROR,
+                    torrent: None,
+                    message: panic_message(info),
+                });
+                return;
+            }
             restore_terminal();
             previous(info);
         }));
     });
+}
+
+/// What `info` says, as the default hook would, on one line.
+fn panic_message(info: &std::panic::PanicHookInfo<'_>) -> String {
+    let payload = info.payload();
+    let what = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("Box<dyn Any>");
+    let thread = std::thread::current();
+    let name = thread.name().unwrap_or("<unnamed>");
+    match info.location() {
+        Some(at) => format!("thread '{name}' panicked at {at}: {what}"),
+        None => format!("thread '{name}' panicked: {what}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A panic of a thread other than the UI's lands in the log and leaves
+    /// the terminal alone.
+    #[test]
+    fn a_panic_elsewhere_goes_to_the_log() {
+        let logs = LogBuffer::default();
+        install_panic_hook();
+        // Some other thread than this test's is the UI's.
+        let drawing = std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .unwrap();
+        *ui() = Some(Ui {
+            thread: drawing,
+            logs: Some(logs.clone()),
+        });
+        ACTIVE.store(true, Ordering::SeqCst);
+        let result = std::thread::spawn(|| panic!("boom")).join();
+        let active = ACTIVE.swap(false, Ordering::SeqCst);
+        *ui() = None;
+        assert!(result.is_err());
+        assert!(active, "the terminal was restored");
+        let lines = logs.lines();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].level, Level::ERROR);
+        assert!(lines[0].message.contains("boom"), "{}", lines[0].message);
+    }
 }
