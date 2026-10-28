@@ -149,6 +149,13 @@ async fn torrents_share_one_listener_and_one_rate_limit() {
 }
 
 #[tokio::test]
+async fn the_dht_uses_the_port_the_listener_got() {
+    let client = client(true);
+    let dht = client.dht().await.unwrap();
+    assert_eq!(client.listener().await.port(), Some(dht.port()));
+}
+
+#[tokio::test]
 async fn no_dht_when_it_is_off() {
     assert!(client(false).dht().await.is_none());
 }
