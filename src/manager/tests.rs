@@ -262,6 +262,7 @@ fn recording(
 const RECHECK: StartOptions = StartOptions {
     recheck: Recheck::ThenRun,
     selection: None,
+    picks: None,
 };
 
 #[tokio::test]
@@ -622,7 +623,7 @@ async fn a_torrent_only_checked_ends_paused() {
     let mut manager = Manager::with_runner(Arc::clone(&client), never, fake_run);
     let only_check = StartOptions {
         recheck: Recheck::ThenPause,
-        selection: None,
+        ..StartOptions::default()
     };
     manager.start(vec![magnet(UNTIL_STOPPED)], only_check).await;
     manager.drive(closed()).await;
@@ -1004,4 +1005,200 @@ async fn a_saved_torrent_that_no_longer_loads_is_reported_and_dropped() {
         "{notice}"
     );
     assert_eq!(manager.run(closed()).await.unwrap(), ExitCode::FAILURE);
+}
+
+/// A torrent of two files, "a" and "b", of one block each.
+fn two_files() -> crate::torrent::TorrentFile {
+    crate::torrent::TorrentFile {
+        announce: None,
+        announce_list: None,
+        info: Info {
+            name: "two".to_string(),
+            piece_length: 16 * 1024,
+            pieces: serde_bytes::ByteBuf::from(vec![0; 40]),
+            private: None,
+            length: None,
+            files: Some(vec![
+                crate::torrent::FileInfo {
+                    path: vec!["a".into()],
+                    length: 16 * 1024,
+                },
+                crate::torrent::FileInfo {
+                    path: vec!["b".into()],
+                    length: 16 * 1024,
+                },
+            ]),
+        },
+    }
+}
+
+fn skip_second() -> FileSelection {
+    FileSelection::new(vec![Priority::Normal, Priority::Skip])
+}
+
+#[tokio::test]
+async fn choosing_files_restarts_a_running_torrent_with_them() {
+    let client = client();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, recording(&seen));
+    let hash = [UNTIL_STOPPED; 20];
+    manager
+        .start(vec![magnet(UNTIL_STOPPED)], StartOptions::default())
+        .await;
+    let stats = client.stats().add_torrent(hash, "t", ".".as_ref());
+    let set = |priorities: Vec<Priority>| Command::SetPriorities {
+        info_hash: hash,
+        priorities,
+    };
+
+    // Its files are not known yet.
+    manager.command(set(skip_second().for_files(2))).await;
+    let (_, notice) = client.stats().last_notice().unwrap();
+    assert!(notice.ends_with("no files to choose yet"), "{notice}");
+    assert!(matches!(manager.entries()[0].state, State::Running { .. }));
+
+    stats.set_torrent(&two_files());
+    // A list for another number of files.
+    manager.command(set(vec![Priority::Skip])).await;
+    let (_, notice) = client.stats().last_notice().unwrap();
+    assert!(notice.ends_with("wrong number of files"), "{notice}");
+    assert!(matches!(manager.entries()[0].state, State::Running { .. }));
+
+    manager.command(set(skip_second().for_files(2))).await;
+    let wanted = StartOptions {
+        selection: Some(skip_second()),
+        ..StartOptions::default()
+    };
+    assert!(
+        matches!(&manager.entries()[0].state, State::Restarting { stop, then } if *stop.borrow() && *then == wanted)
+    );
+    // Changing its mind meanwhile replaces the choice.
+    let high = FileSelection::new(vec![Priority::High, Priority::Normal]);
+    manager.command(set(high.for_files(2))).await;
+    let joined = manager.tasks.join_next_with_id().await.unwrap();
+    manager.ended(joined).await;
+    let last = seen.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(last.selection, Some(high));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_torrent_being_removed_or_without_files_keeps_no_choice() {
+    let client = client();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, counting(&runs));
+    let hash = [UNTIL_STOPPED; 20];
+    manager
+        .start(vec![magnet(UNTIL_STOPPED)], StartOptions::default())
+        .await;
+    let set = Command::SetPriorities {
+        info_hash: hash,
+        priorities: vec![Priority::Skip],
+    };
+    // Paused, with no saved torrent to take the files from.
+    manager.command(Command::Pause(hash)).await;
+    let joined = manager.tasks.join_next_with_id().await.unwrap();
+    manager.ended(joined).await;
+    manager.command(set.clone()).await;
+    let (_, notice) = client.stats().last_notice().unwrap();
+    assert!(notice.ends_with("no files to choose yet"), "{notice}");
+
+    manager.command(Command::Resume(hash)).await;
+    manager
+        .command(Command::Remove {
+            info_hash: hash,
+            delete: false,
+        })
+        .await;
+    manager.command(set).await;
+    let (_, notice) = client.stats().last_notice().unwrap();
+    assert!(
+        notice.ends_with("being removed, no files to choose"),
+        "{notice}"
+    );
+    assert!(matches!(manager.entries()[0].state, State::Removing { .. }));
+    manager.drive(closed()).await;
+    assert_eq!(runs.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn a_paused_torrent_keeps_the_choice_of_files_in_its_resume_file() {
+    let (out, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (path, hash) = {
+        let torrent = two_files();
+        let path = out.path().join("two.torrent");
+        std::fs::write(&path, serde_bencode::to_bytes(&torrent).unwrap()).unwrap();
+        let metainfo = crate::torrent::parse_metainfo(&std::fs::read(&path).unwrap()).unwrap();
+        (path, metainfo.info_hash)
+    };
+    let client = Arc::new(Client::new(
+        DownloadConfig {
+            output_dir: out.path().to_path_buf(),
+            max_peers: 10,
+            max_connections: 100,
+            listen_port: 0,
+            seed: SeedLimits::default(),
+            dht: false,
+            max_download_rate: 0,
+            max_upload_rate: 0,
+            resume_dir: Some(state.path().to_path_buf()),
+        },
+        MultiProgress::with_draw_target(ProgressDrawTarget::hidden()),
+    ));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let runner = {
+        let seen = Arc::clone(&seen);
+        move |client, torrent, options: StartOptions, stop| {
+            seen.lock().unwrap().push(options.clone());
+            Box::pin(until_stopped(client, torrent, options, stop))
+                as BoxFuture<'static, Result<()>>
+        }
+    };
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, runner);
+    manager
+        .start(vec![Source::File(path)], StartOptions::default())
+        .await;
+    let stats = client.stats().add_torrent(hash, "two", out.path());
+    stats.set_torrent(&two_files());
+    manager.command(Command::Pause(hash)).await;
+    let joined = manager.tasks.join_next_with_id().await.unwrap();
+    manager.ended(joined).await;
+    assert!(matches!(manager.entries()[0].state, State::Paused));
+
+    manager
+        .command(Command::SetPriorities {
+            info_hash: hash,
+            priorities: skip_second().for_files(2),
+        })
+        .await;
+    let (_, notice) = client.stats().last_notice().unwrap();
+    assert!(notice.contains("file choice saved"), "{notice}");
+    assert!(matches!(manager.entries()[0].state, State::Paused));
+    let target = resume::Target::new(client.config(), hash).unwrap();
+    assert_eq!(resume::load_selection(&target, 2), Some(skip_second()));
+    // The row shows it, and only the first file is wanted.
+    assert_eq!(
+        stats.priorities(),
+        Some(vec![Priority::Normal, Priority::Skip])
+    );
+    assert_eq!(stats.wanted(), Some(16 * 1024));
+
+    // Resumed with no options of its own, it goes by the resume file.
+    manager.command(Command::Resume(hash)).await;
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert_eq!(seen.lock().unwrap()[1], StartOptions::default());
+    // And a second change keeps the rest of the file.
+    manager.command(Command::Pause(hash)).await;
+    let joined = manager.tasks.join_next_with_id().await.unwrap();
+    manager.ended(joined).await;
+    manager
+        .command(Command::SetPriorities {
+            info_hash: hash,
+            priorities: vec![Priority::High; 2],
+        })
+        .await;
+    assert_eq!(
+        resume::load_selection(&target, 2),
+        Some(FileSelection::new(vec![Priority::High; 2]))
+    );
 }

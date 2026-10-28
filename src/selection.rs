@@ -41,6 +41,32 @@ impl Priority {
     }
 }
 
+impl Priority {
+    /// The next higher priority, or the same for `High`.
+    pub fn raised(self) -> Self {
+        match self {
+            Priority::Skip => Priority::Normal,
+            Priority::Normal | Priority::High => Priority::High,
+        }
+    }
+
+    /// The next lower priority, or the same for `Skip`.
+    pub fn lowered(self) -> Self {
+        match self {
+            Priority::Skip | Priority::Normal => Priority::Skip,
+            Priority::High => Priority::Normal,
+        }
+    }
+
+    /// `Normal` for a skipped file, and `Skip` for any other.
+    pub fn toggled(self) -> Self {
+        match self {
+            Priority::Skip => Priority::Normal,
+            Priority::Normal | Priority::High => Priority::Skip,
+        }
+    }
+}
+
 /// The priority of each file of a torrent, in order. The empty selection
 /// means every file is `Normal`, whatever their number.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -77,10 +103,75 @@ impl FileSelection {
         self.0.iter().all(|&priority| priority == Priority::Normal)
     }
 
+    /// Whether the selection lists files and skips every one.
+    pub fn is_all_skipped(&self) -> bool {
+        !self.0.is_empty() && self.0.iter().all(|&priority| priority == Priority::Skip)
+    }
+
     /// Whether the selection lists no file, which means all are `Normal`.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+}
+
+/// The files named on the command line (`--select-file 1,3-5`): numbered
+/// from 1, as aria2 does, in ranges that may overlap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilePicks(Vec<(usize, usize)>);
+
+impl FilePicks {
+    /// Parses a comma-separated list of file numbers and ranges (`3`,
+    /// `3-5`), each from 1.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let number = |part: &str| match part.trim().parse::<usize>() {
+            Ok(number) if number >= 1 => Ok(number),
+            _ => Err(format!("{part:?} is not a file number, counting from 1")),
+        };
+        let mut ranges = Vec::new();
+        for item in text.split(',') {
+            let (first, last) = match item.split_once('-') {
+                Some((first, last)) => (number(first)?, number(last)?),
+                None => (number(item)?, number(item)?),
+            };
+            if first > last {
+                return Err(format!("{item:?} is a range that ends before it starts"));
+            }
+            ranges.push((first, last));
+        }
+        Ok(Self(ranges))
+    }
+
+    /// The highest file number picked.
+    pub fn last(&self) -> usize {
+        self.0.iter().map(|&(_, last)| last).max().unwrap_or(0)
+    }
+
+    /// The selection of a torrent of `count` files that downloads the ones
+    /// picked and skips the rest. Numbers past the last file pick nothing.
+    pub fn selection(&self, count: usize) -> FileSelection {
+        let picked = |index: usize| {
+            self.0
+                .iter()
+                .any(|&(first, last)| (first..=last).contains(&(index + 1)))
+        };
+        FileSelection::new(
+            (0..count)
+                .map(|index| {
+                    if picked(index) {
+                        Priority::Normal
+                    } else {
+                        Priority::Skip
+                    }
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Bytes in the pieces that `selection` wants of `torrent`.
+pub fn wanted_of(torrent: &TorrentFile, selection: &FileSelection) -> Result<u64> {
+    let files = crate::storage::layout(&torrent.info, std::path::Path::new(""))?;
+    wanted_len(torrent, &piece_priorities(torrent, &files, selection))
 }
 
 /// How many files `info` lists.

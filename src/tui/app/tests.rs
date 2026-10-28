@@ -774,3 +774,131 @@ fn a_bad_magnet_link_or_nothing_keeps_the_add_prompt_open() {
     app.handle_key(key(KeyCode::Char('a')), &snapshot);
     assert_eq!(app.input, None);
 }
+
+/// "a" with three files and their priorities, selected, with the Files tab
+/// focused.
+fn with_files(priorities: Vec<Priority>) -> (Snapshot, App) {
+    let mut snapshot = snapshot(&["a"]);
+    snapshot.torrents[0].layout = Some(crate::stats::Layout {
+        size: 3 * 1024,
+        piece_length: 1024,
+        pieces: 3,
+        private: false,
+        files: ["x", "y", "z"]
+            .iter()
+            .map(|name| (PathBuf::from(name), 1024))
+            .collect(),
+    });
+    snapshot.torrents[0].priorities = priorities;
+    let mut app = App::new(Theme::default());
+    app.ensure_selection(&snapshot);
+    app.handle_key(key(KeyCode::Char('4')), &snapshot);
+    app.handle_key(key(KeyCode::Tab), &snapshot);
+    (snapshot, app)
+}
+
+fn set(priorities: Vec<Priority>) -> Action {
+    Action::Command(Command::SetPriorities {
+        info_hash: [0; 20],
+        priorities,
+    })
+}
+
+#[test]
+fn the_file_cursor_moves_and_space_toggles_skip() {
+    use Priority::{High, Normal, Skip};
+    let (snapshot, mut app) = with_files(Vec::new());
+    assert_eq!(app.file, 0);
+    app.handle_key(key(KeyCode::Down), &snapshot);
+    app.handle_key(key(KeyCode::Char('j')), &snapshot);
+    app.handle_key(key(KeyCode::Down), &snapshot);
+    assert_eq!(app.file, 2);
+    app.handle_key(key(KeyCode::PageUp), &snapshot);
+    assert_eq!(app.file, 0);
+    app.handle_key(key(KeyCode::Down), &snapshot);
+    // No priorities known yet means all normal.
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char(' ')), &snapshot),
+        set(vec![Normal, Skip, Normal])
+    );
+    let (snapshot, mut app) = with_files(vec![Normal, Skip, High]);
+    app.handle_key(key(KeyCode::Down), &snapshot);
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char(' ')), &snapshot),
+        set(vec![Normal, Normal, High])
+    );
+    // A high one toggles to skip.
+    app.handle_key(key(KeyCode::Down), &snapshot);
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char(' ')), &snapshot),
+        set(vec![Normal, Skip, Skip])
+    );
+}
+
+#[test]
+fn plus_and_minus_raise_and_lower_the_file() {
+    use Priority::{High, Normal, Skip};
+    let (snapshot, mut app) = with_files(vec![Skip, Normal, High]);
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('+')), &snapshot),
+        set(vec![Normal, Normal, High])
+    );
+    // Skip is the lowest.
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('-')), &snapshot),
+        Action::None
+    );
+    app.handle_key(key(KeyCode::Down), &snapshot);
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('=')), &snapshot),
+        set(vec![Skip, High, High])
+    );
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('-')), &snapshot),
+        set(vec![Skip, Skip, High])
+    );
+    app.handle_key(key(KeyCode::Down), &snapshot);
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('+')), &snapshot),
+        Action::None
+    );
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('-')), &snapshot),
+        set(vec![Skip, Normal, Normal])
+    );
+}
+
+#[test]
+fn the_file_keys_do_nothing_elsewhere() {
+    let (mut snapshot, mut app) = with_files(Vec::new());
+    assert!(app.choosing_files(&snapshot));
+    for state in [TorrentState::Pausing, TorrentState::Removing] {
+        snapshot.torrents[0].state = state;
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char(' ')), &snapshot),
+            Action::None
+        );
+        assert!(!app.choosing_files(&snapshot));
+    }
+    snapshot.torrents[0].state = TorrentState::Downloading;
+    // On another tab, or with the table focused.
+    app.handle_key(key(KeyCode::Char('1')), &snapshot);
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char(' ')), &snapshot),
+        Action::None
+    );
+    app.handle_key(key(KeyCode::Char('4')), &snapshot);
+    app.handle_key(key(KeyCode::Tab), &snapshot);
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('+')), &snapshot),
+        Action::None
+    );
+    // Files not known yet, or no torrent.
+    snapshot.torrents[0].layout = None;
+    app.handle_key(key(KeyCode::Tab), &snapshot);
+    assert!(!app.choosing_files(&snapshot));
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char(' ')), &Snapshot::default()),
+        Action::None
+    );
+}

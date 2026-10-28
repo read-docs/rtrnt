@@ -605,6 +605,9 @@ impl Feed for DemoFeed {
             Command::Recheck(_) => {
                 self.notice = Some((Instant::now(), "the demo checks nothing".into()));
             }
+            Command::SetPriorities { .. } => {
+                self.notice = Some((Instant::now(), "the demo downloads nothing".into()));
+            }
             // Nothing is on disk to delete.
             Command::Remove { info_hash, .. } => {
                 if let Some(live) = self.live(info_hash) {

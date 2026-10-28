@@ -1,6 +1,7 @@
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 use rtrnt::config;
+use rtrnt::selection::FilePicks;
 use rtrnt::source::Source;
 use std::path::PathBuf;
 
@@ -46,6 +47,14 @@ pub(crate) struct Args {
     /// torrent that has none
     #[arg(long)]
     pub(crate) recheck: bool,
+    /// Download only these files of each torrent, numbered from 1 in the
+    /// order the torrent lists them: `1,3-5`. A file in a piece shared with
+    /// a wanted one is fetched in part anyway. A number past the last file
+    /// is warned of; a magnet link applies it once its metadata arrives.
+    /// Not in the config file; the terminal UI's Files tab changes the
+    /// choice later
+    #[arg(long, value_name = "FILES", value_parser = FilePicks::parse)]
+    pub(crate) select_file: Option<FilePicks>,
     /// Ask every tracker of each torrent how many seeders and leechers it
     /// knows of instead of downloading; exits with an error unless one
     /// answers for each torrent

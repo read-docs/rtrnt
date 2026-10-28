@@ -125,3 +125,50 @@ fn selection_helpers() {
     }
     assert_eq!(Priority::from_wire(3), None);
 }
+
+#[test]
+fn priorities_move_one_step_at_a_time() {
+    assert_eq!(Skip.raised(), Normal);
+    assert_eq!(Normal.raised(), High);
+    assert_eq!(High.raised(), High);
+    assert_eq!(High.lowered(), Normal);
+    assert_eq!(Normal.lowered(), Skip);
+    assert_eq!(Skip.lowered(), Skip);
+    assert_eq!(
+        [Skip, Normal, High].map(Priority::toggled),
+        [Normal, Skip, Skip]
+    );
+}
+
+#[test]
+fn file_picks_parse_numbers_and_ranges_from_one() {
+    let picks = FilePicks::parse("1,3-5").unwrap();
+    assert_eq!(picks.last(), 5);
+    assert_eq!(
+        picks.selection(6).priorities(),
+        [Normal, Skip, Normal, Normal, Normal, Skip]
+    );
+    // Past the last file picks nothing there.
+    assert_eq!(picks.selection(3).priorities(), [Normal, Skip, Normal]);
+    assert!(picks.selection(0).is_empty());
+    assert_eq!(
+        FilePicks::parse(" 2 , 2-2,1-2")
+            .unwrap()
+            .selection(2)
+            .priorities(),
+        [Normal, Normal]
+    );
+    for bad in ["", "0", "1,", "a", "3-1", "1-", "-2", "1-2-3", "1;2"] {
+        assert!(FilePicks::parse(bad).is_err(), "{bad:?}");
+    }
+    assert!(FilePicks::parse("9").unwrap().selection(3).is_all_skipped());
+    assert!(!FileSelection::default().is_all_skipped());
+}
+
+#[test]
+fn wanted_bytes_follow_a_selection() {
+    let torrent = torrent(&[3, 5, 3], 4);
+    let selection = FileSelection::new(vec![Normal, Skip, Normal]);
+    assert_eq!(wanted_of(&torrent, &selection).unwrap(), 7);
+    assert_eq!(wanted_of(&torrent, &FileSelection::default()).unwrap(), 11);
+}

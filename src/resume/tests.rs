@@ -396,3 +396,42 @@ fn candidates_are_not_needed_to_trust_a_resume_file() {
     .unwrap();
     assert_eq!((have, to_hash), (vec![false, true, false], vec![]));
 }
+
+#[tokio::test]
+async fn a_selection_is_saved_into_the_resume_file_with_or_without_one() {
+    let out = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let config = config(out.path(), state.path());
+    let target = Target::new(&config, [7; 20]).unwrap();
+    let selection = FileSelection::new(vec![Priority::Skip, Priority::Normal]);
+
+    // No file: one is made that vouches for no piece.
+    target.save_selection(&selection, 2, 3).await.unwrap();
+    assert_eq!(load_selection(&target, 2), Some(selection.clone()));
+    let saved = decode(&std::fs::read(target.path()).unwrap(), &target).unwrap();
+    assert_eq!(saved.pieces.as_slice(), pack(&[false; 3]));
+    assert_eq!(saved.files, [(0, -1), (0, -1)]);
+
+    // A file from a run keeps its pieces and gets the new selection.
+    write_data(out.path());
+    initial_pieces(
+        &session(&config),
+        false,
+        &Semaphore::new(1),
+        std::future::pending(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(load_selection(&target, 2), None);
+    target.save_selection(&selection, 2, 3).await.unwrap();
+    let saved = decode(&std::fs::read(target.path()).unwrap(), &target).unwrap();
+    assert_eq!(saved.pieces.as_slice(), pack(&[true; 3]));
+    assert_eq!(saved.priorities, [0, 1]);
+    assert_eq!(load_selection(&target, 2), Some(selection));
+    // All normal is stored as none.
+    target
+        .save_selection(&FileSelection::all_normal(2), 2, 3)
+        .await
+        .unwrap();
+    assert_eq!(load_selection(&target, 2), None);
+}

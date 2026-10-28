@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 
 mod check;
 mod choker;
@@ -136,8 +136,8 @@ impl Session {
 }
 
 /// The selection a run of a torrent of `file_count` files starts with:
-/// the one in `options`, else the one in the resume file, else all
-/// `Normal`.
+/// the one in `options`, else the one made of the files picked on the
+/// command line, else the one in the resume file, else all `Normal`.
 pub(crate) fn initial_selection(
     options: &StartOptions,
     resume: Option<&Target>,
@@ -146,8 +146,32 @@ pub(crate) fn initial_selection(
     options
         .selection
         .clone()
+        .or_else(|| {
+            options
+                .picks
+                .as_ref()
+                .and_then(|picks| picked(picks, file_count))
+        })
         .or_else(|| resume.and_then(|target| resume::load_selection(target, file_count)))
         .unwrap_or_default()
+}
+
+/// The selection that downloads the files `picks` names of a torrent of
+/// `file_count` files. A number past the last file is warned of; if none
+/// is left, so is that every file is downloaded, and there is no selection.
+fn picked(picks: &selection::FilePicks, file_count: usize) -> Option<FileSelection> {
+    if picks.last() > file_count {
+        warn!(
+            "--select-file names file {}, but the torrent has {file_count}",
+            picks.last()
+        );
+    }
+    let selection = picks.selection(file_count);
+    if selection.is_all_skipped() {
+        warn!("--select-file names none of the files; downloading all of them");
+        return None;
+    }
+    Some(selection)
 }
 
 /// Downloads the torrent at `torrent_path` and seeds it for as long as the
@@ -468,5 +492,31 @@ mod tests {
         assert!(both.reached(200, 100, Duration::ZERO));
         assert!(both.reached(0, 100, minute));
         assert!(!both.reached(199, 100, minute / 2));
+    }
+
+    #[test]
+    fn the_selection_comes_from_the_options_then_the_picks() {
+        use crate::selection::Priority::{Normal, Skip};
+        let picks = selection::FilePicks::parse("2").unwrap();
+        let options = StartOptions {
+            picks: Some(picks),
+            ..StartOptions::default()
+        };
+        assert_eq!(
+            initial_selection(&options, None, 3).priorities(),
+            [Skip, Normal, Skip]
+        );
+        // Picks past the last file leave nothing to download, so all of it.
+        let none = StartOptions {
+            picks: Some(selection::FilePicks::parse("7").unwrap()),
+            ..StartOptions::default()
+        };
+        assert!(initial_selection(&none, None, 3).is_empty());
+        // An explicit selection wins.
+        let both = StartOptions {
+            selection: Some(FileSelection::all_normal(3)),
+            ..options
+        };
+        assert!(initial_selection(&both, None, 3).is_all_normal());
     }
 }

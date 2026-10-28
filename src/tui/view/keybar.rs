@@ -22,8 +22,10 @@ const KEYS: &[(&str, &str)] = &[
     ("q", "quit"),
 ];
 
-/// Keys shown after them where there is room, after `p`, `x` and `r` for the
-/// selected torrent.
+/// Keys shown after them where there is room, after the file keys while the
+/// Files tab has the focus, and `p`, `x` and `r` for the selected torrent.
+const FILE_KEYS: &[(&str, &str)] = &[("space", "skip"), ("+ -", "priority")];
+
 const MORE_KEYS: &[(&str, &str)] = &[("a", "add"), ("d u", "limits"), ("m", "mouse")];
 
 pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
@@ -50,7 +52,18 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
         let pause = app.pause_command(snapshot).map(|(_, word)| ("p", word));
         let remove = app.removable(snapshot).map(|_| ("x", "remove"));
         let recheck = app.recheck_command(snapshot).map(|_| ("r", "recheck"));
-        for pair in pause.iter().chain(&remove).chain(&recheck).chain(MORE_KEYS) {
+        let files: &[(&str, &str)] = if app.choosing_files(snapshot) {
+            FILE_KEYS
+        } else {
+            &[]
+        };
+        let pairs = files
+            .iter()
+            .chain(&pause)
+            .chain(&remove)
+            .chain(&recheck)
+            .chain(MORE_KEYS);
+        for pair in pairs {
             let more: Vec<Span> = [Span::raw("  ")]
                 .into_iter()
                 .chain(keys(theme, std::slice::from_ref(pair)))

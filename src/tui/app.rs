@@ -5,6 +5,7 @@ use super::Command;
 use super::snapshot::{Detail, Snapshot, TorrentSnapshot};
 use super::theme::Theme;
 use super::view::Areas;
+use crate::selection::Priority;
 use crate::source::Source;
 use crate::stats::TorrentState;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -207,6 +208,8 @@ pub struct App {
     pub peer: Option<SocketAddr>,
     /// Its row, for the cursor to stay near once the peer has gone.
     peer_row: usize,
+    /// The file under the Files tab's cursor, by its place in the torrent.
+    pub file: usize,
     pub show_log: bool,
     pub sort: Sort,
     pub reverse: bool,
@@ -238,6 +241,7 @@ impl App {
             detail_scroll: 0,
             peer: None,
             peer_row: 0,
+            file: 0,
             show_log: true,
             sort: Sort::Added,
             reverse: false,
@@ -317,6 +321,7 @@ impl App {
         self.detail_scroll = 0;
         self.peer = None;
         self.peer_row = 0;
+        self.file = 0;
     }
 
     /// Moves the selection `by` rows down the table (up if negative).
@@ -405,13 +410,8 @@ impl App {
         let rows = match self.tab {
             // The DHT, PeX and incoming rows, after a blank one.
             Tab::Trackers => detail.map_or(0, |detail| detail.trackers.len() + 4),
-            Tab::Files => self
-                .selected
-                .and_then(|hash| snapshot.torrent(hash))
-                .and_then(|torrent| torrent.layout.as_ref())
-                .map_or(0, |layout| layout.files.len()),
-            // The Peers tab moves its cursor instead.
-            Tab::Peers | Tab::Pieces | Tab::Info => 0,
+            // The Peers and Files tabs move their cursors instead.
+            Tab::Peers | Tab::Files | Tab::Pieces | Tab::Info => 0,
         };
         self.detail_scroll = self
             .detail_scroll
@@ -419,10 +419,66 @@ impl App {
             .min(rows.saturating_sub(1));
     }
 
-    /// Moves the peer cursor on the Peers tab, and scrolls the others.
+    /// Moves the file cursor `by` rows, to a file the selected torrent has.
+    fn move_file(&mut self, snapshot: &Snapshot, by: isize) {
+        let files = self
+            .selected
+            .and_then(|hash| snapshot.torrent(hash))
+            .and_then(|torrent| torrent.layout.as_ref())
+            .map_or(0, |layout| layout.files.len());
+        self.file = self
+            .file
+            .saturating_add_signed(by)
+            .min(files.saturating_sub(1));
+    }
+
+    /// What `space`, `+` and `-` do: change the priority of the file under
+    /// the cursor of the Files tab, when it has the focus, by `change`.
+    /// `None` when they do nothing: another tab or panel, no files known,
+    /// a torrent pausing or being removed, or a priority that stays.
+    pub fn priority_command(
+        &self,
+        snapshot: &Snapshot,
+        change: fn(Priority) -> Priority,
+    ) -> Option<Command> {
+        if self.focus != Focus::Detail || self.tab != Tab::Files {
+            return None;
+        }
+        let torrent = snapshot.torrent(self.selected?)?;
+        if matches!(
+            torrent.state,
+            TorrentState::Pausing | TorrentState::Removing
+        ) {
+            return None;
+        }
+        let files = torrent.layout.as_ref()?.files.len();
+        let file = self.file.min(files.checked_sub(1)?);
+        let mut priorities = torrent.priorities.clone();
+        priorities.resize(files, Priority::Normal);
+        let changed = change(priorities[file]);
+        if changed == priorities[file] {
+            return None;
+        }
+        priorities[file] = changed;
+        Some(Command::SetPriorities {
+            info_hash: torrent.info_hash,
+            priorities,
+        })
+    }
+
+    /// Whether the keys of `priority_command` are live: the Files tab has the
+    /// focus and shows files.
+    pub fn choosing_files(&self, snapshot: &Snapshot) -> bool {
+        self.priority_command(snapshot, Priority::toggled).is_some()
+    }
+
+    /// Moves the peer cursor on the Peers tab, the file cursor on the Files
+    /// tab, and scrolls the others.
     fn move_in_detail(&mut self, snapshot: &Snapshot, by: isize) {
         if self.tab == Tab::Peers {
             self.move_peer(snapshot, by);
+        } else if self.tab == Tab::Files {
+            self.move_file(snapshot, by);
         } else {
             self.scroll_detail(snapshot, by);
         }
@@ -508,6 +564,21 @@ impl App {
             }
             KeyCode::Char('r') => {
                 if let Some(command) = self.recheck_command(snapshot) {
+                    return Action::Command(command);
+                }
+            }
+            KeyCode::Char(' ') => {
+                if let Some(command) = self.priority_command(snapshot, Priority::toggled) {
+                    return Action::Command(command);
+                }
+            }
+            KeyCode::Char('+' | '=') => {
+                if let Some(command) = self.priority_command(snapshot, Priority::raised) {
+                    return Action::Command(command);
+                }
+            }
+            KeyCode::Char('-') => {
+                if let Some(command) = self.priority_command(snapshot, Priority::lowered) {
                     return Action::Command(command);
                 }
             }

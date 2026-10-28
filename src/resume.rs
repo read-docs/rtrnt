@@ -90,6 +90,44 @@ impl Target {
     }
 }
 
+impl Target {
+    /// Saves `selection` in the resume file of a torrent that is not
+    /// running, for the next run to take, leaving the rest of the file as
+    /// it is. Without a usable file (none, or for another torrent or
+    /// download directory), one is made that vouches for no piece, so the
+    /// next run hashes what is on disk. The file is replaced atomically.
+    pub async fn save_selection(
+        &self,
+        selection: &FileSelection,
+        file_count: usize,
+        num_pieces: usize,
+    ) -> Result<()> {
+        let (target, selection) = (self.clone(), selection.clone());
+        tokio::task::spawn_blocking(move || {
+            let kept = std::fs::read(&target.path)
+                .ok()
+                .and_then(|data| parse(&data, &target, file_count, num_pieces).ok());
+            let priorities = priorities_to_save(&selection);
+            let saved = match kept {
+                Some(saved) => Saved {
+                    priorities,
+                    ..saved
+                },
+                None => Saved {
+                    version: VERSION,
+                    info_hash: ByteBuf::from(target.info_hash.to_vec()),
+                    output_dir: ByteBuf::from(target.output_dir.as_os_str().as_encoded_bytes()),
+                    pieces: ByteBuf::from(pack(&vec![false; num_pieces])),
+                    files: vec![(0, -1); file_count],
+                    priorities,
+                },
+            };
+            write_atomically(&target.path, &serde_bencode::to_bytes(&saved)?)
+        })
+        .await?
+    }
+}
+
 /// Where resume files go when no directory is given: `resume` in the state
 /// directory (see `state::state_dir`), so `$XDG_STATE_HOME/rtrnt/resume` or
 /// `~/.local/state/rtrnt/resume`. `None` if neither directory is known.

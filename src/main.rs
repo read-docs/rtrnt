@@ -184,7 +184,8 @@ async fn main() -> anyhow::Result<ExitCode> {
         } else {
             Recheck::No
         },
-        selection: None,
+        picks: args.select_file,
+        ..StartOptions::default()
     };
     manager.start(sources, options).await;
     let (commands, commands_rx) = mpsc::unbounded_channel();

@@ -296,6 +296,52 @@ fn files_tab_counts_pieces_pro_rata() {
 }
 
 #[test]
+fn files_tab_shows_priorities_the_cursor_and_the_keys() {
+    use crate::selection::Priority;
+    use crate::tui::app::{Focus, Tab};
+    let mut snapshot = demo::fixture();
+    snapshot.torrents[0].layout = Some(crate::stats::Layout {
+        size: 640 * 1024,
+        piece_length: 256 * 1024,
+        pieces: 3,
+        private: false,
+        files: vec![
+            ("dir/a.bin".into(), 384 * 1024),
+            ("dir/b.bin".into(), 256 * 1024),
+        ],
+    });
+    snapshot.torrents[0].priorities = vec![Priority::High, Priority::Skip];
+    let mut app = app(&snapshot);
+    app.tab = Tab::Files;
+    let buffer = render(100, 32, &snapshot, &app);
+    let lines = text(&buffer, buffer.area);
+    assert!(lines[10].contains(" Path ") && lines[10].contains(" Get "));
+    assert!(lines[11].starts_with("│ dir/a.bin "), "{}", lines[11]);
+    assert!(lines[11].contains(" high "), "{}", lines[11]);
+    assert!(lines[12].contains(" skip "), "{}", lines[12]);
+    // The table has the focus, so no cursor and no file keys.
+    assert!(!lines[11].starts_with("│▌"));
+    assert!(!lines[31].contains("space skip"), "{}", lines[31]);
+
+    app.focus = Focus::Detail;
+    app.file = 1;
+    let buffer = render(100, 32, &snapshot, &app);
+    let lines = text(&buffer, buffer.area);
+    assert!(lines[12].starts_with("│▌dir/b.bin "), "{}", lines[12]);
+    assert_eq!(buffer[(10, 12)].bg, Theme::default().selection());
+    assert_ne!(buffer[(10, 11)].bg, Theme::default().selection());
+    assert!(
+        lines[31].contains("q quit  space skip  + - priority"),
+        "{}",
+        lines[31]
+    );
+    // A skipped file's name is dimmed.
+    app.file = 0;
+    let buffer = render(100, 32, &snapshot, &app);
+    assert_eq!(buffer[(3, 12)].fg, Theme::default().dim());
+}
+
+#[test]
 fn info_tab_lists_the_facts() {
     let mut snapshot = demo::fixture();
     snapshot.torrents[0].downloaded = 4 * 1024 * 1024;

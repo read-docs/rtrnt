@@ -17,6 +17,10 @@ const KEYS: &[(&str, &str)] = &[
     ("/", "filter torrents by name; esc clears it"),
     ("p  x", "pause or resume the selected torrent; remove it"),
     ("r", "hash the selected torrent's files again"),
+    (
+        "space + -",
+        "on the Files tab: skip a file, raise or lower it",
+    ),
     ("a", "add a .torrent file or a magnet link"),
     ("d  u", "set the download or upload limit, in KiB/s"),
     ("m", "turn the mouse off to select text, and on again"),

@@ -1,14 +1,19 @@
 use rtrnt::download::{download_from_peers, download_metainfo};
-use rtrnt::manager::StartOptions;
-use rtrnt::selection::{FileSelection, Priority};
+use rtrnt::manager::{Command, Manager, StartOptions};
+use rtrnt::peer::PeerMessage;
+use rtrnt::selection::{FilePicks, FileSelection, Priority};
+use rtrnt::source::Source;
+use rtrnt::stats::TorrentState;
 use rtrnt::storage::Storage;
 use rtrnt::torrent::{FileInfo, Info, Metainfo, TorrentFile};
 use serde_bytes::ByteBuf;
 use sha1::Digest;
 use std::future::pending;
-use std::sync::Arc;
+use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::{mpsc, watch};
 
 use crate::common::*;
 
@@ -179,4 +184,129 @@ async fn a_skipped_file_sharing_a_piece_is_created_but_not_filled() {
     assert_eq!(a[piece..], data[piece..40_000]);
     let b = std::fs::read(dir.join("b.bin")).unwrap();
     assert_eq!(b, data[40_000..]);
+}
+
+/// Waits for the run that a command just started to end: the manager is
+/// not idle while it goes.
+async fn next_run_ends(idle: &mut watch::Receiver<bool>) {
+    tokio::time::timeout(Duration::from_secs(10), idle.wait_for(|&idle| !idle))
+        .await
+        .expect("the run did not start")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), idle.wait_for(|&idle| idle))
+        .await
+        .expect("the run did not end")
+        .unwrap();
+}
+
+/// `--select-file 1,3` leaves the middle file out and the run Done; a
+/// resume keeps the choice, with nothing fetched; choosing the file later
+/// (on the ended torrent) and running it again fetches just that piece.
+#[tokio::test]
+async fn the_choice_of_files_is_kept_across_runs_and_can_change() {
+    init_tracing();
+    let (data, mut metainfo) = three_files();
+    let info_hash = metainfo.info_hash;
+    let num_pieces = metainfo.torrent.num_pieces();
+    let data = Arc::new(data);
+
+    // Serves every connection, and notes which pieces were asked for.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seeder_addr = listener.local_addr().unwrap();
+    let requested = Arc::new(Mutex::new(Vec::new()));
+    {
+        let (data, requested) = (Arc::clone(&data), Arc::clone(&requested));
+        tokio::spawn(async move {
+            loop {
+                let mut socket = accept_leecher(&listener, info_hash, num_pieces).await;
+                let (data, requested) = (Arc::clone(&data), Arc::clone(&requested));
+                tokio::spawn(async move {
+                    send(&mut socket, PeerMessage::Unchoke).await;
+                    while let Some(message) = read_message(&mut socket).await {
+                        if let PeerMessage::Request {
+                            index,
+                            begin,
+                            length,
+                        } = message
+                        {
+                            requested.lock().unwrap().push(index);
+                            send(&mut socket, piece(&data, index, begin, length)).await;
+                        }
+                    }
+                });
+            }
+        });
+    }
+    let (tracker_url, _queries) = mock_tracker(vec![seeder_addr]).await;
+    metainfo.torrent.announce = Some(tracker_url);
+
+    let out = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let path = out.path().join("sel.torrent");
+    std::fs::write(&path, serde_bencode::to_bytes(&metainfo.torrent).unwrap()).unwrap();
+
+    let client = Arc::new(client(resume_config(out.path(), state.path())));
+    let mut manager = Manager::new(Arc::clone(&client), pending::<()>);
+    let mut idle = manager.idle();
+    let options = StartOptions {
+        picks: Some(FilePicks::parse("1,3").unwrap()),
+        ..StartOptions::default()
+    };
+    manager.start(vec![Source::File(path)], options).await;
+    let (commands, commands_rx) = mpsc::unbounded_channel();
+    let run = tokio::spawn(manager.run(commands_rx));
+    tokio::time::timeout(Duration::from_secs(30), idle.wait_for(|&idle| idle))
+        .await
+        .expect("the first run did not end")
+        .unwrap();
+
+    let root = out.path().join("sel");
+    let len = PIECE_LENGTH as usize;
+    let state_of = || client.stats().torrents()[0].state();
+    assert_eq!(state_of(), TorrentState::Done);
+    assert_eq!(std::fs::read(root.join("x")).unwrap(), data[..len]);
+    assert_eq!(std::fs::read(root.join("z")).unwrap(), data[2 * len..]);
+    assert!(!root.join("y").exists(), "the skipped file was created");
+    let wanted = client.stats().torrents()[0].wanted();
+    assert_eq!(wanted, Some(2 * PIECE_LENGTH));
+
+    // A resume goes by the resume file's choice: still no middle file, and
+    // nothing asked of the seed.
+    let asked = requested.lock().unwrap().len();
+    commands.send(Command::Resume(info_hash)).unwrap();
+    next_run_ends(&mut idle).await;
+    assert_eq!(state_of(), TorrentState::Done);
+    assert!(!root.join("y").exists(), "the choice was forgotten");
+    assert_eq!(requested.lock().unwrap().len(), asked);
+
+    // Choosing every file, then running it again, fetches the middle one.
+    commands
+        .send(Command::SetPriorities {
+            info_hash,
+            priorities: vec![Priority::Normal; 3],
+        })
+        .unwrap();
+    commands.send(Command::Resume(info_hash)).unwrap();
+    next_run_ends(&mut idle).await;
+    assert_eq!(state_of(), TorrentState::Done);
+    assert_eq!(std::fs::read(root.join("y")).unwrap(), data[len..2 * len]);
+    // The first run asked for pieces 0 and 2 only, the last for piece 1.
+    let pieces = requested.lock().unwrap().clone();
+    let (first, last) = pieces.split_at(asked);
+    let distinct = |pieces: &[u32]| {
+        let mut pieces = pieces.to_vec();
+        pieces.sort_unstable();
+        pieces.dedup();
+        pieces
+    };
+    assert_eq!(distinct(first), [0, 2]);
+    assert_eq!(distinct(last), [1]);
+
+    drop(commands);
+    let exit = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("the session did not end")
+        .unwrap()
+        .unwrap();
+    assert_eq!(exit, ExitCode::SUCCESS);
 }

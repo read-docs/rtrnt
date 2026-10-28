@@ -1,6 +1,7 @@
 use super::*;
 use clap::CommandFactory;
 use rtrnt::peer;
+use rtrnt::selection::Priority;
 use std::path::Path;
 
 #[test]
@@ -207,4 +208,29 @@ fn the_session_follows_the_ui_unless_told_otherwise() {
     assert!(!args.use_session(Some(true), true));
     let args = Args::try_parse_from(["rtrnt", "a.torrent", "--check"]).unwrap();
     assert!(!args.use_session(Some(true), true));
+}
+
+#[test]
+fn select_file_takes_numbers_and_ranges() {
+    let args = Args::try_parse_from(["rtrnt", "x.torrent"]).unwrap();
+    assert_eq!(args.select_file, None);
+    let args = Args::try_parse_from(["rtrnt", "x.torrent", "--select-file", "1,3-5"]).unwrap();
+    let picks = args.select_file.unwrap();
+    assert_eq!(picks.last(), 5);
+    assert_eq!(
+        picks.selection(5).priorities(),
+        [
+            Priority::Normal,
+            Priority::Skip,
+            Priority::Normal,
+            Priority::Normal,
+            Priority::Normal
+        ]
+    );
+    for bad in ["0", "3-1", "x", ""] {
+        assert!(
+            Args::try_parse_from(["rtrnt", "x.torrent", "--select-file", bad]).is_err(),
+            "{bad:?}"
+        );
+    }
 }

@@ -397,7 +397,7 @@ fn fold_case(path: &Path) -> PathBuf {
 /// Where each file of the torrent goes: `out_dir/name` for a single file,
 /// under `out_dir/name/` for several. Fails if two files share a path.
 /// Nothing is touched on disk.
-fn layout(info: &Info, out_dir: &Path) -> Result<Vec<FileSpan>> {
+pub(crate) fn layout(info: &Info, out_dir: &Path) -> Result<Vec<FileSpan>> {
     check_component(&info.name)?;
     let root = out_dir.join(&info.name);
 

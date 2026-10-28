@@ -5,7 +5,7 @@ use crate::client::Client;
 use crate::download::{self, CheckedOnly, Interrupted};
 use crate::magnet::{self, FetchInterrupted, MagnetLink};
 use crate::resume;
-use crate::selection::FileSelection;
+use crate::selection::{FilePicks, FileSelection, Priority};
 use crate::session::{SavedLimits, SavedSession, SavedTorrent, SessionStore};
 use crate::source::Source;
 use crate::stats::{TorrentState, TorrentStats};
@@ -40,6 +40,13 @@ pub enum Command {
     /// resume file: a running one stops and carries on, a paused one stays
     /// paused, and one that has ended runs again.
     Recheck([u8; 20]),
+    /// Download the files of the torrent with this info hash by these
+    /// priorities, one per file: a running torrent restarts to do it, and
+    /// one that is paused or has ended keeps them for when it runs again.
+    SetPriorities {
+        info_hash: [u8; 20],
+        priorities: Vec<Priority>,
+    },
     /// Drop the torrent with this info hash from the session, stopping it
     /// first if it runs, and with `delete` its files and resume file too.
     Remove { info_hash: [u8; 20], delete: bool },
@@ -62,6 +69,10 @@ pub struct StartOptions {
     /// Which files to download and which first, or `None` to go by the
     /// resume file, and failing that to download every file.
     pub selection: Option<FileSelection>,
+    /// Files picked on the command line, for a torrent run the first time:
+    /// they take the place of `selection` once the torrent's files are
+    /// known (a magnet link's, not until its metadata arrives).
+    pub picks: Option<FilePicks>,
 }
 
 /// Whether, and what next, a run hashes the data on disk, ignoring the
@@ -306,6 +317,14 @@ where
         );
         if let Torrent::File(metainfo) = torrent {
             stats.set_torrent(&metainfo.torrent);
+            let target = resume::Target::new(self.client.config(), torrent.info_hash());
+            let files = crate::selection::file_count(&metainfo.torrent.info);
+            if let Some(selection) =
+                target.and_then(|target| resume::load_selection(&target, files))
+                && let Ok(wanted) = crate::selection::wanted_of(&metainfo.torrent, &selection)
+            {
+                stats.set_selection(selection.for_files(files), wanted);
+            }
         }
         stats.set_state(TorrentState::Paused);
     }
@@ -611,7 +630,7 @@ where
         }
         let recheck = |recheck| StartOptions {
             recheck,
-            selection: None,
+            ..StartOptions::default()
         };
         match self.entries[index].state {
             State::Running { .. } => self.restart(info_hash, recheck(Recheck::ThenRun)),
@@ -624,6 +643,118 @@ where
                     .await;
             }
         }
+    }
+
+    /// Has the torrent with info hash `info_hash` download its files by
+    /// `priorities`. A running torrent is restarted with them, which hashes
+    /// nothing when its resume file is good; one already restarting takes
+    /// them in place of the options it had; a paused one or one that has
+    /// ended saves them in its resume file, for its next run. One being
+    /// removed or pausing is left alone, and so is one whose files are not
+    /// known yet (a magnet link without metadata), or that lists another
+    /// number of files; a notice says why.
+    async fn set_priorities(&mut self, info_hash: [u8; 20], priorities: Vec<Priority>) {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.info_hash == info_hash)
+        else {
+            return;
+        };
+        let name = stats_of(&self.client, info_hash, |_| true)
+            .map_or_else(|| self.entries[index].source.label(), |stats| stats.name());
+        let selection = FileSelection::new(priorities);
+        let refused = match &mut self.entries[index].state {
+            State::Removing { .. } => Some("being removed, no files to choose"),
+            State::Restarting { then, .. } => {
+                then.selection = Some(selection);
+                return;
+            }
+            State::Running { stop } if *stop.borrow() => {
+                Some("pausing, choose the files once it has stopped")
+            }
+            State::Running { .. } => {
+                let files = stats_of(&self.client, info_hash, |_| true)
+                    .and_then(|stats| stats.layout().map(|layout| layout.files.len()));
+                match files {
+                    None => Some("no files to choose yet"),
+                    Some(files) if files != selection.priorities().len() => {
+                        Some("that lists the wrong number of files")
+                    }
+                    Some(_) => None,
+                }
+            }
+            State::Paused | State::Ended(_) => {
+                let ended = matches!(self.entries[index].state, State::Ended(_));
+                match self.keep_selection(index, &selection).await {
+                    Ok(()) => {
+                        let later = if ended {
+                            "press p to download them"
+                        } else {
+                            "they apply once it resumes"
+                        };
+                        self.client
+                            .stats()
+                            .notice(format!("{name}: file choice saved, {later}"));
+                    }
+                    Err(why) => self.client.stats().notice(format!("{name}: {why}")),
+                }
+                return;
+            }
+        };
+        if let Some(why) = refused {
+            self.client.stats().notice(format!("{name}: {why}"));
+            return;
+        }
+        let then = StartOptions {
+            selection: Some(selection),
+            ..StartOptions::default()
+        };
+        self.restart(info_hash, then);
+    }
+
+    /// Saves `selection` in the resume file of the torrent of entry
+    /// `index`, which is not running, and shows it in the torrent's row.
+    /// Fails with what to tell the user.
+    async fn keep_selection(
+        &self,
+        index: usize,
+        selection: &FileSelection,
+    ) -> std::result::Result<(), String> {
+        let entry = &self.entries[index];
+        let torrent = match &entry.source {
+            Source::File(path) => torrent::load_metainfo(path)
+                .await
+                .ok()
+                .filter(|metainfo| metainfo.info_hash == entry.info_hash)
+                .map(|metainfo| metainfo.torrent),
+            Source::Magnet(link) => {
+                match magnet::saved_torrent(link, &self.client.config().output_dir).await {
+                    Some(path) => torrent::load_file(&path)
+                        .await
+                        .ok()
+                        .map(|(torrent, _)| torrent),
+                    None => None,
+                }
+            }
+        };
+        let torrent = torrent.ok_or("no files to choose yet")?;
+        let files = crate::selection::file_count(&torrent.info);
+        if selection.priorities().len() != files {
+            return Err("that lists the wrong number of files".into());
+        }
+        let wanted = crate::selection::wanted_of(&torrent, selection)
+            .map_err(|e| format!("cannot choose the files: {e:#}"))?;
+        let target = resume::Target::new(self.client.config(), entry.info_hash)
+            .ok_or("no state directory, so the choice cannot be kept")?;
+        target
+            .save_selection(selection, files, torrent.num_pieces())
+            .await
+            .map_err(|e| format!("cannot save the choice of files: {e:#}"))?;
+        if let Some(stats) = stats_of(&self.client, entry.info_hash, |_| true) {
+            stats.set_selection(selection.for_files(files), wanted);
+        }
+        Ok(())
     }
 
     /// Starts the paused or ended torrent with info hash `info_hash` again,
@@ -831,6 +962,10 @@ where
             Command::Pause(info_hash) => self.pause(info_hash),
             Command::Resume(info_hash) => self.resume(info_hash).await,
             Command::Recheck(info_hash) => self.recheck(info_hash).await,
+            Command::SetPriorities {
+                info_hash,
+                priorities,
+            } => self.set_priorities(info_hash, priorities).await,
             Command::Remove { info_hash, delete } => self.remove(info_hash, delete).await,
             Command::Add(source) => self.add(source).await,
             // The feed stops the torrents itself.
