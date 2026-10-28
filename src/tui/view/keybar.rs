@@ -22,7 +22,7 @@ const KEYS: &[(&str, &str)] = &[
     ("q", "quit"),
 ];
 
-/// Keys shown after them where there is room, after `p` and `x` for the
+/// Keys shown after them where there is room, after `p`, `x` and `r` for the
 /// selected torrent.
 const MORE_KEYS: &[(&str, &str)] = &[("a", "add"), ("d u", "limits"), ("m", "mouse")];
 
@@ -49,7 +49,8 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
         let width = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>();
         let pause = app.pause_command(snapshot).map(|(_, word)| ("p", word));
         let remove = app.removable(snapshot).map(|_| ("x", "remove"));
-        for pair in pause.iter().chain(&remove).chain(MORE_KEYS) {
+        let recheck = app.recheck_command(snapshot).map(|_| ("r", "recheck"));
+        for pair in pause.iter().chain(&remove).chain(&recheck).chain(MORE_KEYS) {
             let more: Vec<Span> = [Span::raw("  ")]
                 .into_iter()
                 .chain(keys(theme, std::slice::from_ref(pair)))

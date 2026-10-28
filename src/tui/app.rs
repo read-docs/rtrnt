@@ -292,6 +292,16 @@ impl App {
         }
     }
 
+    /// What `r` does: recheck the selected torrent, unless it is pausing or
+    /// being removed.
+    pub fn recheck_command(&self, snapshot: &Snapshot) -> Option<Command> {
+        let torrent = snapshot.torrent(self.selected?)?;
+        match torrent.state {
+            TorrentState::Pausing | TorrentState::Removing => None,
+            _ => Some(Command::Recheck(torrent.info_hash)),
+        }
+    }
+
     /// The selected torrent, if `x` can remove it: not while it is being
     /// removed already.
     pub fn removable<'a>(&self, snapshot: &'a Snapshot) -> Option<&'a TorrentSnapshot> {
@@ -493,6 +503,11 @@ impl App {
             KeyCode::Char('l') => self.show_log = !self.show_log,
             KeyCode::Char('p') => {
                 if let Some((command, _)) = self.pause_command(snapshot) {
+                    return Action::Command(command);
+                }
+            }
+            KeyCode::Char('r') => {
+                if let Some(command) = self.recheck_command(snapshot) {
                     return Action::Command(command);
                 }
             }

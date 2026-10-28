@@ -8,6 +8,7 @@ mod magnet;
 mod pause;
 mod pex;
 mod rate_limit;
+mod recheck;
 mod remove;
 mod resume;
 mod seeding;

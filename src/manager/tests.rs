@@ -543,7 +543,7 @@ async fn a_restarted_torrent_runs_again_with_the_new_options() {
     assert!(
         matches!(&manager.entries()[0].state, State::Restarting { stop, then } if *stop.borrow() && *then == RECHECK)
     );
-    assert_eq!(stats.state(), TorrentState::Pausing);
+    assert_eq!(stats.state(), TorrentState::QueuedForChecking);
     // Asking again, or to pause, does not stop it twice.
     manager.restart(hash, StartOptions::default());
     assert!(
@@ -626,4 +626,85 @@ async fn a_torrent_only_checked_ends_paused() {
         manager.run(closed()).await.unwrap(),
         ExitCode::from(EXIT_INTERRUPTED)
     );
+}
+
+#[tokio::test]
+async fn a_recheck_restarts_a_running_torrent_and_shows_it_at_once() {
+    let client = client();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, recording(&seen));
+    let hash = [UNTIL_STOPPED; 20];
+    manager
+        .start(vec![magnet(UNTIL_STOPPED)], StartOptions::default())
+        .await;
+    let stats = client.stats().add_torrent(hash, "t", ".".as_ref());
+
+    manager.command(Command::Recheck(hash)).await;
+    assert!(
+        matches!(&manager.entries()[0].state, State::Restarting { then, .. } if then.recheck == Recheck::ThenRun)
+    );
+    assert_eq!(stats.state(), TorrentState::QueuedForChecking);
+    // Again, while it restarts: a notice, no second stop.
+    manager.command(Command::Recheck(hash)).await;
+    let (_, notice) = client.stats().last_notice().unwrap();
+    assert!(notice.ends_with("already restarting"), "{notice}");
+
+    let joined = manager.tasks.join_next_with_id().await.unwrap();
+    manager.ended(joined).await;
+    assert_eq!(*seen.lock().unwrap(), [StartOptions::default(), RECHECK]);
+}
+
+#[tokio::test]
+async fn a_torrent_being_removed_is_not_rechecked() {
+    let client = client();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, counting(&runs));
+    let hash = [UNTIL_STOPPED; 20];
+    manager
+        .start(vec![magnet(UNTIL_STOPPED)], StartOptions::default())
+        .await;
+    manager
+        .command(Command::Remove {
+            info_hash: hash,
+            delete: false,
+        })
+        .await;
+    manager.command(Command::Recheck(hash)).await;
+    let (_, notice) = client.stats().last_notice().unwrap();
+    assert!(
+        notice.ends_with("being removed, nothing to check"),
+        "{notice}"
+    );
+    assert!(matches!(manager.entries()[0].state, State::Removing { .. }));
+    manager.drive(closed()).await;
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn a_magnet_link_without_metadata_is_not_rechecked() {
+    let client = client();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, counting(&runs));
+    let hash = [UNTIL_STOPPED; 20];
+    manager
+        .start(vec![magnet(UNTIL_STOPPED)], StartOptions::default())
+        .await;
+    let stats = client.stats().add_torrent(hash, "t", ".".as_ref());
+    stats.set_state(TorrentState::FetchingMetadata {
+        pieces: 0,
+        total: 0,
+        peers: 0,
+    });
+    manager.command(Command::Recheck(hash)).await;
+    assert!(matches!(manager.entries()[0].state, State::Running { .. }));
+
+    // Paused, with no saved torrent to load.
+    manager.command(Command::Pause(hash)).await;
+    let joined = manager.tasks.join_next_with_id().await.unwrap();
+    manager.ended(joined).await;
+    manager.command(Command::Recheck(hash)).await;
+    let (_, notice) = client.stats().last_notice().unwrap();
+    assert!(notice.ends_with("nothing to check yet"), "{notice}");
+    assert!(matches!(manager.entries()[0].state, State::Paused));
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
 }

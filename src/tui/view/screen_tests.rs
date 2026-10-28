@@ -435,7 +435,7 @@ fn a_paused_torrent_says_so_and_p_resumes_it() {
     let lines = text(&buffer, buffer.area);
     assert!(lines.iter().any(|line| line.contains("paused")));
     assert!(
-        lines[31].contains("  q quit  p resume  x remove  a add  d u limits"),
+        lines[31].contains("  q quit  p resume  x remove  r recheck  a add  d u limits"),
         "{}",
         lines[31]
     );

@@ -34,6 +34,10 @@ pub enum Command {
     /// Start the paused or ended torrent with this info hash again, from
     /// where it got to.
     Resume([u8; 20]),
+    /// Hash the files of the torrent with this info hash again, ignoring its
+    /// resume file: a running one stops and carries on, a paused one stays
+    /// paused, and one that has ended runs again.
+    Recheck([u8; 20]),
     /// Drop the torrent with this info hash from the session, stopping it
     /// first if it runs, and with `delete` its files and resume file too.
     Remove { info_hash: [u8; 20], delete: bool },
@@ -397,13 +401,79 @@ where
             // Already asked to stop, by a pause.
             return;
         }
+        let rechecking = then.recheck != Recheck::No;
         entry.state = match std::mem::replace(&mut entry.state, State::Paused) {
             State::Running { stop } => State::Restarting { stop, then },
             state => state,
         };
         let running = |state: &TorrentState| !state.is_finished();
         if let Some(stats) = stats_of(&self.client, info_hash, running) {
-            stats.set_state(TorrentState::Pausing);
+            stats.set_state(if rechecking {
+                TorrentState::QueuedForChecking
+            } else {
+                TorrentState::Pausing
+            });
+        }
+    }
+
+    /// Hashes the files of the torrent with info hash `info_hash` again.
+    /// A running torrent is restarted to do it and carries on after; a
+    /// paused one is checked and stays paused; one that has ended is checked
+    /// and then runs, so a Done torrent found incomplete fetches the rest and
+    /// a failed one gets a fresh try. One being removed or already
+    /// restarting is left alone, and so is a magnet link with no metadata
+    /// yet; a notice says why.
+    async fn recheck(&mut self, info_hash: [u8; 20]) {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.info_hash == info_hash)
+        else {
+            return;
+        };
+        let name = || {
+            stats_of(&self.client, info_hash, |_| true)
+                .map_or_else(|| self.entries[index].source.label(), |stats| stats.name())
+        };
+        let refused = match &self.entries[index].state {
+            State::Removing { .. } => Some("being removed, nothing to check"),
+            State::Restarting { .. } => Some("already restarting"),
+            State::Running { stop } if *stop.borrow() => Some("pausing, nothing to check"),
+            State::Running { .. }
+                if matches!(
+                    stats_of(&self.client, info_hash, |_| true).map(|stats| stats.state()),
+                    Some(TorrentState::FetchingMetadata { .. })
+                ) =>
+            {
+                Some("nothing to check yet")
+            }
+            State::Paused | State::Ended(_) => match &self.entries[index].source {
+                Source::Magnet(link)
+                    if magnet::saved_torrent(link, &self.client.config().output_dir)
+                        .await
+                        .is_none() =>
+                {
+                    Some("nothing to check yet")
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(why) = refused {
+            self.client.stats().notice(format!("{}: {why}", name()));
+            return;
+        }
+        let recheck = |recheck| StartOptions { recheck };
+        match self.entries[index].state {
+            State::Running { .. } => self.restart(info_hash, recheck(Recheck::ThenRun)),
+            State::Paused => {
+                self.start_again(index, recheck(Recheck::ThenPause), "rechecking", "recheck")
+                    .await;
+            }
+            _ => {
+                self.start_again(index, recheck(Recheck::ThenRun), "rechecking", "recheck")
+                    .await;
+            }
         }
     }
 
@@ -587,6 +657,7 @@ where
             }
             Command::Pause(info_hash) => self.pause(info_hash),
             Command::Resume(info_hash) => self.resume(info_hash).await,
+            Command::Recheck(info_hash) => self.recheck(info_hash).await,
             Command::Remove { info_hash, delete } => self.remove(info_hash, delete).await,
             Command::Add(source) => self.add(source).await,
             // The feed stops the torrents itself.
