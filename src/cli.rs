@@ -114,21 +114,13 @@ impl Args {
     /// Whether the DHT was turned on or off on the command line: by the last
     /// of `--dht` and `--no-dht`, if either is given.
     pub(crate) fn dht(&self) -> Option<bool> {
-        match (self.dht, self.no_dht) {
-            (_, true) => Some(false),
-            (true, false) => Some(true),
-            (false, false) => None,
-        }
+        tri(self.dht, self.no_dht)
     }
 
     /// Whether the terminal UI was turned on or off on the command line, as
     /// for `dht`.
     pub(crate) fn tui(&self) -> Option<bool> {
-        match (self.tui, self.no_tui) {
-            (_, true) => Some(false),
-            (true, false) => Some(true),
-            (false, false) => None,
-        }
+        tri(self.tui, self.no_tui)
     }
 
     /// Whether the session was turned off on the command line: `Some(false)`
@@ -172,6 +164,17 @@ impl Args {
             ));
         }
         Ok(())
+    }
+}
+
+/// The setting a pair of on and off flags gives: `Some(false)` if `off` is
+/// set, else `Some(true)` if `on` is, else `None`. Each flag overrides the
+/// other, so at most one is set.
+fn tri(on: bool, off: bool) -> Option<bool> {
+    match (on, off) {
+        (_, true) => Some(false),
+        (true, false) => Some(true),
+        (false, false) => None,
     }
 }
 
