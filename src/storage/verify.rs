@@ -14,10 +14,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 const MAX_THREADS: usize = 4;
 
 /// Pieces that may hold data from an earlier run: those overlapping data
-/// that was on disk before `Storage::new` created and resized the files.
+/// that was on disk before `Storage::new` created and resized the files,
+/// and whose files are all there (a skipped file may not be).
 pub fn candidates(torrent: &TorrentFile, storage: &Storage) -> Result<Vec<usize>> {
     pieces_where(torrent, |offset, len| {
-        storage.may_hold_prior_data(offset, len)
+        storage.may_hold_prior_data(offset, len) && storage.files_exist(offset, len)
     })
 }
 

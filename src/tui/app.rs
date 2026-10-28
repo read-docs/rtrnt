@@ -101,7 +101,7 @@ impl Sort {
     }
 
     fn compare(self, a: &TorrentSnapshot, b: &TorrentSnapshot) -> Ordering {
-        let size = |t: &TorrentSnapshot| t.layout.as_ref().map(|layout| layout.size);
+        let size = |t: &TorrentSnapshot| t.size();
         match self {
             Sort::Added => a.order.cmp(&b.order),
             Sort::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),

@@ -62,7 +62,7 @@ A magnet link works wherever a .torrent file does. The torrent's metadata is fet
 
 Options: `-o, --output <DIR>` (default `.`), `--max-peers <N>` per torrent (default 30), `--max-connections <N>` across all torrents (default 200), `-p, --port <PORT>` to listen on for incoming peers over IPv4 and IPv6 (default 6881), `--no-dht` to find peers through trackers only (`--dht` turns the DHT back on if the config file turned it off), `--check` to verify a finished download (for a magnet link, against the saved `.torrent`), `--recheck` to ignore the resume files and hash the data already on disk, `--scrape` to print each tracker's seeder, leecher and completed counts without downloading (a magnet link's `tr` trackers), `--seed-ratio <RATIO>` and `--seed-time <MINUTES>` to keep seeding once the download is complete, until we have uploaded that many times the torrent's size or for that long, whichever comes first (both default to 0, which exits at completion), and `--max-download-rate <KIB/S>` and `--max-upload-rate <KIB/S>` to limit how fast piece data moves each way, in KiB per second across all peers of all torrents (both default to 0, unlimited). The limits count piece data only, not protocol messages or TCP/IP headers, so the traffic on the wire is slightly higher. Without `--no-dht`, peers are also looked up in the BitTorrent DHT (on UDP, same port), so torrents without trackers download too. Connected peers that support peer exchange also tell us about more peers, and we tell them about ours (never for private torrents). Set `RUST_LOG=debug` for per-peer logs.
 
-Progress is saved in a resume file per torrent, `$XDG_STATE_HOME/rtrnt/resume/<info hash>.resume` (`~/.local/state/rtrnt/resume/` when that is unset), every 30 seconds while pieces complete and at exit. A restart trusts the pieces it lists as long as the files still have the size and modification time they had then, so a clean exit rehashes nothing, and after a crash only the files written since the last save are hashed. `--recheck` ignores the file; `--check` never reads it.
+Progress is saved in a resume file per torrent, `$XDG_STATE_HOME/rtrnt/resume/<info hash>.resume` (`~/.local/state/rtrnt/resume/` when that is unset), every 30 seconds while pieces complete and at exit. A restart trusts the pieces it lists as long as the files still have the size and modification time they had then, so a clean exit rehashes nothing, and after a crash only the files written since the last save are hashed. `--recheck` ignores the file; `--check` never reads it. The file also keeps which files of the torrent are skipped or come first, once something sets that.
 
 ### Config file
 
@@ -147,6 +147,7 @@ src/
 │   └── pex.rs       # Peer exchange (BEP 11): telling peers about each other
 ├── rate_limit.rs  # Upload and download rate limits (shared token buckets)
 ├── resume.rs      # Resume files: what was on disk last time
+├── selection.rs   # Which files to download, and which first; piece priorities
 ├── source.rs      # What to download: a .torrent file or a magnet link
 ├── stats.rs       # Counters the engine publishes for the UI: torrents, peers, trackers
 ├── stats/

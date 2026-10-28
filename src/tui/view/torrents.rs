@@ -261,8 +261,8 @@ fn cell(
             };
             vec![Span::styled(fit(&torrent.name, width, false), style)]
         }
-        Column::Size => match &torrent.layout {
-            Some(layout) => vec![Span::raw(fit(&human_bytes(layout.size), width, true))],
+        Column::Size => match torrent.size() {
+            Some(size) => vec![Span::raw(fit(&human_bytes(size), width, true))],
             None => dash(),
         },
         Column::Progress => {

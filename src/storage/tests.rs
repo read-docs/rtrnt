@@ -1,4 +1,5 @@
 use super::*;
+use crate::selection::FileSelection;
 use crate::torrent::FileInfo;
 use serde_bytes::ByteBuf;
 
@@ -25,7 +26,7 @@ fn multi_file_info(files: &[(&[&str], u64)]) -> Info {
 fn piece_spanning_files() {
     let dir = tempfile::tempdir().unwrap();
     let info = multi_file_info(&[(&["a"], 3), (&["sub", "empty"], 0), (&["sub", "b"], 6)]);
-    let storage = Storage::new(&info, dir.path()).unwrap();
+    let storage = Storage::new(&info, dir.path(), &FileSelection::default()).unwrap();
 
     storage.write_at(0, b"abcd").unwrap();
     storage.write_at(4, b"efgh").unwrap();
@@ -44,7 +45,7 @@ fn piece_spanning_files() {
 async fn reads_blocks_by_piece_and_offset() {
     let dir = tempfile::tempdir().unwrap();
     let info = multi_file_info(&[(&["a"], 3), (&["b"], 6)]);
-    let storage = Arc::new(Storage::new(&info, dir.path()).unwrap());
+    let storage = Arc::new(Storage::new(&info, dir.path(), &FileSelection::default()).unwrap());
     storage.write_at(0, b"abcdefghi").unwrap();
     // Piece 1 is "efgh", and its middle spans no file boundary.
     assert_eq!(storage.read_block(1, 1, 2).await.unwrap(), b"fg");
@@ -61,7 +62,12 @@ fn caches_handles_up_to_limit() {
     let names: Vec<String> = (0..count).map(|i| format!("f{i}")).collect();
     let paths: Vec<[&str; 1]> = names.iter().map(|n| [n.as_str()]).collect();
     let files: Vec<(&[&str], u64)> = paths.iter().map(|p| (&p[..], 1)).collect();
-    let storage = Storage::new(&multi_file_info(&files), dir.path()).unwrap();
+    let storage = Storage::new(
+        &multi_file_info(&files),
+        dir.path(),
+        &FileSelection::default(),
+    )
+    .unwrap();
     let cached = |storage: &Storage| -> Vec<usize> {
         let cache = storage.handles.lock().unwrap();
         cache.open.iter().map(|(i, _)| *i).collect()
@@ -121,21 +127,21 @@ fn rejects_path_traversal() {
     for bad in [&["..", "x"][..], &["/etc"], &["a/b"], &[""], &["."], &[]] {
         let info = multi_file_info(&[(bad, 1)]);
         assert!(
-            Storage::new(&info, dir.path()).is_err(),
+            Storage::new(&info, dir.path(), &FileSelection::default()).is_err(),
             "accepted {:?}",
             bad
         );
     }
     let mut info = multi_file_info(&[(&["ok"], 1)]);
     info.name = "..".into();
-    assert!(Storage::new(&info, dir.path()).is_err());
+    assert!(Storage::new(&info, dir.path(), &FileSelection::default()).is_err());
 }
 
 #[test]
 fn rejects_the_same_path_twice() {
     let dir = tempfile::tempdir().unwrap();
     let info = multi_file_info(&[(&["a"], 1), (&["sub", "b"], 1), (&["a"], 2)]);
-    let err = Storage::new(&info, dir.path()).unwrap_err();
+    let err = Storage::new(&info, dir.path(), &FileSelection::default()).unwrap_err();
     assert!(err.to_string().contains("twice"), "{err:#}");
     assert!(Storage::paths(&info, dir.path()).is_err());
     assert!(Storage::open_existing(&info, dir.path()).is_err());
@@ -144,7 +150,7 @@ fn rejects_the_same_path_twice() {
     let info = multi_file_info(&[(&["a"], 1), (&["A"], 1)]);
     // Names that differ in case are two files only where case counts.
     assert_eq!(
-        Storage::new(&info, dir.path()).is_err(),
+        Storage::new(&info, dir.path(), &FileSelection::default()).is_err(),
         cfg!(any(target_os = "macos", windows))
     );
 }
@@ -178,7 +184,7 @@ fn deleting_removes_the_files_and_the_directories_they_leave_empty() {
         (&["linked", "d"], 1),
         (&["missing"], 1),
     ]);
-    drop(Storage::new(&info, &out).unwrap());
+    drop(Storage::new(&info, &out, &FileSelection::default()).unwrap());
     let root = out.join("root");
     std::fs::remove_file(root.join("missing")).unwrap();
     // Not the torrent's: it keeps its directory.
@@ -220,4 +226,92 @@ fn deleting_removes_the_files_and_the_directories_they_leave_empty() {
     assert!(delete_files(&info, &out).is_empty());
     assert!(!root.exists());
     assert!(out.is_dir());
+}
+
+/// Files of the given lengths, `piece_length` 4, with room for every piece's
+/// hash.
+fn selectable_info(lengths: &[u64]) -> Info {
+    let mut info = multi_file_info(&lengths.iter().map(|&l| (&["x"][..], l)).collect::<Vec<_>>());
+    for (i, file) in info.files.as_mut().unwrap().iter_mut().enumerate() {
+        file.path = vec![format!("f{i}")];
+    }
+    info.pieces = ByteBuf::from(vec![
+        0;
+        lengths.iter().sum::<u64>().div_ceil(4) as usize * 20
+    ]);
+    info
+}
+
+use crate::selection::Priority::{High, Normal, Skip};
+
+#[test]
+fn a_skipped_file_no_wanted_piece_touches_is_not_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = selectable_info(&[4, 4, 4]);
+    let selection = FileSelection::new(vec![Normal, Skip, High]);
+    let storage = Storage::new(&info, dir.path(), &selection).unwrap();
+    let root = dir.path().join("root");
+    assert!(root.join("f0").is_file());
+    assert!(!root.join("f1").exists());
+    assert_eq!(std::fs::metadata(root.join("f2")).unwrap().len(), 4);
+    let exists: Vec<bool> = storage.files().iter().map(FileSpan::exists).collect();
+    assert_eq!(exists, [true, false, true]);
+    assert_eq!(storage.selection(), &selection);
+    // Its pieces are not on disk, but the others are.
+    assert!(!storage.files_exist(4, 4));
+    assert!(storage.files_exist(0, 4));
+    assert!(storage.files_exist(8, 4));
+    // Nothing in a wanted piece reaches it.
+    storage.write_at(0, b"abcd").unwrap();
+    storage.write_at(8, b"efgh").unwrap();
+    assert!(!root.join("f1").exists());
+}
+
+#[test]
+fn a_skipped_file_sharing_a_wanted_piece_is_created_full_length() {
+    let dir = tempfile::tempdir().unwrap();
+    // Pieces: [a a a b] [b b b b] [b c c c]: both neighbours need "b".
+    let info = selectable_info(&[3, 6, 3]);
+    let storage = Storage::new(
+        &info,
+        dir.path(),
+        &FileSelection::new(vec![Normal, Skip, Normal]),
+    )
+    .unwrap();
+    let root = dir.path().join("root");
+    assert_eq!(std::fs::metadata(root.join("f1")).unwrap().len(), 6);
+    assert!(storage.files().iter().all(FileSpan::exists));
+}
+
+#[test]
+fn skipped_files_that_exist_are_left_as_they_are() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("f1"), b"xy").unwrap();
+    let info = selectable_info(&[4, 4]);
+    let storage = Storage::new(&info, dir.path(), &FileSelection::new(vec![Normal, Skip])).unwrap();
+    assert_eq!(std::fs::read(root.join("f1")).unwrap(), b"xy");
+    assert_eq!(storage.files()[1].found, Some(2));
+}
+
+#[test]
+fn rejects_a_selection_for_another_number_of_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = selectable_info(&[4, 4]);
+    assert!(Storage::new(&info, dir.path(), &FileSelection::new(vec![Skip])).is_err());
+}
+
+#[test]
+fn delete_files_ignores_files_that_were_never_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = selectable_info(&[4, 4, 4]);
+    Storage::new(
+        &info,
+        dir.path(),
+        &FileSelection::new(vec![Normal, Skip, Normal]),
+    )
+    .unwrap();
+    assert!(delete_files(&info, dir.path()).is_empty());
+    assert!(!dir.path().join("root").exists());
 }

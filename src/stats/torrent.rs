@@ -1,5 +1,6 @@
 use crate::download::{CheckedOnly, Interrupted};
 use crate::magnet::FetchInterrupted;
+use crate::selection::Priority;
 use crate::torrent::TorrentFile;
 use crate::tracker::AnnounceResponse;
 use crate::tracker::announcer::Transferred;
@@ -95,6 +96,15 @@ impl Layout {
     }
 }
 
+/// What the run of a torrent is to download.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Selected {
+    /// Each file's priority, in order.
+    priorities: Vec<Priority>,
+    /// Bytes in the pieces wanted.
+    wanted: u64,
+}
+
 /// Which pieces we have, are downloading, and how many connected peers have
 /// each.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -155,6 +165,7 @@ pub struct TorrentStats {
     previous: Previous,
     name: Mutex<String>,
     layout: OnceLock<Layout>,
+    selection: Mutex<Option<Selected>>,
     state: Mutex<TorrentState>,
     /// When the task ended.
     finished: OnceLock<Instant>,
@@ -197,6 +208,7 @@ impl TorrentStats {
             previous,
             name: Mutex::new(name.to_string()),
             layout: OnceLock::new(),
+            selection: Mutex::new(None),
             state: Mutex::new(TorrentState::QueuedForChecking),
             finished: OnceLock::new(),
             transferred: Arc::default(),
@@ -276,6 +288,28 @@ impl TorrentStats {
 
     pub fn layout(&self) -> Option<&Layout> {
         self.layout.get()
+    }
+
+    /// Records which files this run downloads, and the bytes of the pieces
+    /// that takes.
+    pub(crate) fn set_selection(&self, priorities: Vec<Priority>, wanted: u64) {
+        *lock(&self.selection) = Some(Selected { priorities, wanted });
+    }
+
+    /// Each file's priority, in order, once the run has chosen them.
+    pub fn priorities(&self) -> Option<Vec<Priority>> {
+        lock(&self.selection)
+            .as_ref()
+            .map(|selected| selected.priorities.clone())
+    }
+
+    /// Bytes in the pieces wanted, once the run has chosen them: the size
+    /// that `verified` is out of. It is the torrent's size unless files are
+    /// skipped.
+    pub fn wanted(&self) -> Option<u64> {
+        lock(&self.selection)
+            .as_ref()
+            .map(|selected| selected.wanted)
     }
 
     pub fn state(&self) -> TorrentState {

@@ -5,6 +5,7 @@ use crate::client::Client;
 use crate::download::{self, CheckedOnly, Interrupted};
 use crate::magnet::{self, FetchInterrupted, MagnetLink};
 use crate::resume;
+use crate::selection::FileSelection;
 use crate::source::Source;
 use crate::stats::{TorrentState, TorrentStats};
 use crate::storage::{self, Storage};
@@ -57,6 +58,9 @@ pub type RunTorrent =
 pub struct StartOptions {
     /// Whether to hash the data on disk rather than trust the resume file.
     pub recheck: Recheck,
+    /// Which files to download and which first, or `None` to go by the
+    /// resume file, and failing that to download every file.
+    pub selection: Option<FileSelection>,
 }
 
 /// Whether, and what next, a run hashes the data on disk, ignoring the
@@ -463,7 +467,10 @@ where
             self.client.stats().notice(format!("{}: {why}", name()));
             return;
         }
-        let recheck = |recheck| StartOptions { recheck };
+        let recheck = |recheck| StartOptions {
+            recheck,
+            selection: None,
+        };
         match self.entries[index].state {
             State::Running { .. } => self.restart(info_hash, recheck(Recheck::ThenRun)),
             State::Paused => {

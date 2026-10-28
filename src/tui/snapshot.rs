@@ -2,6 +2,7 @@
 //! data, no locks, so views can be drawn (and tested) from it alone.
 
 use super::log_buffer::{LogBuffer, LogLine};
+use crate::selection::Priority;
 use crate::stats::{
     Layout, PeerFlags, PeerSource, PieceSnapshot, SessionStats, TorrentState, TorrentStats,
     TrackerStatus,
@@ -45,8 +46,13 @@ pub struct TorrentSnapshot {
     pub name: String,
     pub state: TorrentState,
     pub layout: Option<Layout>,
+    /// Each file's priority, once known; empty before.
+    pub priorities: Vec<Priority>,
+    /// Bytes in the pieces wanted, once known; the torrent's size unless
+    /// files are skipped.
+    pub wanted: Option<u64>,
     pub save_path: PathBuf,
-    /// Bytes verified and on disk.
+    /// Bytes verified and on disk, of the pieces wanted.
     pub verified: u64,
     /// Block data received this session, verified or not, before a pause
     /// too.
@@ -84,18 +90,23 @@ impl TorrentSnapshot {
             TorrentState::FetchingMetadata { pieces, total, .. } => {
                 fraction(*pieces as u64, *total as u64)
             }
-            _ => match &self.layout {
-                Some(layout) => fraction(self.verified, layout.size),
+            _ => match self.size() {
+                Some(size) => fraction(self.verified, size),
                 None => 0.0,
             },
         }
     }
 
+    /// Bytes to download in all, once known: the wanted pieces, or the
+    /// whole torrent before they are chosen.
+    pub fn size(&self) -> Option<u64> {
+        self.wanted
+            .or(self.layout.as_ref().map(|layout| layout.size))
+    }
+
     /// Bytes still to download, once the size is known.
     pub fn left(&self) -> Option<u64> {
-        self.layout
-            .as_ref()
-            .map(|layout| layout.size.saturating_sub(self.verified))
+        self.size().map(|size| size.saturating_sub(self.verified))
     }
 }
 
@@ -219,6 +230,8 @@ fn torrent_snapshot(torrent: &TorrentStats, order: usize, now: Instant) -> Torre
         name: torrent.name(),
         state: torrent.state(),
         layout: torrent.layout().cloned(),
+        priorities: torrent.priorities().unwrap_or_default(),
+        wanted: torrent.wanted(),
         save_path: torrent.save_path().to_path_buf(),
         verified: torrent.verified(),
         received: torrent.received(),
@@ -349,6 +362,8 @@ mod tests {
                 peers: 2,
             },
             layout: None,
+            priorities: Vec::new(),
+            wanted: None,
             save_path: PathBuf::new(),
             verified: 0,
             received: 0,
@@ -374,5 +389,10 @@ mod tests {
         torrent.verified = 30;
         assert_eq!(torrent.progress(), 0.3);
         assert_eq!(torrent.left(), Some(70));
+        // With files skipped, progress is of the pieces wanted.
+        torrent.wanted = Some(60);
+        assert_eq!(torrent.size(), Some(60));
+        assert_eq!(torrent.progress(), 0.5);
+        assert_eq!(torrent.left(), Some(30));
     }
 }

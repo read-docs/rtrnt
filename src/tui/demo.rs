@@ -422,6 +422,8 @@ impl DemoFeed {
                     live.state.clone()
                 },
                 layout: live.layout(),
+                priorities: Vec::new(),
+                wanted: None,
                 save_path: PathBuf::from("/home/me/Downloads"),
                 verified: live.verified as u64,
                 received: live.received as u64,

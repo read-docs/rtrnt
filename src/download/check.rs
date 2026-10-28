@@ -2,7 +2,7 @@ use crate::peer::{self};
 use crate::stats::{TorrentState, TorrentStats};
 use crate::storage::Storage;
 use crate::storage::verify;
-use crate::torrent::{self, TorrentFile};
+use crate::torrent::{self};
 use anyhow::{Result, bail};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::path::Path;
@@ -131,13 +131,4 @@ pub(crate) async fn hash_pieces(
     let done = have.iter().filter(|&&have| have).count();
     info!(done, pieces = have.len(), "checked data on disk");
     Ok(have)
-}
-
-/// Total length of the pieces marked in `have`.
-pub(crate) fn verified_bytes(torrent: &TorrentFile, have: &[bool]) -> Result<u64> {
-    have.iter()
-        .enumerate()
-        .filter(|(_, have)| **have)
-        .map(|(index, _)| torrent.piece_len(index))
-        .sum()
 }

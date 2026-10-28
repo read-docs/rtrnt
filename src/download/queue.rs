@@ -1,7 +1,9 @@
 use crate::peer::PeerMessage;
 use crate::peer::fast;
+use crate::selection::Priority;
 use crate::stats::PieceSnapshot;
 use rand::Rng;
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use tokio::sync::Notify;
@@ -22,7 +24,10 @@ pub(super) struct QueueState {
     /// hold a claim on each (more than one only in endgame).
     in_flight: BTreeMap<usize, u32>,
     /// Pieces not yet verified and written, whether pending or in flight.
+    /// Pieces that are not wanted are never counted.
     remaining: usize,
+    /// How much each piece is wanted, `None` for one that is not.
+    priorities: Vec<Option<Priority>>,
     /// How many connected peers have each piece.
     availability: Vec<u32>,
     /// Pieces verified and on disk, which peers may download from us.
@@ -39,12 +44,18 @@ pub(super) struct QueueState {
 }
 
 impl PieceQueue {
-    /// A queue of every piece not marked in `have`.
-    pub(super) fn new(have: &[bool]) -> Self {
-        let pending: BTreeSet<usize> = (0..have.len()).filter(|&i| !have[i]).collect();
+    /// A queue of every wanted piece not marked in `have`. `priorities` has
+    /// an entry for each piece: `None` for one that is not wanted, which is
+    /// never handed out and does not count towards being done.
+    pub(super) fn new(have: &[bool], priorities: &[Option<Priority>]) -> Self {
+        let wanted = |i: usize| priorities.get(i).is_some_and(Option::is_some);
+        let pending: BTreeSet<usize> = (0..have.len()).filter(|&i| !have[i] && wanted(i)).collect();
         Self {
             state: Mutex::new(QueueState {
                 remaining: pending.len(),
+                priorities: (0..have.len())
+                    .map(|i| priorities.get(i).copied().flatten())
+                    .collect(),
                 pending,
                 in_flight: BTreeMap::new(),
                 availability: vec![0; have.len()],
@@ -55,6 +66,12 @@ impl PieceQueue {
             }),
             changed: Notify::new(),
         }
+    }
+
+    /// A queue in which every piece is wanted, as `Priority::Normal`.
+    #[cfg(test)]
+    pub(super) fn all_wanted(have: &[bool]) -> Self {
+        Self::new(have, &vec![Some(Priority::Normal); have.len()])
     }
 
     /// Keeps workers going once every piece is done if `seed` is set, so
@@ -80,7 +97,8 @@ impl PieceQueue {
         }
     }
 
-    /// Takes the rarest pending piece the peer has, breaking ties at random.
+    /// Takes the pending piece the peer has that is wanted most, and of
+    /// those the rarest, breaking ties at random.
     ///
     /// Endgame: once no piece is pending, every remaining piece is already
     /// being downloaded, so this joins the in-flight piece with the fewest
@@ -132,10 +150,14 @@ impl PieceQueue {
             index
         } else {
             let availability = &state.availability;
-            let candidates = state
-                .pending
-                .iter()
-                .map(|&i| (i, availability.get(i).copied().unwrap_or(0)));
+            let priorities = &state.priorities;
+            let candidates = state.pending.iter().map(|&i| {
+                let priority = priorities.get(i).copied().flatten();
+                (
+                    i,
+                    (Reverse(priority), availability.get(i).copied().unwrap_or(0)),
+                )
+            });
             let index = pick_least(candidates, has, &mut rng)?;
             state.pending.remove(&index);
             state.in_flight.insert(index, 1);
@@ -148,8 +170,8 @@ impl PieceQueue {
         })
     }
 
-    /// Whether the peer has a piece that is not yet completed, whether
-    /// pending or in flight.
+    /// Whether the peer has a wanted piece that is not yet completed,
+    /// whether pending or in flight.
     pub(super) fn wants(&self, peer: &PeerPieces<'_>) -> bool {
         let state = self.lock();
         let has = |i: &usize| peer.has.get(*i).copied().unwrap_or(false);
@@ -233,8 +255,14 @@ impl PieceQueue {
         self.lock().have.clone()
     }
 
+    /// Wanted pieces not yet verified and written.
     pub(super) fn remaining(&self) -> usize {
         self.lock().remaining
+    }
+
+    /// How many pieces are wanted at all.
+    pub(super) fn wanted(&self) -> usize {
+        self.lock().priorities.iter().flatten().count()
     }
 
     pub(super) fn is_done(&self) -> bool {
@@ -360,11 +388,11 @@ impl Drop for PeerPieces<'_> {
     }
 }
 
-/// Picks the `(piece, count)` candidate in `has` with the lowest count. Ties
+/// Picks the `(piece, key)` candidate in `has` with the lowest key. Ties
 /// are broken uniformly at random (reservoir sampling) so that peers spread
 /// out over equally good pieces instead of all fetching the lowest index.
-fn pick_least(
-    candidates: impl IntoIterator<Item = (usize, u32)>,
+fn pick_least<K: Ord + Copy>(
+    candidates: impl IntoIterator<Item = (usize, K)>,
     has: &[bool],
     rng: &mut impl Rng,
 ) -> Option<usize> {

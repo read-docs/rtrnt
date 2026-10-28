@@ -3,6 +3,7 @@ use rtrnt::client::Client;
 use rtrnt::download::{DownloadConfig, Interrupted, SeedLimits, Session, download_file};
 use rtrnt::peer::{PeerMessage, generate_peer_id};
 use rtrnt::resume;
+use rtrnt::selection::FileSelection;
 use rtrnt::stats::TorrentStats;
 use rtrnt::storage::Storage;
 use std::future::pending;
@@ -350,7 +351,8 @@ async fn a_torrent_waits_its_turn_to_check_its_data() {
     write_files(out.path(), &data);
     let config = resume_config(out.path(), state.path());
     let term = RecordedTerm::default();
-    let storage = Arc::new(Storage::new(&torrent.info, out.path()).unwrap());
+    let storage =
+        Arc::new(Storage::new(&torrent.info, out.path(), &FileSelection::default()).unwrap());
     let session = Arc::new(Session {
         torrent,
         info_hash,

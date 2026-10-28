@@ -1,4 +1,5 @@
 use super::*;
+use crate::selection::FileSelection;
 use crate::torrent::{FileInfo, Info};
 use indicatif::MultiProgress;
 use sha1::Digest;
@@ -52,7 +53,9 @@ fn config(output: &Path, resume: &Path) -> DownloadConfig {
 /// A session over the files in `config.output_dir`.
 fn session(config: &DownloadConfig) -> Arc<Session> {
     let torrent = torrent();
-    let storage = Arc::new(Storage::new(&torrent.info, &config.output_dir).unwrap());
+    let storage = Arc::new(
+        Storage::new(&torrent.info, &config.output_dir, &FileSelection::default()).unwrap(),
+    );
     Arc::new(Session {
         torrent,
         info_hash: [7; 20],
@@ -112,6 +115,7 @@ fn saved() -> Saved {
         output_dir: ByteBuf::from(b"/out".to_vec()),
         pieces: ByteBuf::from(pack(&[true, false, true])),
         files: vec![(6, 1_000), (5, 2_000)],
+        priorities: Vec::new(),
     }
 }
 
@@ -131,6 +135,65 @@ fn round_trips_through_bencode() {
     assert!(encoded.starts_with(b"d5:filesl"), "{:?}", encoded);
     let parsed = parse(&encoded, &target(), 2, 3).unwrap();
     assert_eq!(parsed, saved());
+}
+
+#[test]
+fn priorities_are_saved_only_when_not_all_normal() {
+    let plain = serde_bencode::to_bytes(&saved()).unwrap();
+    assert!(!String::from_utf8_lossy(&plain).contains("priorities"));
+    // A file from before priorities existed has no such key, and loads.
+    let parsed = parse(&plain, &target(), 2, 3).unwrap();
+    assert_eq!(selection_of(&parsed, 2), None);
+
+    let mut with = saved();
+    with.priorities = priorities_to_save(&FileSelection::new(vec![Priority::Skip, Priority::High]));
+    assert_eq!(with.priorities, [0, 2]);
+    let encoded = serde_bencode::to_bytes(&with).unwrap();
+    let parsed = parse(&encoded, &target(), 2, 3).unwrap();
+    assert_eq!(parsed, with);
+    assert_eq!(
+        selection_of(&parsed, 2),
+        Some(FileSelection::new(vec![Priority::Skip, Priority::High]))
+    );
+    // Not for a torrent of another number of files, or with a value we do
+    // not know.
+    assert_eq!(selection_of(&parsed, 3), None);
+    with.priorities = vec![0, 9];
+    assert_eq!(selection_of(&with, 2), None);
+    assert!(priorities_to_save(&FileSelection::all_normal(2)).is_empty());
+}
+
+#[test]
+fn load_selection_reads_the_resume_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut target = target();
+    target.path = dir.path().join("x.resume");
+    assert_eq!(load_selection(&target, 2), None);
+    let mut with = saved();
+    with.priorities = vec![1, 0];
+    write_atomically(&target.path, &serde_bencode::to_bytes(&with).unwrap()).unwrap();
+    assert_eq!(
+        load_selection(&target, 2),
+        Some(FileSelection::new(vec![Priority::Normal, Priority::Skip]))
+    );
+    let mut other = target.clone();
+    other.info_hash = [8; 20];
+    assert_eq!(load_selection(&other, 2), None);
+    std::fs::write(&target.path, b"garbage").unwrap();
+    assert_eq!(load_selection(&target, 2), None);
+}
+
+#[tokio::test]
+async fn saves_and_reloads_the_selection_of_the_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    let config = config(&out, &dir.path().join("resume"));
+    let torrent = torrent();
+    let selection = FileSelection::new(vec![Priority::High, Priority::Skip]);
+    let storage = Arc::new(Storage::new(&torrent.info, &out, &selection).unwrap());
+    let target = Target::new(&config, [7; 20]).unwrap();
+    target.save(&storage, vec![false; 3]).await;
+    assert_eq!(load_selection(&target, 2), Some(selection));
 }
 
 #[test]
@@ -165,7 +228,7 @@ fn ignores_a_truncated_or_garbage_file() {
 fn only_unchanged_files_are_clean() {
     let dir = tempfile::tempdir().unwrap();
     let torrent = torrent();
-    let storage = Storage::new(&torrent.info, dir.path()).unwrap();
+    let storage = Storage::new(&torrent.info, dir.path(), &FileSelection::default()).unwrap();
     let files = storage.files();
     let saved = [(6, 1_000), (5, 2_000)];
     assert_eq!(
@@ -185,7 +248,7 @@ fn only_unchanged_files_are_clean() {
 fn hashes_only_candidates_that_touch_a_dirty_file() {
     let dir = tempfile::tempdir().unwrap();
     let torrent = torrent();
-    let storage = Storage::new(&torrent.info, dir.path()).unwrap();
+    let storage = Storage::new(&torrent.info, dir.path(), &FileSelection::default()).unwrap();
     let files = storage.files();
     // Pieces 0 and 1 are in "a" (1 also in "b"), and 2 is in "b".
     let all_done = pack(&[true, true, true]);
@@ -321,7 +384,7 @@ fn candidates_are_not_needed_to_trust_a_resume_file() {
     // resume file can still vouch for a piece in files it saw complete.
     let dir = tempfile::tempdir().unwrap();
     let torrent = torrent();
-    let storage = Storage::new(&torrent.info, dir.path()).unwrap();
+    let storage = Storage::new(&torrent.info, dir.path(), &FileSelection::default()).unwrap();
     assert!(verify::candidates(&torrent, &storage).unwrap().is_empty());
     let (have, to_hash) = split(
         &torrent,

@@ -5,6 +5,7 @@ use crate::dht::DhtSearch;
 use crate::listener::Registration;
 use crate::peer::pex::PeerExchange;
 use crate::peer::{self, Incoming, PeerConnection};
+use crate::selection;
 use crate::stats::{PeerSource, PieceSnapshot, PieceSource, TorrentState};
 use crate::tracker::announcer::{Announcer, Transferred};
 use anyhow::{Result, bail};
@@ -18,7 +19,6 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tracing::{Instrument, debug, info, warn};
 
-use super::check::verified_bytes;
 use super::progress::Progress;
 use super::queue::PieceQueue;
 use super::worker::peer_worker;
@@ -86,13 +86,14 @@ pub(crate) async fn download_with(
     // Private torrents (BEP 27) get their peers from trackers only.
     let (pex, mut pex_peers) = PeerExchange::new(!torrent.is_private());
     let stats = &session.stats;
+    let priorities = session.piece_priorities();
     let swarm = Arc::new(Swarm {
-        queue: PieceQueue::new(have).seeding(seed.enabled()),
+        queue: PieceQueue::new(have, &priorities).seeding(seed.enabled()),
         progress: Progress::new(
             &session.bars,
             &torrent.info.name,
-            torrent.length(),
-            verified_bytes(torrent, have)?,
+            selection::wanted_len(torrent, &priorities)?,
+            selection::wanted_done(torrent, &priorities, have)?,
             Arc::clone(stats),
         ),
         connected: ConnectedPeers::default(),
@@ -348,6 +349,7 @@ pub(crate) async fn download_with(
     stats.set_final_pieces(queue.snapshot());
 
     let remaining = queue.remaining();
+    let wanted = queue.wanted();
     if remaining == 0 {
         progress.bar.finish();
     } else {
@@ -361,10 +363,10 @@ pub(crate) async fn download_with(
         if interrupted {
             bail!(Interrupted {
                 remaining,
-                pieces: num_pieces
+                pieces: wanted
             });
         }
-        bail!("download incomplete: {remaining} of {num_pieces} pieces missing and no peers left");
+        bail!("download incomplete: {remaining} of {wanted} pieces missing and no peers left");
     }
     Ok(())
 }

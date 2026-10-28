@@ -11,6 +11,7 @@ pub mod manager;
 pub mod peer;
 pub mod rate_limit;
 pub mod resume;
+pub mod selection;
 pub mod source;
 pub mod stats;
 pub mod storage;

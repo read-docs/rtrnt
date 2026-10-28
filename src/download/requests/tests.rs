@@ -23,7 +23,7 @@ fn block(data: &[u8], block: usize) -> &[u8] {
 
 #[test]
 fn active_piece_requests_blocks_in_order_and_assembles_them() {
-    let queue = PieceQueue::new(&[false; 1]);
+    let queue = PieceQueue::all_wanted(&[false; 1]);
     let seed = peer(&queue, &[true]);
     let (data, mut piece) = active(&queue, &seed);
     let mut lengths = Vec::new();
@@ -61,7 +61,7 @@ fn active_piece_requests_blocks_in_order_and_assembles_them() {
 
 #[test]
 fn active_piece_ignores_duplicate_and_unrequested_blocks() {
-    let queue = PieceQueue::new(&[false; 1]);
+    let queue = PieceQueue::all_wanted(&[false; 1]);
     let seed = peer(&queue, &[true]);
     let (data, mut piece) = active(&queue, &seed);
     piece.request_next();
@@ -77,7 +77,7 @@ fn active_piece_ignores_duplicate_and_unrequested_blocks() {
 
 #[test]
 fn active_piece_rejects_invalid_blocks() {
-    let queue = PieceQueue::new(&[false; 1]);
+    let queue = PieceQueue::all_wanted(&[false; 1]);
     let seed = peer(&queue, &[true]);
     let (data, mut piece) = active(&queue, &seed);
     while piece.has_unrequested() {
@@ -97,7 +97,7 @@ fn active_piece_rejects_invalid_blocks() {
 
 #[test]
 fn active_piece_cancels_only_outstanding_requests() {
-    let queue = PieceQueue::new(&[false; 1]);
+    let queue = PieceQueue::all_wanted(&[false; 1]);
     let seed = peer(&queue, &[true]);
     let (data, mut piece) = active(&queue, &seed);
     piece.request_next();
@@ -116,7 +116,7 @@ fn active_piece_cancels_only_outstanding_requests() {
 
 #[test]
 fn rejected_blocks_are_requested_again_first() {
-    let queue = PieceQueue::new(&[false; 1]);
+    let queue = PieceQueue::all_wanted(&[false; 1]);
     let seed = peer(&queue, &[true]);
     let (data, mut piece) = active(&queue, &seed);
     let request = |block: u32| PeerMessage::Request {
@@ -161,7 +161,7 @@ fn rejected_blocks_are_requested_again_first() {
 
 #[test]
 fn a_choke_releases_pieces_with_nothing_outstanding_unless_allowed_fast() {
-    let queue = PieceQueue::new(&[false; 3]);
+    let queue = PieceQueue::all_wanted(&[false; 3]);
     let seed = peer(&queue, &[true; 3]);
     let piece = |index: usize| {
         let claim = queue
@@ -188,7 +188,7 @@ fn a_choke_releases_pieces_with_nothing_outstanding_unless_allowed_fast() {
 
 #[test]
 fn corrupt_piece_fails_verification_and_is_returned() {
-    let queue = PieceQueue::new(&[false; 1]);
+    let queue = PieceQueue::all_wanted(&[false; 1]);
     let seed = peer(&queue, &[true]);
     let (mut data, mut piece) = active(&queue, &seed);
     data[0] ^= 0xff;

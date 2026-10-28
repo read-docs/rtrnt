@@ -17,6 +17,7 @@ use crate::download::{self, CheckedOnly, Limits, Session, StartPeers};
 use crate::manager::{Recheck, StartOptions};
 use crate::peer::extension::Advertised;
 use crate::resume::{self, Target};
+use crate::selection;
 use crate::stats::{PeerSource, TorrentState, TorrentStats};
 use crate::storage::Storage;
 use crate::torrent;
@@ -353,7 +354,13 @@ async fn fetch_and_download(
             &Storage::paths(&torrent.info, &config.output_dir)?,
         )?;
         save_torrent(link, &config.output_dir, &tiers, &fetched.metadata).await;
-        let storage = Arc::new(Storage::new(&torrent.info, &config.output_dir)?);
+        let resume = Target::new(config, info_hash);
+        let selection = download::initial_selection(
+            options,
+            resume.as_ref(),
+            selection::file_count(&torrent.info),
+        );
+        let storage = Arc::new(Storage::new(&torrent.info, &config.output_dir, &selection)?);
         // BEP 27: a private torrent's peers come from its trackers alone.
         // Magnet links for private torrents are not a thing in practice,
         // but should one come, we stop using the DHT once we know.
@@ -374,7 +381,7 @@ async fn fetch_and_download(
             rate_limits: client.rate_limits(),
             metadata: Some(fetched.metadata),
             bars: client.bars().clone(),
-            resume: Target::new(config, info_hash),
+            resume,
             stats: Arc::clone(stats),
         });
         let recheck = options.recheck != Recheck::No;
@@ -383,7 +390,7 @@ async fn fetch_and_download(
         if options.recheck == Recheck::ThenPause {
             bail!(CheckedOnly);
         }
-        let left = session.torrent.length() - download::verified_bytes(&session.torrent, &have)?;
+        let left = session.left(&have)?;
         anyhow::Ok((session, have, left))
     };
     let (session, have, left) = match start.await {

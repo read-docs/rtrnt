@@ -2,6 +2,7 @@ use indicatif::MultiProgress;
 use rtrnt::download::{DownloadConfig, Interrupted, SeedLimits, Session, download_from_peers};
 use rtrnt::peer::{PeerMessage, generate_peer_id};
 use rtrnt::resume;
+use rtrnt::selection::FileSelection;
 use rtrnt::stats::TorrentStats;
 use rtrnt::storage::Storage;
 use rtrnt::storage::verify;
@@ -119,7 +120,9 @@ fn resumable_session(
     info_hash: [u8; 20],
     config: &DownloadConfig,
 ) -> Arc<Session> {
-    let storage = Arc::new(Storage::new(&torrent.info, &config.output_dir).unwrap());
+    let storage = Arc::new(
+        Storage::new(&torrent.info, &config.output_dir, &FileSelection::default()).unwrap(),
+    );
     Arc::new(Session {
         torrent,
         info_hash,

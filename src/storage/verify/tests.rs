@@ -1,4 +1,5 @@
 use super::*;
+use crate::selection::FileSelection;
 use crate::torrent::{FileInfo, Info};
 use serde_bytes::ByteBuf;
 use std::sync::atomic::AtomicU64;
@@ -45,7 +46,7 @@ fn finds_intact_pieces_and_skips_fresh_files() {
     // piece 1, which spans both files; "b" does not exist yet.
     std::fs::write(root.join("a"), b"abcdeX").unwrap();
 
-    let storage = Storage::new(&torrent.info, dir.path()).unwrap();
+    let storage = Storage::new(&torrent.info, dir.path(), &FileSelection::default()).unwrap();
     // Piece 2 lies entirely in the new, empty "b".
     let candidates = candidates(&torrent, &storage).unwrap();
     assert_eq!(candidates, [0, 1]);
@@ -75,7 +76,7 @@ fn complete_data_verifies_every_piece() {
     std::fs::write(root.join("a"), &data[..6]).unwrap();
     std::fs::write(root.join("b"), &data[6..]).unwrap();
 
-    let storage = Storage::new(&torrent.info, dir.path()).unwrap();
+    let storage = Storage::new(&torrent.info, dir.path(), &FileSelection::default()).unwrap();
     let candidates = candidates(&torrent, &storage).unwrap();
     assert_eq!(candidates, [0, 1, 2]);
     let have = verify(
@@ -93,7 +94,7 @@ fn complete_data_verifies_every_piece() {
 fn nothing_to_check_in_a_new_download() {
     let torrent = torrent(b"abcdefghijk");
     let dir = tempfile::tempdir().unwrap();
-    let storage = Storage::new(&torrent.info, dir.path()).unwrap();
+    let storage = Storage::new(&torrent.info, dir.path(), &FileSelection::default()).unwrap();
     assert!(candidates(&torrent, &storage).unwrap().is_empty());
     let have = verify(&torrent, &storage, &[], &AtomicBool::new(false), &|_| {}).unwrap();
     assert_eq!(have, [false, false, false]);
@@ -108,7 +109,7 @@ fn a_cancelled_check_hashes_nothing_more_and_fails() {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("a"), &data[..6]).unwrap();
     std::fs::write(root.join("b"), &data[6..]).unwrap();
-    let storage = Storage::new(&torrent.info, dir.path()).unwrap();
+    let storage = Storage::new(&torrent.info, dir.path(), &FileSelection::default()).unwrap();
 
     // Cancelled before it starts: no piece is read.
     let checked = AtomicU64::new(0);
@@ -200,4 +201,29 @@ fn report_on_corrupt_and_resized_files() {
     assert!(text.starts_with("2 of 3 pieces OK\n"), "{text}");
     assert!(text.contains("corrupt     "), "{text}");
     assert!(text.contains(": 6 bytes, expected 5\n"), "{text}");
+}
+
+#[test]
+fn pieces_in_files_that_were_never_created_are_not_candidates() {
+    use crate::selection::Priority::Skip;
+    let data = b"abcdefghijk";
+    let torrent = torrent(data);
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a"), b"abcdef").unwrap();
+
+    let all = Storage::new(&torrent.info, dir.path(), &FileSelection::default()).unwrap();
+    assert_eq!(candidates(&torrent, &all).unwrap(), [0, 1]);
+    // With both files skipped, "b" is not made, so piece 1 (which has data
+    // of "a" and of "b") could not be read.
+    std::fs::remove_file(root.join("b")).unwrap();
+    let skipped = Storage::new(
+        &torrent.info,
+        dir.path(),
+        &FileSelection::new(vec![Skip, Skip]),
+    )
+    .unwrap();
+    assert!(!skipped.files()[1].exists());
+    assert_eq!(candidates(&torrent, &skipped).unwrap(), [0]);
 }

@@ -4,6 +4,7 @@ use rtrnt::download::{DownloadConfig, SeedLimits, Session};
 use rtrnt::peer::fast;
 use rtrnt::peer::{PeerMessage, generate_peer_id, handshake_bytes, parse_handshake};
 use rtrnt::rate_limit::RateLimits;
+use rtrnt::selection::FileSelection;
 use rtrnt::stats::TorrentStats;
 use rtrnt::storage::Storage;
 use rtrnt::torrent::{FileInfo, Info, TorrentFile};
@@ -291,7 +292,7 @@ pub(crate) fn limited_session(
     seed: SeedLimits,
     rate_limits: RateLimits,
 ) -> Arc<Session> {
-    let storage = Arc::new(Storage::new(&torrent.info, out).unwrap());
+    let storage = Arc::new(Storage::new(&torrent.info, out, &FileSelection::default()).unwrap());
     // What `make_torrent` hashed.
     let metadata = serde_bencode::to_bytes(&torrent.info).unwrap();
     Arc::new(Session {

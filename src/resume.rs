@@ -8,9 +8,10 @@
 
 use crate::bencode;
 use crate::download::{self, DownloadConfig, Session};
+use crate::selection::{self, FileSelection, Priority};
 use crate::stats::TorrentState;
 use crate::storage::verify;
-use crate::storage::{FileSpan, Storage};
+use crate::storage::{FileSpan, Storage, files_between};
 use crate::torrent::TorrentFile;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -75,6 +76,7 @@ impl Target {
                 output_dir: ByteBuf::from(target.output_dir.as_os_str().as_encoded_bytes()),
                 pieces: ByteBuf::from(pack(&have)),
                 files: storage.files().iter().map(|f| stamp(&f.path)).collect(),
+                priorities: priorities_to_save(storage.selection()),
             };
             write_atomically(&target.path, &serde_bencode::to_bytes(&saved)?)
         })
@@ -115,6 +117,23 @@ struct Saved {
     pieces: ByteBuf,
     /// Each file of the torrent, in order, as it was when saved.
     files: Vec<Stamp>,
+    /// The priority of each file (see `Priority::to_wire`), when any is not
+    /// normal. Files from before priorities existed have none, and so have
+    /// those saved with every file normal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    priorities: Vec<i64>,
+}
+
+/// The priorities of `selection` as stored: none if all are normal.
+fn priorities_to_save(selection: &FileSelection) -> Vec<i64> {
+    if selection.is_all_normal() {
+        return Vec::new();
+    }
+    selection
+        .priorities()
+        .iter()
+        .map(|priority| priority.to_wire())
+        .collect()
 }
 
 /// Which pieces of the torrent are on disk and intact, for a run that is
@@ -143,6 +162,14 @@ pub async fn initial_pieces(
     shutdown: impl Future<Output = ()>,
 ) -> Result<Vec<bool>> {
     let torrent = &session.torrent;
+    let priorities = session.piece_priorities();
+    session.stats.set_selection(
+        session
+            .storage
+            .selection()
+            .for_files(session.storage.files().len()),
+        selection::wanted_len(torrent, &priorities)?,
+    );
     let candidates = verify::candidates(torrent, &session.storage)?;
     let saved = match &session.resume {
         Some(target) if !recheck => load(target, session).await,
@@ -183,7 +210,7 @@ pub async fn initial_pieces(
     }
     session
         .stats
-        .set_verified(download::verified_bytes(torrent, &have)?);
+        .set_verified(selection::wanted_done(torrent, &priorities, &have)?);
     session.stats.set_state(TorrentState::Downloading);
     Ok(have)
 }
@@ -208,10 +235,41 @@ async fn load(target: &Target, session: &Session) -> Option<Saved> {
     }
 }
 
-/// Decodes a resume file and checks that it is for this torrent, this
-/// download directory and a torrent of `file_count` files and `num_pieces`
-/// pieces.
-fn parse(data: &[u8], target: &Target, file_count: usize, num_pieces: usize) -> Result<Saved> {
+/// The file selection saved for a torrent of `file_count` files, if the
+/// resume file is there, is for this torrent and download directory, and
+/// has one. Called before the files are created, since which of them are
+/// depends on it. Without priorities in the file, all are `Normal`, which
+/// is the same as none.
+pub fn load_selection(target: &Target, file_count: usize) -> Option<FileSelection> {
+    let data = std::fs::read(&target.path).ok()?;
+    let saved = match decode(&data, target) {
+        Ok(saved) => saved,
+        Err(e) => {
+            info!(path = %target.path.display(), "ignoring the resume file: {e:#}");
+            return None;
+        }
+    };
+    selection_of(&saved, file_count)
+}
+
+/// The selection `saved` holds, if it has one for `file_count` files.
+fn selection_of(saved: &Saved, file_count: usize) -> Option<FileSelection> {
+    if saved.priorities.is_empty() {
+        return None;
+    }
+    let priorities: Option<Vec<Priority>> = saved
+        .priorities
+        .iter()
+        .map(|&wire| Priority::from_wire(wire))
+        .collect();
+    priorities
+        .filter(|priorities| priorities.len() == file_count)
+        .map(FileSelection::new)
+}
+
+/// Decodes a resume file and checks that it is for this torrent and this
+/// download directory.
+fn decode(data: &[u8], target: &Target) -> Result<Saved> {
     // Bounds the nesting, so that decoding the value is safe.
     let len = bencode::value_len(data)?;
     let saved: Saved = serde_bencode::from_bytes(&data[..len]).context("not a resume file")?;
@@ -224,6 +282,13 @@ fn parse(data: &[u8], target: &Target, file_count: usize, num_pieces: usize) -> 
     if saved.output_dir.as_slice() != target.output_dir.as_os_str().as_encoded_bytes() {
         bail!("it is for another download directory");
     }
+    Ok(saved)
+}
+
+/// `decode`, and checks that it is for a torrent of `file_count` files and
+/// `num_pieces` pieces.
+fn parse(data: &[u8], target: &Target, file_count: usize, num_pieces: usize) -> Result<Saved> {
+    let saved = decode(data, target)?;
     if saved.files.len() != file_count {
         bail!("it lists {} files, not {file_count}", saved.files.len());
     }
@@ -273,15 +338,6 @@ fn split(
         }
     }
     Ok((have, to_hash))
-}
-
-/// Indexes of the files holding bytes of `start..end`, which are in order in
-/// `files`. Empty files hold none.
-fn files_between(files: &[FileSpan], start: u64, end: u64) -> impl Iterator<Item = usize> {
-    let first = files.partition_point(|file| file.offset + file.length <= start);
-    (first..files.len())
-        .take_while(move |&file| files[file].offset < end)
-        .filter(move |&file| files[file].length > 0)
 }
 
 /// `have` as a bitfield, first piece in the high bit.

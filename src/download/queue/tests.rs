@@ -17,7 +17,7 @@ fn availability(queue: &PieceQueue) -> Vec<u32> {
 
 #[test]
 fn claims_only_pieces_the_peer_has() {
-    let queue = PieceQueue::new(&[false; 3]);
+    let queue = PieceQueue::all_wanted(&[false; 3]);
     assert!(queue.claim(&peer(&queue, &[false; 3]), &[]).is_none());
     let partial = peer(&queue, &[false, true, true]);
     let claim = queue.claim(&partial, &[]).unwrap();
@@ -36,7 +36,7 @@ fn claims_only_pieces_the_peer_has() {
 
 #[test]
 fn snapshot_shows_have_in_flight_and_availability() {
-    let queue = PieceQueue::new(&[true, false, false, false]);
+    let queue = PieceQueue::all_wanted(&[true, false, false, false]);
     let first = peer(&queue, &[true, true, false, false]);
     let _second = peer(&queue, &[false, true, true, false]);
     // Piece 1 is the only one `first` has that we lack.
@@ -56,7 +56,7 @@ fn snapshot_shows_have_in_flight_and_availability() {
 
 #[test]
 fn dropped_claim_returns_piece() {
-    let queue = PieceQueue::new(&[false; 1]);
+    let queue = PieceQueue::all_wanted(&[false; 1]);
     let seed = peer(&queue, &[true]);
     drop(queue.claim(&seed, &[]).unwrap());
     let claim = queue.claim(&seed, &[]).unwrap();
@@ -67,7 +67,7 @@ fn dropped_claim_returns_piece() {
 
 #[test]
 fn pieces_already_on_disk_are_never_claimed() {
-    let queue = PieceQueue::new(&[true, false, true]);
+    let queue = PieceQueue::all_wanted(&[true, false, true]);
     assert_eq!(queue.remaining(), 1);
     let seed = peer(&queue, &[true; 3]);
     let claim = queue.claim(&seed, &[]).unwrap();
@@ -81,7 +81,7 @@ fn pieces_already_on_disk_are_never_claimed() {
 
 #[test]
 fn claims_rarest_piece_first() {
-    let queue = PieceQueue::new(&[false; 4]);
+    let queue = PieceQueue::all_wanted(&[false; 4]);
     let _a = peer(&queue, &[true, true, false, true]);
     let _b = peer(&queue, &[true, false, false, true]);
     let seed = peer(&queue, &[true; 4]);
@@ -94,7 +94,7 @@ fn claims_rarest_piece_first() {
 
 #[test]
 fn availability_follows_peer_updates_and_disconnects() {
-    let queue = PieceQueue::new(&[false; 3]);
+    let queue = PieceQueue::all_wanted(&[false; 3]);
     let mut a = peer(&queue, &[true, false, false]);
     let b = peer(&queue, &[true, true, false]);
     assert_eq!(availability(&queue), [2, 1, 0]);
@@ -111,7 +111,7 @@ fn availability_follows_peer_updates_and_disconnects() {
 
 #[test]
 fn wants_pieces_until_they_are_completed() {
-    let queue = PieceQueue::new(&[false; 3]);
+    let queue = PieceQueue::all_wanted(&[false; 3]);
     let a = peer(&queue, &[true, true, false]);
     let b = peer(&queue, &[false, true, false]);
     assert!(!queue.wants(&peer(&queue, &[false; 3])));
@@ -130,7 +130,7 @@ fn wants_pieces_until_they_are_completed() {
 
 #[test]
 fn rarest_ties_are_broken_at_random() {
-    let candidates = [(0, 1), (1, 5), (2, 1), (3, 1)];
+    let candidates = [(0, 1u32), (1, 5), (2, 1), (3, 1)];
     let has = [true; 4];
     let mut rng = StdRng::seed_from_u64(7);
     let mut seen = [0u32; 4];
@@ -160,7 +160,7 @@ fn pick_least_skips_pieces_the_peer_lacks() {
 
 #[test]
 fn endgame_duplicates_in_flight_pieces() {
-    let queue = PieceQueue::new(&[false; 2]);
+    let queue = PieceQueue::all_wanted(&[false; 2]);
     let seed = peer(&queue, &[true; 2]);
     let a = queue.claim(&seed, &[]).unwrap();
     let b = queue.claim(&seed, &[]).unwrap();
@@ -183,7 +183,7 @@ fn endgame_duplicates_in_flight_pieces() {
 
 #[test]
 fn endgame_piece_is_requeued_only_when_every_claim_is_dropped() {
-    let queue = PieceQueue::new(&[false; 1]);
+    let queue = PieceQueue::all_wanted(&[false; 1]);
     let seed = peer(&queue, &[true]);
     let a = queue.claim(&seed, &[]).unwrap();
     let b = queue.claim(&seed, &[]).unwrap();
@@ -199,7 +199,7 @@ fn endgame_piece_is_requeued_only_when_every_claim_is_dropped() {
 
 #[test]
 fn dropping_a_duplicate_after_completion_changes_nothing() {
-    let queue = PieceQueue::new(&[false; 1]);
+    let queue = PieceQueue::all_wanted(&[false; 1]);
     let seed = peer(&queue, &[true]);
     let a = queue.claim(&seed, &[]).unwrap();
     let b = queue.claim(&seed, &[]).unwrap();
@@ -212,7 +212,7 @@ fn dropping_a_duplicate_after_completion_changes_nothing() {
 
 #[tokio::test]
 async fn closed_queue_hands_out_nothing_and_wakes_workers() {
-    let queue = PieceQueue::new(&[false; 2]);
+    let queue = PieceQueue::all_wanted(&[false; 2]);
     let seed = peer(&queue, &[true; 2]);
     let held = queue.claim(&seed, &[]).unwrap();
     assert!(!queue.is_finished());
@@ -237,7 +237,7 @@ async fn closed_queue_hands_out_nothing_and_wakes_workers() {
 
 #[test]
 fn choked_claims_take_only_allowed_fast_pieces() {
-    let queue = PieceQueue::new(&[false, false, true, false]);
+    let queue = PieceQueue::all_wanted(&[false, false, true, false]);
     let partial = peer(&queue, &[true, true, false, true]);
     let allowed = [false, true, true, false];
     // Piece 2 is allowed, but we have it already.
@@ -256,7 +256,7 @@ fn choked_claims_take_only_allowed_fast_pieces() {
 
 #[test]
 fn endgame_never_duplicates_a_piece_the_worker_holds() {
-    let queue = PieceQueue::new(&[false; 2]);
+    let queue = PieceQueue::all_wanted(&[false; 2]);
     let seed = peer(&queue, &[true; 2]);
     let a = queue.claim(&seed, &[]).unwrap();
     let b = queue.claim(&seed, &[]).unwrap();
@@ -267,7 +267,7 @@ fn endgame_never_duplicates_a_piece_the_worker_holds() {
 
 #[test]
 fn bitfield_and_haves_follow_completed_pieces() {
-    let queue = PieceQueue::new(&[false; 3]);
+    let queue = PieceQueue::all_wanted(&[false; 3]);
     assert_eq!(queue.have_message(false), (None, 0));
     assert_eq!(queue.have_message(true), (Some(PeerMessage::HaveNone), 0));
     assert!(!queue.has(0));
@@ -301,9 +301,9 @@ fn bitfield_and_haves_follow_completed_pieces() {
 
 #[test]
 fn a_seeding_queue_keeps_workers_until_closed() {
-    let queue = PieceQueue::new(&[true, true]);
+    let queue = PieceQueue::all_wanted(&[true, true]);
     assert!(queue.is_done() && queue.is_finished());
-    let queue = PieceQueue::new(&[true, true]).seeding(true);
+    let queue = PieceQueue::all_wanted(&[true, true]).seeding(true);
     assert!(queue.is_done() && !queue.is_finished());
     queue.close();
     assert!(queue.is_finished());
@@ -311,7 +311,7 @@ fn a_seeding_queue_keeps_workers_until_closed() {
 
 #[test]
 fn pieces_on_disk_are_in_the_bitfield_but_never_announced() {
-    let queue = PieceQueue::new(&[true, false, true]);
+    let queue = PieceQueue::all_wanted(&[true, false, true]);
     assert!(queue.has(0) && !queue.has(1) && queue.has(2));
     let bitfield = vec![0b1010_0000];
     let message = Some(PeerMessage::Bitfield { bitfield });
@@ -322,7 +322,7 @@ fn pieces_on_disk_are_in_the_bitfield_but_never_announced() {
 
 #[tokio::test]
 async fn wait_for_wakes_on_completion() {
-    let queue = PieceQueue::new(&[false; 1]);
+    let queue = PieceQueue::all_wanted(&[false; 1]);
     let seed = peer(&queue, &[true]);
     let a = queue.claim(&seed, &[]).unwrap();
     let b = queue.claim(&seed, &[]).unwrap();
@@ -342,4 +342,67 @@ async fn wait_for_wakes_on_completion() {
     })
     .await
     .expect("not woken by completion");
+}
+
+const SKIP: Option<Priority> = None;
+const NORMAL: Option<Priority> = Some(Priority::Normal);
+const HIGH: Option<Priority> = Some(Priority::High);
+
+#[test]
+fn skipped_pieces_are_never_claimed() {
+    let queue = PieceQueue::new(&[false; 3], &[NORMAL, SKIP, NORMAL]);
+    assert_eq!(queue.remaining(), 2);
+    assert_eq!(queue.wanted(), 2);
+    let seed = peer(&queue, &[true; 3]);
+    let a = queue.claim(&seed, &[]).unwrap();
+    let b = queue.claim(&seed, &[]).unwrap();
+    let mut claimed = [a.index, b.index];
+    claimed.sort();
+    assert_eq!(claimed, [0, 2]);
+    // Endgame joins an in-flight piece, never the skipped one.
+    let c = queue.claim(&seed, &[a.index]).unwrap();
+    assert_eq!(c.index, b.index);
+}
+
+#[test]
+fn high_goes_before_a_rarer_normal_piece() {
+    let queue = PieceQueue::new(&[false; 2], &[NORMAL, HIGH]);
+    // Piece 1 is the more common one.
+    let _a = peer(&queue, &[false, true]);
+    let _b = peer(&queue, &[false, true]);
+    let seed = peer(&queue, &[true, true]);
+    for _ in 0..20 {
+        // Dropping the claim returns the piece to the queue.
+        assert_eq!(queue.claim(&seed, &[]).unwrap().index, 1);
+    }
+}
+
+#[test]
+fn rarest_still_decides_within_a_priority() {
+    let queue = PieceQueue::new(&[false; 3], &[HIGH, HIGH, NORMAL]);
+    let _a = peer(&queue, &[true, false, true]);
+    let _b = peer(&queue, &[true, false, true]);
+    let seed = peer(&queue, &[true, true, true]);
+    assert_eq!(queue.claim(&seed, &[]).unwrap().index, 1);
+}
+
+#[test]
+fn is_done_without_the_skipped_pieces() {
+    let queue = PieceQueue::new(&[false; 3], &[NORMAL, SKIP, SKIP]);
+    assert!(!queue.is_done());
+    let seed = peer(&queue, &[true; 3]);
+    queue.claim(&seed, &[]).unwrap().complete();
+    assert!(queue.is_done());
+    assert!(queue.is_finished());
+    assert_eq!(queue.have_bitfield(), [true, false, false]);
+    // A skipped piece that was on disk already is not counted either way.
+    let queue = PieceQueue::new(&[false, true, false], &[NORMAL, SKIP, NORMAL]);
+    assert_eq!(queue.remaining(), 2);
+}
+
+#[test]
+fn a_peer_with_only_skipped_pieces_is_not_wanted() {
+    let queue = PieceQueue::new(&[false; 3], &[NORMAL, SKIP, SKIP]);
+    assert!(!queue.wants(&peer(&queue, &[false, true, true])));
+    assert!(queue.wants(&peer(&queue, &[true, false, false])));
 }

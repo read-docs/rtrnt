@@ -10,6 +10,8 @@ pub(crate) fn torrent(hash: u8, name: &str) -> TorrentSnapshot {
         name: name.into(),
         state: TorrentState::Downloading,
         layout: None,
+        priorities: Vec::new(),
+        wanted: None,
         save_path: PathBuf::new(),
         verified: 0,
         received: 0,

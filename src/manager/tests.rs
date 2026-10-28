@@ -257,6 +257,7 @@ fn recording(
 
 const RECHECK: StartOptions = StartOptions {
     recheck: Recheck::ThenRun,
+    selection: None,
 };
 
 #[tokio::test]
@@ -617,6 +618,7 @@ async fn a_torrent_only_checked_ends_paused() {
     let mut manager = Manager::with_runner(Arc::clone(&client), never, fake_run);
     let only_check = StartOptions {
         recheck: Recheck::ThenPause,
+        selection: None,
     };
     manager.start(vec![magnet(UNTIL_STOPPED)], only_check).await;
     manager.drive(closed()).await;

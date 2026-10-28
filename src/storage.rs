@@ -1,3 +1,4 @@
+use crate::selection::{FileSelection, Priority, priorities_of};
 use crate::torrent::Info;
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
@@ -20,11 +21,18 @@ pub struct FileSpan {
     pub offset: u64,
     pub length: u64,
     /// The file's size when the storage was opened, before any resizing, or
-    /// `None` if it did not exist.
+    /// `None` if it did not exist. A file that was skipped and not needed
+    /// by a wanted piece is not created, so it stays `None`.
     pub found: Option<u64>,
 }
 
 impl FileSpan {
+    /// Whether the file is on disk, as far as the storage knows: it was
+    /// there or was created when the storage was opened.
+    pub fn exists(&self) -> bool {
+        self.found.is_some()
+    }
+
     /// Bytes at the start of the file that were there before we opened it.
     fn prior_len(&self) -> u64 {
         self.found.unwrap_or(0)
@@ -38,6 +46,8 @@ pub struct Storage {
     piece_length: u64,
     total_length: u64,
     writable: bool,
+    /// Which files are wanted, as the files were created by.
+    selection: FileSelection,
     handles: Mutex<HandleCache>,
 }
 
@@ -91,11 +101,34 @@ impl Storage {
             .collect())
     }
 
-    /// Creates (or opens) every file with its final size. Single-file
-    /// torrents go in `out_dir/name`, multi-file ones under `out_dir/name/`.
-    pub fn new(info: &Info, out_dir: &Path) -> Result<Self> {
+    /// Creates (or opens) every file with its final size, except a file
+    /// that `selection` skips and no wanted piece touches, which is left
+    /// alone (not created, not resized). A skipped file that shares a piece
+    /// with a wanted one is created with its full length (sparse where the
+    /// file system allows). Single-file torrents go in `out_dir/name`,
+    /// multi-file ones under `out_dir/name/`.
+    ///
+    /// `selection` lists a priority for each file, or none at all, which
+    /// means all are `Normal`.
+    pub fn new(info: &Info, out_dir: &Path, selection: &FileSelection) -> Result<Self> {
         let mut files = layout(info, out_dir)?;
-        for file in &mut files {
+        if !selection.is_empty() && selection.priorities().len() != files.len() {
+            bail!(
+                "selection lists {} files, the torrent has {}",
+                selection.priorities().len(),
+                files.len()
+            );
+        }
+        let touched = touched_by_wanted_pieces(info, &files, selection);
+        for (index, file) in files.iter_mut().enumerate() {
+            if selection.priority(index) == Priority::Skip && !touched[index] {
+                // Whatever is there from an earlier run stays as it is.
+                file.found = std::fs::metadata(&file.path)
+                    .ok()
+                    .filter(|meta| meta.is_file())
+                    .map(|meta| meta.len());
+                continue;
+            }
             if let Some(parent) = file.path.parent() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -115,7 +148,9 @@ impl Storage {
                 handle.set_len(file.length)?;
             }
         }
-        Ok(Self::with_files(info, files, true))
+        let mut storage = Self::with_files(info, files, true);
+        storage.selection = selection.clone();
+        Ok(storage)
     }
 
     /// Opens whatever files of the torrent are already on disk, read-only,
@@ -144,6 +179,7 @@ impl Storage {
             piece_length: info.piece_length,
             total_length,
             writable,
+            selection: FileSelection::default(),
             handles: Mutex::default(),
         }
     }
@@ -151,6 +187,19 @@ impl Storage {
     /// The torrent's files, in order.
     pub fn files(&self) -> &[FileSpan] {
         &self.files
+    }
+
+    /// The selection the files were created by: all `Normal` for a storage
+    /// opened with `open_existing`.
+    pub fn selection(&self) -> &FileSelection {
+        &self.selection
+    }
+
+    /// Whether every file holding bytes of `offset..offset + len` is on
+    /// disk.
+    pub fn files_exist(&self, offset: u64, len: usize) -> bool {
+        self.segments(offset, len)
+            .all(|(index, _, _)| self.files[index].exists())
     }
 
     /// Writes a verified piece to disk on the blocking thread pool.
@@ -299,6 +348,39 @@ fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result
         }
     }
     Ok(())
+}
+
+/// Indexes of the files holding bytes of `start..end`, which are in order in
+/// `files`. Empty files hold none.
+pub(crate) fn files_between(
+    files: &[FileSpan],
+    start: u64,
+    end: u64,
+) -> impl Iterator<Item = usize> {
+    let first = files.partition_point(|file| file.offset + file.length <= start);
+    (first..files.len())
+        .take_while(move |&file| files[file].offset < end)
+        .filter(move |&file| files[file].length > 0)
+}
+
+/// Which files hold bytes of a piece that `selection` wants.
+fn touched_by_wanted_pieces(
+    info: &Info,
+    files: &[FileSpan],
+    selection: &FileSelection,
+) -> Vec<bool> {
+    let priorities = priorities_of(files, info.piece_length, info.pieces.len() / 20, selection);
+    let mut touched = vec![false; files.len()];
+    for (index, priority) in priorities.iter().enumerate() {
+        if priority.is_some() {
+            let start = index as u64 * info.piece_length;
+            let end = start + info.piece_length;
+            for file in files_between(files, start, end) {
+                touched[file] = true;
+            }
+        }
+    }
+    touched
 }
 
 /// `path` as it is compared with others: lowercased on macOS and Windows,

@@ -113,6 +113,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         } else {
             Recheck::No
         },
+        selection: None,
     };
     manager.start(args.torrents, options).await;
     let (commands, commands_rx) = mpsc::unbounded_channel();

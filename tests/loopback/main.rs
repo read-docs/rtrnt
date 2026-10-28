@@ -12,5 +12,6 @@ mod recheck;
 mod remove;
 mod resume;
 mod seeding;
+mod selection;
 mod session;
 mod tracker;

@@ -4,6 +4,7 @@ use crate::listener::Listener;
 use crate::manager::{Recheck, StartOptions};
 use crate::rate_limit::RateLimits;
 use crate::resume::{self, Target};
+use crate::selection::{self, FileSelection, Priority};
 use crate::stats::{PeerSource, TorrentStats};
 use crate::storage::Storage;
 use crate::torrent::{self, TorrentFile};
@@ -29,7 +30,7 @@ mod upload;
 mod worker;
 
 pub use check::check_file;
-pub(crate) use check::{hash_pieces, verified_bytes};
+pub(crate) use check::hash_pieces;
 pub(crate) use swarm::{
     ConnectedPeers, Limits, StartPeers, dht_lookup, download_with, reannounce, sleep_until_some,
 };
@@ -114,6 +115,41 @@ pub struct Session {
     pub stats: Arc<TorrentStats>,
 }
 
+impl Session {
+    /// How much each piece is wanted, by the selection the storage was
+    /// opened with.
+    pub fn piece_priorities(&self) -> Vec<Option<Priority>> {
+        selection::piece_priorities(
+            &self.torrent,
+            self.storage.files(),
+            self.storage.selection(),
+        )
+    }
+
+    /// Bytes of wanted pieces not marked in `have`: what is left to
+    /// download.
+    pub fn left(&self, have: &[bool]) -> Result<u64> {
+        let priorities = self.piece_priorities();
+        Ok(selection::wanted_len(&self.torrent, &priorities)?
+            - selection::wanted_done(&self.torrent, &priorities, have)?)
+    }
+}
+
+/// The selection a run of a torrent of `file_count` files starts with:
+/// the one in `options`, else the one in the resume file, else all
+/// `Normal`.
+pub(crate) fn initial_selection(
+    options: &StartOptions,
+    resume: Option<&Target>,
+    file_count: usize,
+) -> FileSelection {
+    options
+        .selection
+        .clone()
+        .or_else(|| resume.and_then(|target| resume::load_selection(target, file_count)))
+        .unwrap_or_default()
+}
+
 /// Downloads the torrent at `torrent_path` and seeds it for as long as the
 /// client's `seed` setting says, stopping early (see `download_from_peers`)
 /// if `shutdown` resolves. It is first polled when the data on disk is
@@ -189,7 +225,13 @@ async fn download_loaded(
 
     // Before announcing, so a bad output directory does not leave the
     // tracker without a `stopped`.
-    let storage = Arc::new(Storage::new(&torrent.info, &config.output_dir)?);
+    let resume = Target::new(config, info_hash);
+    let selection = initial_selection(
+        options,
+        resume.as_ref(),
+        selection::file_count(&torrent.info),
+    );
+    let storage = Arc::new(Storage::new(&torrent.info, &config.output_dir, &selection)?);
     let dht = start_dht(&torrent, client).await;
     let session = Arc::new(Session {
         torrent,
@@ -201,7 +243,7 @@ async fn download_loaded(
         rate_limits: client.rate_limits(),
         metadata: Some(info_bytes),
         bars: client.bars().clone(),
-        resume: Target::new(config, info_hash),
+        resume,
         stats: Arc::clone(stats),
     });
 
@@ -212,7 +254,7 @@ async fn download_loaded(
     if options.recheck == Recheck::ThenPause {
         bail!(CheckedOnly);
     }
-    let left = session.torrent.length() - verified_bytes(&session.torrent, &have)?;
+    let left = session.left(&have)?;
     if left == 0 {
         info!(output = %config.output_dir.display(), "already complete");
         if !config.seed.enabled() {
