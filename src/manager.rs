@@ -234,7 +234,9 @@ where
     }
 
     /// Starts every torrent in `sources` at once with `options`, loading
-    /// the files first. One that fails does not stop the others. With
+    /// the files first. One that fails does not stop the others, and one
+    /// the session has already, as `restore` or an earlier source put
+    /// there, is skipped with a notice. With
     /// several, each one's logs carry its name.
     pub async fn start(&mut self, sources: Vec<Source>, options: StartOptions) {
         self.several |= sources.len() > 1;
@@ -251,6 +253,9 @@ where
                 }
             };
             let info_hash = torrent.info_hash();
+            if self.refuse_known(info_hash, &source) {
+                continue;
+            }
             let source = self.keep_copy(source, info_hash).await;
             let state = self.spawn(torrent, options.clone(), span);
             self.entries.push(Entry {
@@ -856,21 +861,7 @@ where
             }
         };
         let info_hash = torrent.info_hash();
-        if let Some(entry) = self
-            .entries
-            .iter()
-            .find(|entry| entry.info_hash == info_hash)
-        {
-            let why = match entry.state {
-                State::Running { .. } => "already running",
-                State::Restarting { .. } => "already running, restarting",
-                State::Paused => "already added, press p to resume",
-                State::Ended(_) => "already added, press p to run it again",
-                State::Removing { .. } => "still being removed, add it again once it has gone",
-            };
-            let name = stats_of(&self.client, info_hash, |_| true)
-                .map_or_else(|| source.label(), |stats| stats.name());
-            self.client.stats().notice(format!("{name}: {why}"));
+        if self.refuse_known(info_hash, &source) {
             return;
         }
         span.in_scope(|| info!("added"));
@@ -882,6 +873,30 @@ where
             state,
         });
         self.idle.send_replace(self.tasks.is_empty());
+    }
+
+    /// Whether the session has the torrent with `info_hash` already, in
+    /// which case a notice says so, in the terms of its state, and `source`
+    /// is not to be started.
+    fn refuse_known(&self, info_hash: [u8; 20], source: &Source) -> bool {
+        let Some(entry) = self
+            .entries
+            .iter()
+            .find(|entry| entry.info_hash == info_hash)
+        else {
+            return false;
+        };
+        let why = match entry.state {
+            State::Running { .. } => "already running",
+            State::Restarting { .. } => "already running, restarting",
+            State::Paused => "already added, press p to resume",
+            State::Ended(_) => "already added, press p to run it again",
+            State::Removing { .. } => "still being removed, add it again once it has gone",
+        };
+        let name = stats_of(&self.client, info_hash, |_| true)
+            .map_or_else(|| source.label(), |stats| stats.name());
+        self.client.stats().notice(format!("{name}: {why}"));
+        true
     }
 
     /// Drops the row of `entry`, removed from the session, and with

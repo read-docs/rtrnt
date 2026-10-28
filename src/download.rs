@@ -1,4 +1,4 @@
-use crate::client::{Client, ConnectionSlots};
+use crate::client::{Claim, Client, ConnectionSlots};
 use crate::dht::Dht;
 use crate::listener::Listener;
 use crate::manager::{Recheck, StartOptions};
@@ -207,13 +207,16 @@ pub async fn download_metainfo(
     client: &Client,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
+    // Before the row, so a torrent the client runs already does not leave a
+    // second row of the same torrent behind.
+    let claim = client.claim(metainfo.info_hash)?;
     let stats = client.stats().add_torrent(
         metainfo.info_hash,
         &metainfo.torrent.info.name,
         &client.config().output_dir,
     );
     stats.set_torrent(&metainfo.torrent);
-    let result = download_loaded(metainfo, options, client, &stats, shutdown).await;
+    let result = download_loaded(metainfo, options, client, claim, &stats, shutdown).await;
     stats.finish(&result);
     result
 }
@@ -223,6 +226,7 @@ async fn download_loaded(
     metainfo: torrent::Metainfo,
     options: &StartOptions,
     client: &Client,
+    mut claim: Claim<'_>,
     stats: &Arc<TorrentStats>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
@@ -239,7 +243,6 @@ async fn download_loaded(
         info_hash = %hex(&info_hash),
         "loaded torrent"
     );
-    let mut claim = client.claim(info_hash)?;
     // Before anything is created, so a torrent that shares a file with a
     // running one leaves its files alone.
     claim.claim_files(

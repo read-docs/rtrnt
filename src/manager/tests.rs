@@ -488,6 +488,26 @@ async fn a_torrent_the_session_has_is_not_added_again() {
 }
 
 #[tokio::test]
+async fn a_torrent_started_twice_gets_one_entry() {
+    let client = client();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, counting(&runs));
+    manager
+        .start(
+            vec![magnet(UNTIL_STOPPED), magnet(DONE), magnet(UNTIL_STOPPED)],
+            StartOptions::default(),
+        )
+        .await;
+    let hashes: Vec<_> = manager.entries().iter().map(|e| e.info_hash).collect();
+    assert_eq!(hashes, [[UNTIL_STOPPED; 20], [DONE; 20]]);
+    let notice = client.stats().last_notice().unwrap().1;
+    assert!(notice.ends_with(": already running"), "{notice}");
+    assert_eq!(runs.load(Ordering::Relaxed), 2);
+    // The one that was skipped is not a failure.
+    assert!(manager.unloaded.is_empty());
+}
+
+#[tokio::test]
 async fn a_torrent_file_that_does_not_load_is_not_added() {
     let client = client();
     let mut manager = Manager::with_runner(Arc::clone(&client), never, fake_run);

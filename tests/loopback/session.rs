@@ -1,9 +1,12 @@
 use indicatif::MultiProgress;
 use rtrnt::client::Client;
 use rtrnt::download::{DownloadConfig, Interrupted, SeedLimits, Session, download_file};
+use rtrnt::magnet::{MagnetLink, download_magnet};
+use rtrnt::manager::{Manager, StartOptions};
 use rtrnt::peer::{PeerMessage, generate_peer_id};
 use rtrnt::resume;
 use rtrnt::selection::FileSelection;
+use rtrnt::source::Source;
 use rtrnt::stats::TorrentStats;
 use rtrnt::storage::Storage;
 use std::future::pending;
@@ -140,8 +143,83 @@ async fn a_client_runs_a_torrent_once() {
         err.to_string().contains("already being downloaded"),
         "{err:#}"
     );
+    // The refused run left no row of its own.
+    assert_eq!(client.stats().torrents().len(), 1);
     // Once done, the torrent may run again.
     assert!(client.claim(info_hash).is_ok());
+}
+
+/// A magnet link for a torrent the client runs already is refused without a
+/// row of its own.
+#[tokio::test]
+async fn a_magnet_link_for_a_running_torrent_gets_no_row() {
+    init_tracing();
+    let client = client(DownloadConfig {
+        output_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
+        max_peers: 10,
+        max_connections: 100,
+        listen_port: 0,
+        seed: SeedLimits::default(),
+        dht: false,
+        max_download_rate: 0,
+        max_upload_rate: 0,
+        resume_dir: None,
+    });
+    let info_hash = [7; 20];
+    let _claim = client.claim(info_hash).unwrap();
+    let hex: String = info_hash.iter().map(|b| format!("{b:02x}")).collect();
+    let link = MagnetLink::parse(&format!("magnet:?xt=urn:btih:{hex}")).unwrap();
+    let err = download_magnet(&link, &StartOptions::default(), &client, pending())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("already being downloaded"),
+        "{err:#}"
+    );
+    assert!(client.stats().torrents().is_empty());
+}
+
+/// `rtrnt a.torrent a.torrent` runs the torrent once and gives it one row.
+#[tokio::test]
+async fn a_torrent_given_twice_gets_one_row() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (mut torrent, info_hash) = make_torrent(&data);
+    let (tracker_url, _queries) = mock_tracker(Vec::new()).await;
+    torrent.announce = Some(tracker_url);
+    let out = tempfile::tempdir().unwrap();
+    write_files(out.path(), &data);
+    let path = out.path().join("twice.torrent");
+    std::fs::write(&path, serde_bencode::to_bytes(&torrent).unwrap()).unwrap();
+
+    let client = Arc::new(client(DownloadConfig {
+        output_dir: out.path().to_path_buf(),
+        max_peers: 10,
+        max_connections: 100,
+        listen_port: 0,
+        seed: SeedLimits::default(),
+        dht: false,
+        max_download_rate: 0,
+        max_upload_rate: 0,
+        resume_dir: None,
+    }));
+    let mut manager = Manager::new(Arc::clone(&client), pending::<()>);
+    manager
+        .start(
+            vec![Source::File(path.clone()), Source::File(path)],
+            StartOptions::default(),
+        )
+        .await;
+    assert_eq!(manager.entries().len(), 1);
+    let (_, commands) = tokio::sync::mpsc::unbounded_channel();
+    let exit = tokio::time::timeout(Duration::from_secs(20), manager.run(commands))
+        .await
+        .expect("the session did not end");
+    // Done on disk already, so the one run ends at once, and succeeds.
+    assert!(exit.is_ok());
+    let torrents = client.stats().torrents();
+    assert_eq!(torrents.len(), 1);
+    assert_eq!(torrents[0].info_hash(), info_hash);
 }
 
 /// Two torrents that write the same files: the one that starts first runs,

@@ -10,7 +10,7 @@
 //! the output directory, so a later run with the same link, `--check` among
 //! them, uses that instead of asking peers again.
 
-use crate::client::Client;
+use crate::client::{Claim, Client};
 use crate::dht::DhtSearch;
 use crate::download::peer_pool::PeerPool;
 use crate::download::{self, CheckedOnly, Limits, Session, StartPeers};
@@ -269,6 +269,9 @@ pub async fn download_magnet(
         let metainfo = torrent::load_metainfo(&path).await?;
         return download::download_metainfo(metainfo, options, client, shutdown).await;
     }
+    // Before the row, so a torrent the client runs already does not leave a
+    // second row of the same torrent behind.
+    let claim = client.claim(link.info_hash)?;
     let name = link.name.clone().unwrap_or_else(|| hex(&link.info_hash));
     let stats = client
         .stats()
@@ -278,7 +281,7 @@ pub async fn download_magnet(
         total: 0,
         peers: 0,
     });
-    let result = fetch_and_download(link, options, client, &stats, shutdown).await;
+    let result = fetch_and_download(link, options, client, claim, &stats, shutdown).await;
     stats.finish(&result);
     result
 }
@@ -289,6 +292,7 @@ async fn fetch_and_download(
     link: &MagnetLink,
     options: &StartOptions,
     client: &Client,
+    mut claim: Claim<'_>,
     stats: &Arc<TorrentStats>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
@@ -300,7 +304,6 @@ async fn fetch_and_download(
         trackers = link.trackers.len(),
         "fetching metadata for magnet link"
     );
-    let mut claim = client.claim(info_hash)?;
     let peer_id = client.peer_id();
     let dht = client.dht().await;
     let mut incoming = client.listener().await.register(info_hash)?;
