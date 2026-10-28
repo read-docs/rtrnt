@@ -353,3 +353,102 @@ async fn rejects_a_choked_fast_peer_and_bans_one_that_rejects_unsent_requests() 
     assert!(result.is_err(), "downloaded without a peer");
     peer.await.unwrap();
 }
+
+/// A fast peer (BEP 6) takes our requests, answers the first, chokes us, and
+/// from then on only sends keep-alives, so that we never time it out for
+/// silence. The requests it ignores are cancelled after a minute, and it is
+/// dropped for not unchoking us after another half. Time is paused once the
+/// peer is connected, so the minutes pass at once.
+#[tokio::test]
+async fn cancels_requests_a_choked_fast_peer_never_answers() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+    let out = tempfile::tempdir().unwrap();
+    let session = session(torrent, info_hash, out.path());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = listener.local_addr().unwrap();
+    let peer_data = Arc::clone(&data);
+    let peer = tokio::spawn(async move {
+        let socket = accept_fast(&listener, info_hash).await;
+        let (mut reader, mut writer) = socket.into_split();
+        let (messages_tx, mut messages) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(message) = read_message(&mut reader).await {
+                let _ = messages_tx.send(message);
+            }
+        });
+        writer
+            .write_all(&encode_all(&[PeerMessage::HaveAll, PeerMessage::Unchoke]))
+            .await
+            .unwrap();
+
+        let mut requested = Vec::new();
+        let mut answered = None;
+        let mut cancelled = Vec::new();
+        let mut ticks = tokio::time::interval(Duration::from_secs(10));
+        let mut round = 0;
+        // Whether the client hung up, rather than we gave up waiting.
+        let hung_up = loop {
+            tokio::select! {
+                message = messages.recv() => match message {
+                    None => break true,
+                    Some(PeerMessage::Request { index, begin, length }) => {
+                        requested.push((index, begin, length));
+                        if answered.is_none() {
+                            // Connected, so the clock can stop without the
+                            // connection timing out while it is set up.
+                            tokio::time::pause();
+                            ticks.reset();
+                            answered = Some((index, begin, length));
+                            let reply = piece(&peer_data, index, begin, length);
+                            writer.write_all(&reply.encode()).await.unwrap();
+                        }
+                    }
+                    Some(PeerMessage::Cancel { index, begin, length }) => {
+                        cancelled.push((index, begin, length));
+                    }
+                    Some(_) => {}
+                },
+                _ = ticks.tick() => {
+                    round += 1;
+                    // Half a minute in, the choke; keep-alives otherwise.
+                    let message = if round == 4 {
+                        PeerMessage::Choke
+                    } else {
+                        PeerMessage::KeepAlive
+                    };
+                    let _ = writer.write_all(&message.encode()).await;
+                    if round > 20 {
+                        break false;
+                    }
+                }
+            }
+        };
+        (requested, answered, cancelled, hung_up)
+    });
+
+    let have = vec![false; num_pieces];
+    let peers = [peer_addr];
+    let (mut requested, answered, mut cancelled, hung_up) = tokio::select! {
+        result = download_from_peers(
+            session,
+            &have,
+            &peers,
+            10,
+            Vec::new(),
+            None,
+            pending(),
+        ) => panic!("download ended before the peer was done: {result:?}"),
+        done = peer => done.unwrap(),
+    };
+    let answered = answered.expect("no request came");
+    requested.retain(|request| *request != answered);
+    requested.sort_unstable();
+    cancelled.sort_unstable();
+    assert!(!requested.is_empty(), "nothing was left unanswered");
+    assert_eq!(cancelled, requested, "unanswered requests not cancelled");
+    assert!(hung_up, "kept waiting for a peer that never unchokes us");
+}

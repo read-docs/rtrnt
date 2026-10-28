@@ -29,7 +29,7 @@ fn active_piece_requests_blocks_in_order_and_assembles_them() {
     let (data, mut piece) = active(&queue, &seed);
     let mut lengths = Vec::new();
     while piece.has_unrequested() {
-        let PeerMessage::Request { begin, length, .. } = piece.request_next() else {
+        let PeerMessage::Request { begin, length, .. } = piece.request_next(Instant::now()) else {
             panic!("not a request");
         };
         lengths.push((begin, length));
@@ -66,7 +66,7 @@ fn active_piece_ignores_duplicate_and_unrequested_blocks() {
     let queue = PieceQueue::all_wanted(&[false; 1]);
     let seed = peer(&queue, &[true]);
     let (data, mut piece) = active(&queue, &seed);
-    piece.request_next();
+    piece.request_next(Instant::now());
     // A late reply to a request abandoned on a choke, for a block we
     // have not asked for again yet.
     assert!(!piece.add_block(BLOCK_SIZE, block(&data, 1)).unwrap());
@@ -83,7 +83,7 @@ fn active_piece_rejects_invalid_blocks() {
     let seed = peer(&queue, &[true]);
     let (data, mut piece) = active(&queue, &seed);
     while piece.has_unrequested() {
-        piece.request_next();
+        piece.request_next(Instant::now());
     }
     let full = vec![0u8; BLOCK_SIZE as usize];
     for (begin, block) in [
@@ -102,8 +102,8 @@ fn active_piece_cancels_only_outstanding_requests() {
     let queue = PieceQueue::all_wanted(&[false; 1]);
     let seed = peer(&queue, &[true]);
     let (data, mut piece) = active(&queue, &seed);
-    piece.request_next();
-    piece.request_next();
+    piece.request_next(Instant::now());
+    piece.request_next(Instant::now());
     piece.add_block(0, block(&data, 0)).unwrap();
     let cancels: Vec<PeerMessage> = piece.outstanding().map(BlockRequest::cancel).collect();
     assert_eq!(
@@ -126,8 +126,8 @@ fn rejected_blocks_are_requested_again_first() {
         begin: block * BLOCK_SIZE,
         length: BLOCK_SIZE.min(data.len() as u32 - block * BLOCK_SIZE),
     };
-    assert_eq!(piece.request_next(), request(0));
-    assert_eq!(piece.request_next(), request(1));
+    assert_eq!(piece.request_next(Instant::now()), request(0));
+    assert_eq!(piece.request_next(Instant::now()), request(1));
     // Not outstanding: unrequested, wrong length, not a block start.
     assert!(!piece.reject(2 * BLOCK_SIZE, BLOCK_SIZE / 2));
     assert!(!piece.reject(0, BLOCK_SIZE - 1));
@@ -139,8 +139,8 @@ fn rejected_blocks_are_requested_again_first() {
     assert_eq!(piece.in_flight(), 1);
     // A block that arrives after all is ignored until asked for again.
     assert!(!piece.add_block(0, block(&data, 0)).unwrap());
-    assert_eq!(piece.request_next(), request(0));
-    assert_eq!(piece.request_next(), request(2));
+    assert_eq!(piece.request_next(Instant::now()), request(0));
+    assert_eq!(piece.request_next(Instant::now()), request(2));
     assert!(!piece.has_unrequested());
     let outstanding: Vec<BlockRequest> = piece.outstanding().collect();
     assert_eq!(outstanding.len(), 3);
@@ -148,7 +148,7 @@ fn rejected_blocks_are_requested_again_first() {
     assert!(piece.add_block(BLOCK_SIZE, block(&data, 1)).unwrap());
     assert!(!piece.reject(BLOCK_SIZE, BLOCK_SIZE), "already received");
     assert!(piece.reject(2 * BLOCK_SIZE, BLOCK_SIZE / 2));
-    assert_eq!(piece.request_next(), request(2));
+    assert_eq!(piece.request_next(Instant::now()), request(2));
     for b in [0, 2] {
         assert!(
             piece
@@ -158,6 +158,55 @@ fn rejected_blocks_are_requested_again_first() {
     }
     assert!(piece.is_complete());
     assert_eq!(piece.in_flight(), 0);
+}
+
+#[test]
+fn unanswered_requests_expire_and_are_asked_for_again() {
+    let queue = PieceQueue::all_wanted(&[false; 1]);
+    let seed = peer(&queue, &[true]);
+    let (data, mut piece) = active(&queue, &seed);
+    let timeout = Duration::from_secs(60);
+    let start = Instant::now();
+    let at = |secs| start + Duration::from_secs(secs);
+    let request = |block: u32, length: u32| BlockRequest {
+        index: 0,
+        begin: block * BLOCK_SIZE,
+        length,
+    };
+    for secs in [0, 30, 40] {
+        piece.request_next(at(secs));
+    }
+    // The second block is answered in time, and so never expires.
+    assert!(piece.add_block(BLOCK_SIZE, block(&data, 1)).unwrap());
+    assert_eq!(piece.in_flight(), 2);
+
+    assert!(piece.expire(at(59), timeout).is_empty());
+    assert_eq!(piece.in_flight(), 2);
+    assert!(!piece.has_unrequested());
+
+    // Only the first request is old enough.
+    assert_eq!(piece.expire(at(60), timeout), [request(0, BLOCK_SIZE)]);
+    assert_eq!(piece.in_flight(), 1);
+    assert!(piece.has_unrequested());
+    // Nothing expires twice, and the block waits for a new request.
+    assert!(piece.expire(at(60), timeout).is_empty());
+    assert_eq!(
+        piece.request_next(at(61)),
+        PeerMessage::Request {
+            index: 0,
+            begin: 0,
+            length: BLOCK_SIZE,
+        }
+    );
+
+    // The third block expires on its own clock, the first one's new request
+    // not yet.
+    assert_eq!(piece.expire(at(100), timeout), [request(2, BLOCK_SIZE / 2)]);
+    assert_eq!(piece.in_flight(), 1);
+    assert_eq!(piece.expire(at(121), timeout), [request(0, BLOCK_SIZE)]);
+    assert_eq!(piece.in_flight(), 0);
+    // A late answer to an expired request is ignored, not an error.
+    assert!(!piece.add_block(0, block(&data, 0)).unwrap());
 }
 
 #[test]
@@ -171,7 +220,7 @@ fn a_choke_releases_pieces_with_nothing_outstanding_unless_allowed_fast() {
         ActivePiece::new(claim, u64::from(2 * BLOCK_SIZE), [0; 20]).unwrap()
     };
     let (mut waiting, idle, allowed) = (piece(0), piece(1), piece(2));
-    waiting.request_next();
+    waiting.request_next(Instant::now());
     let mut active = vec![waiting, idle, allowed];
     release_choked(&mut active, &[false, false, true]);
     let held: Vec<usize> = active.iter().map(|piece| piece.claim.index).collect();
@@ -193,7 +242,7 @@ fn a_complete_piece_is_returned_when_its_claim_is_dropped() {
     let seed = peer(&queue, &[true]);
     let (data, mut piece) = active(&queue, &seed);
     for b in 0..3 {
-        piece.request_next();
+        piece.request_next(Instant::now());
         piece
             .add_block(b as u32 * BLOCK_SIZE, block(&data, b))
             .unwrap();

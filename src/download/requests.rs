@@ -80,7 +80,7 @@ pub(super) async fn request_blocks<'q>(
         if !budget.try_take(active[pos].next_block_len().into(), Instant::now()) {
             break;
         }
-        requests.push(active[pos].request_next());
+        requests.push(active[pos].request_next(Instant::now()));
     }
     if !requests.is_empty() {
         conn.send_all(&requests).await?;
@@ -111,6 +111,33 @@ pub(super) async fn drop_completed(
         }
         !completed
     });
+    if !cancels.is_empty() {
+        conn.send_all(&cancels).await?;
+    }
+    Ok(())
+}
+
+/// Takes back the requests the peer has not answered within `timeout`, and
+/// cancels them, so their blocks are asked for again. With `cancelled` (fast
+/// extension), the cancelled requests are added to it, as the peer still
+/// answers them.
+pub(super) async fn expire_requests(
+    conn: &mut PeerConnection,
+    active: &mut [ActivePiece<'_>],
+    now: Instant,
+    timeout: Duration,
+    mut cancelled: Option<&mut HashSet<BlockRequest>>,
+) -> Result<()> {
+    let mut cancels = Vec::new();
+    for piece in active {
+        for request in piece.expire(now, timeout) {
+            debug!(addr = %conn.addr, ?request, "request timed out");
+            cancels.push(request.cancel());
+            if let Some(cancelled) = cancelled.as_deref_mut() {
+                cancelled.insert(request);
+            }
+        }
+    }
     if !cancels.is_empty() {
         conn.send_all(&cancels).await?;
     }
@@ -186,8 +213,8 @@ impl Pipeline {
 enum BlockState {
     /// Not asked for, or asked for and rejected (fast extension).
     Wanted,
-    /// Asked for and not yet answered.
-    Requested,
+    /// Asked for at the given time and not yet answered.
+    Requested(Instant),
     Received,
 }
 
@@ -259,11 +286,11 @@ impl<'a> ActivePiece<'a> {
         self.block_len(self.next_request)
     }
 
-    /// The request for the first wanted block. Call only if
+    /// The request for the first wanted block, sent at `now`. Call only if
     /// `has_unrequested`.
-    fn request_next(&mut self) -> PeerMessage {
+    fn request_next(&mut self, now: Instant) -> PeerMessage {
         let block = self.next_request;
-        self.blocks[block] = BlockState::Requested;
+        self.blocks[block] = BlockState::Requested(now);
         self.in_flight += 1;
         self.next_request = (block + 1..self.blocks.len())
             .find(|&b| self.blocks[b] == BlockState::Wanted)
@@ -283,7 +310,7 @@ impl<'a> ActivePiece<'a> {
     /// Every request still outstanding.
     fn outstanding(&self) -> impl Iterator<Item = BlockRequest> + '_ {
         (0..self.blocks.len())
-            .filter(|&block| self.blocks[block] == BlockState::Requested)
+            .filter(|&block| matches!(self.blocks[block], BlockState::Requested(_)))
             .map(|block| self.block_request(block))
     }
 
@@ -294,13 +321,33 @@ impl<'a> ActivePiece<'a> {
         let Some(block) = self.block_at(begin) else {
             return false;
         };
-        if self.blocks[block] != BlockState::Requested || length != self.block_len(block) {
+        if !matches!(self.blocks[block], BlockState::Requested(_))
+            || length != self.block_len(block)
+        {
             return false;
         }
         self.blocks[block] = BlockState::Wanted;
         self.in_flight -= 1;
         self.next_request = self.next_request.min(block);
         true
+    }
+
+    /// Takes back the requests that were sent `timeout` or longer before
+    /// `now` and are still unanswered, so their blocks are asked for again,
+    /// and returns them.
+    pub(super) fn expire(&mut self, now: Instant, timeout: Duration) -> Vec<BlockRequest> {
+        let mut expired = Vec::new();
+        for block in 0..self.blocks.len() {
+            if let BlockState::Requested(sent) = self.blocks[block]
+                && now.saturating_duration_since(sent) >= timeout
+            {
+                self.blocks[block] = BlockState::Wanted;
+                self.in_flight -= 1;
+                self.next_request = self.next_request.min(block);
+                expired.push(self.block_request(block));
+            }
+        }
+        expired
     }
 
     /// Stores a block of this piece. Returns false if it was not one we are
@@ -312,7 +359,7 @@ impl<'a> ActivePiece<'a> {
             Some(index) if block.len() == self.block_len(index) as usize => index,
             _ => bail!(Misbehaved("peer sent an invalid block")),
         };
-        if self.blocks[index] != BlockState::Requested {
+        if !matches!(self.blocks[index], BlockState::Requested(_)) {
             return Ok(false);
         }
         let start = begin as usize;

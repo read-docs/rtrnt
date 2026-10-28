@@ -13,7 +13,9 @@ use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use super::queue::PieceQueue;
-use super::requests::{ActivePiece, Pipeline, drop_completed, release_choked, request_blocks};
+use super::requests::{
+    ActivePiece, Pipeline, drop_completed, expire_requests, release_choked, request_blocks,
+};
 use super::swarm::{Link, Swarm, sleep_until_some};
 use super::upload::{BlockRequest, Uploads, serve_block};
 use super::{Misbehaved, Session};
@@ -24,6 +26,10 @@ const MAX_HASH_FAILURES: u32 = 3;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// A peer that keeps us choked this long while we are interested is dropped.
 const UNCHOKE_TIMEOUT: Duration = Duration::from_secs(60);
+/// A block request that goes unanswered this long is cancelled and asked for
+/// again, which a peer that keeps sending messages would otherwise never
+/// make us do.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// How often an idle worker re-checks the queue.
 const IDLE_POLL: Duration = Duration::from_secs(2);
 
@@ -201,6 +207,14 @@ pub(super) async fn peer_worker(
             }
         }
         let now = Instant::now();
+        expire_requests(
+            &mut conn,
+            &mut active,
+            now,
+            REQUEST_TIMEOUT,
+            fast.then_some(&mut cancelled),
+        )
+        .await?;
         // Worth keeping while either side wants something from the other.
         if wanted || conn.peer_interested() {
             last_useful = now;
@@ -210,6 +224,12 @@ pub(super) async fn peer_worker(
             Some(deadline) => Some(deadline),
             None => Some(now + UNCHOKE_TIMEOUT),
         };
+        // Also while requests are outstanding: with the fast extension they
+        // stand through a choke, and a peer that chokes us and then only
+        // keep-alives would be waited on for good.
+        if unchoke_deadline.is_some_and(|deadline| now >= deadline) {
+            bail!("peer did not unchoke us");
+        }
         if fast && conn.is_choked() {
             release_choked(&mut active, conn.allowed_fast());
         }
@@ -274,9 +294,6 @@ pub(super) async fn peer_worker(
                 () = std::future::ready(()) => None,
             }
         } else if active.is_empty() {
-            if unchoke_deadline.is_some_and(|deadline| now >= deadline) {
-                bail!("peer did not unchoke us");
-            }
             if now - last_useful > IDLE_TIMEOUT {
                 bail!("neither side has pieces the other needs");
             }
@@ -321,6 +338,7 @@ pub(super) async fn peer_worker(
                 message = receive => Some(message?),
                 () = queue.wait_for(woken) => None,
                 () = slot.changed() => None,
+                () = sleep_until_some(unchoke_deadline) => None,
                 () = sleep_until_some(next_turn) => {
                     turn_came = true;
                     None
