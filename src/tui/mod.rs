@@ -26,6 +26,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use snapshot::Snapshot;
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -103,13 +104,19 @@ pub enum Exit {
 
 /// Runs the UI on the terminal until the user leaves, showing what `feed`
 /// gives. `finished` is true while no torrent's task is running; the UI
-/// then says so and waits for `q`.
+/// then says so and waits for `q`. A torrent added by a relative path is
+/// under `dir`.
 ///
 /// The terminal is put back as it was on every way out, a panic included.
-pub async fn run(mut feed: impl Feed, mut finished: watch::Receiver<bool>) -> io::Result<Exit> {
+pub async fn run(
+    mut feed: impl Feed,
+    mut finished: watch::Receiver<bool>,
+    dir: PathBuf,
+) -> io::Result<Exit> {
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut app = App::new(Theme::detect());
+    app.dir = dir;
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(TICK);
     let mut done = *finished.borrow();

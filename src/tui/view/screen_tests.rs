@@ -435,7 +435,7 @@ fn a_paused_torrent_says_so_and_p_resumes_it() {
     let lines = text(&buffer, buffer.area);
     assert!(lines.iter().any(|line| line.contains("paused")));
     assert!(
-        lines[31].contains("  q quit  p resume  x remove  d u limits"),
+        lines[31].contains("  q quit  p resume  x remove  a add  d u limits"),
         "{}",
         lines[31]
     );
@@ -683,4 +683,52 @@ fn the_removal_question_names_the_files_over_the_screen() {
     let lines = text(&buffer, buffer.area);
     assert!(lines.iter().any(|line| line.contains("removing")));
     assert!(!lines[31].contains("  x "), "{}", lines[31]);
+}
+
+#[test]
+fn an_empty_session_says_to_press_a() {
+    let mut snapshot = Snapshot {
+        finished: true,
+        ..demo::fixture()
+    };
+    snapshot.torrents.clear();
+    snapshot.detail = None;
+    let mut app = app(&snapshot);
+    assert_eq!(app.selected, None);
+    let buffer = render(100, 32, &snapshot, &app);
+    let lines = text(&buffer, buffer.area);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("│ no torrents yet: press a to add a torrent ")),
+        "{lines:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("│ no torrent selected "))
+    );
+    assert!(
+        lines[31].starts_with(" press a to add a torrent, or q to exit "),
+        "{}",
+        lines[31]
+    );
+
+    // The prompt says what to type until something is.
+    app.handle_key(
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        &snapshot,
+    );
+    let buffer = render(100, 32, &snapshot, &app);
+    let line = &text(&buffer, buffer.area)[31];
+    assert!(
+        line.starts_with(" add: ▏path to a .torrent or magnet link   enter add  esc cancel"),
+        "{line}"
+    );
+    app.handle_key(
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        &snapshot,
+    );
+    let buffer = render(100, 32, &snapshot, &app);
+    assert!(text(&buffer, buffer.area)[31].starts_with(" add: /▏   enter add"));
 }

@@ -37,6 +37,8 @@ pub enum Command {
     /// Drop the torrent with this info hash from the session, stopping it
     /// first if it runs, and with `delete` its files and resume file too.
     Remove { info_hash: [u8; 20], delete: bool },
+    /// Start the torrent from this source too, unless the session has it.
+    Add(Source),
 }
 
 /// Resolves when a torrent is to stop.
@@ -110,8 +112,9 @@ pub struct Manager<S, R> {
     running: HashMap<task::Id, [u8; 20]>,
     /// Torrent files that could not be loaded, and so have no entry.
     unloaded: Vec<anyhow::Error>,
-    /// Whether the session was started with more than one torrent: each
-    /// one's logs then carry its name.
+    /// Whether the session was started with more than one torrent, or can
+    /// get more: each one's logs then carry its name, and each failure is
+    /// logged as it comes rather than returned.
     several: bool,
     /// True while no task is running.
     idle: watch::Sender<bool>,
@@ -160,11 +163,17 @@ where
         &self.entries
     }
 
+    /// Runs the session as one of several torrents however many it starts
+    /// with, since the UI can add more (see `several`).
+    pub fn expect_more(&mut self) {
+        self.several = true;
+    }
+
     /// Starts every torrent in `sources` at once, loading the files first.
     /// One that fails does not stop the others. With several, each one's
     /// logs carry its name.
     pub async fn start(&mut self, sources: Vec<Source>) {
-        self.several = sources.len() > 1;
+        self.several |= sources.len() > 1;
         for source in sources {
             let span = self.span(&source);
             let torrent = match load(&source, &span).await {
@@ -385,6 +394,52 @@ where
         }
     }
 
+    /// Starts the torrent from `source` as `start` does, with the session's
+    /// settings, unless the session has it already or its file cannot be
+    /// loaded; a notice then says why, and no row is made.
+    ///
+    /// The file is loaded here rather than in a task of its own: it is
+    /// small, and the check for a torrent the session has is then never
+    /// raced by another `Add` of it. The torrents run on meanwhile.
+    async fn add(&mut self, source: Source) {
+        let span = self.span(&source);
+        let torrent = match load(&source, &span).await {
+            Ok(torrent) => torrent,
+            Err(e) => {
+                span.in_scope(|| warn!("cannot add: {e:#}"));
+                self.client
+                    .stats()
+                    .notice(format!("cannot add {}: {e:#}", source.label()));
+                return;
+            }
+        };
+        let info_hash = torrent.info_hash();
+        if let Some(entry) = self
+            .entries
+            .iter()
+            .find(|entry| entry.info_hash == info_hash)
+        {
+            let why = match entry.state {
+                State::Running { .. } => "already running",
+                State::Paused => "already added, press p to resume",
+                State::Ended(_) => "already added, press p to run it again",
+                State::Removing { .. } => "still being removed, add it again once it has gone",
+            };
+            let name = stats_of(&self.client, info_hash, |_| true)
+                .map_or_else(|| source.label(), |stats| stats.name());
+            self.client.stats().notice(format!("{name}: {why}"));
+            return;
+        }
+        span.in_scope(|| info!("added"));
+        let state = self.spawn(torrent, span);
+        self.entries.push(Entry {
+            source,
+            info_hash,
+            state,
+        });
+        self.idle.send_replace(self.tasks.is_empty());
+    }
+
     /// Drops the row of `entry`, removed from the session, and with
     /// `delete` its files, its resume file and a magnet link's saved
     /// `.torrent`. What cannot be deleted is logged and shown as a notice.
@@ -440,6 +495,7 @@ where
             Command::Pause(info_hash) => self.pause(info_hash),
             Command::Resume(info_hash) => self.resume(info_hash).await,
             Command::Remove { info_hash, delete } => self.remove(info_hash, delete).await,
+            Command::Add(source) => self.add(source).await,
             // The feed stops the torrents itself.
             Command::Stop => {}
         }

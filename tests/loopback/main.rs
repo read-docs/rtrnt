@@ -1,5 +1,6 @@
 //! End-to-end downloads from mock seeders (and a mock tracker) over loopback.
 
+mod add;
 mod common;
 mod download;
 mod fast;

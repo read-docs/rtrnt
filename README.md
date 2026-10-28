@@ -26,7 +26,7 @@ cargo run --release -- first.torrent second.torrent 'magnet:?xt=urn:btih:...' -o
 
 ### Terminal UI
 
-When stdout and stderr are terminals, a run shows a full-screen UI instead of progress bars and log lines (`--no-tui`, or `tui = false` in the config file, turns it off; `--tui` turns it on regardless). It is never used with `--check`, `--scrape` or `--print-config`. At the top are the session's rates and counts, then the torrent table, then a detail panel for the selected torrent with five tabs: its peers (client, flags, rates and how much each has, with the torrent's rates over the last half minute, or the selected peer's while the panel has the focus), a map of its pieces with the swarm's numbers, its trackers, its files, and facts about it. The log sits below, and the keys at the bottom:
+When stdout and stderr are terminals, a run shows a full-screen UI instead of progress bars and log lines (`--no-tui`, or `tui = false` in the config file, turns it off; `--tui` turns it on regardless). It is never used with `--check`, `--scrape` or `--print-config`. Only the UI can start without a torrent: `rtrnt` alone opens it empty, saying `press a to add a torrent`. At the top are the session's rates and counts, then the torrent table, then a detail panel for the selected torrent with five tabs: its peers (client, flags, rates and how much each has, with the torrent's rates over the last half minute, or the selected peer's while the panel has the focus), a map of its pieces with the swarm's numbers, its trackers, its files, and facts about it. The log sits below, and the keys at the bottom:
 
 | Key | Action |
 |-----|--------|
@@ -39,6 +39,7 @@ When stdout and stderr are terminals, a run shows a full-screen UI instead of pr
 | `/` | filter torrents by name; `esc` clears the filter |
 | `p` | pause the selected torrent, or resume it; a finished or failed torrent is run again |
 | `x` | remove the selected torrent from the session, after asking: `y` keeps its files, `D` deletes them too |
+| `a` | add a torrent: the path of a `.torrent` file (a relative one is taken from the directory rtrnt was started in) or a magnet link. It starts as one given on the command line would, with the same output directory and settings; one the session has already is refused, and so is a file that does not load, with a note at the bottom |
 | `d` / `u` | set the download / upload limit in KiB/s, 0 for none, until the run ends; the header shows the limits next to the rates |
 | `m` | turn the mouse off, so the terminal can select text, or on again |
 | `?` | help |

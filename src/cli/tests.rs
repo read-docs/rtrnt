@@ -37,9 +37,31 @@ fn takes_several_torrents() {
         Args::try_parse_from(["rtrnt", "dir/a.torrent", &link, "b.torrent", "-o", "x"]).unwrap();
     let labels: Vec<_> = args.torrents.iter().map(Source::label).collect();
     assert_eq!(labels, ["a.torrent", "Some Name", "b.torrent"]);
-    assert!(Args::try_parse_from(["rtrnt"]).is_err());
-    let args = Args::try_parse_from(["rtrnt", "--print-config"]).unwrap();
-    assert!(args.torrents.is_empty());
+}
+
+/// Only the UI, where `a` adds one, starts without a torrent, and
+/// --print-config needs none.
+#[test]
+fn no_torrent_is_accepted_only_with_the_ui() {
+    // Whether stdout and stderr are terminals, and the config file's `tui`.
+    let accepted = |args: &[&str], terminals: bool, file_tui: Option<bool>| {
+        let args = Args::try_parse_from(args).unwrap();
+        let use_tui = args.use_tui(file_tui, || terminals);
+        args.check_torrents(use_tui).is_ok()
+    };
+    assert!(accepted(&["rtrnt"], true, None));
+    assert!(accepted(&["rtrnt", "--tui"], false, Some(false)));
+    assert!(accepted(&["rtrnt"], false, Some(true)));
+    assert!(!accepted(&["rtrnt"], false, None));
+    assert!(!accepted(&["rtrnt", "--no-tui"], true, None));
+    assert!(!accepted(&["rtrnt"], true, Some(false)));
+    assert!(!accepted(&["rtrnt", "--tui", "--check"], true, None));
+    assert!(!accepted(&["rtrnt", "--scrape"], true, None));
+    assert!(accepted(&["rtrnt", "--print-config"], false, None));
+    assert!(accepted(&["rtrnt", "x.torrent", "--no-tui"], false, None));
+    let args = Args::try_parse_from(["rtrnt", "--no-tui"]).unwrap();
+    let error = args.check_torrents(false).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
 }
 
 /// The defaults are written into the help by hand, since clap does not

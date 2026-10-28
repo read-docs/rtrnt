@@ -2,10 +2,10 @@
 
 use crate::magnet::{self, MagnetLink};
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// What to download.
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     File(PathBuf),
     Magnet(Box<MagnetLink>),
@@ -20,6 +20,14 @@ impl Source {
         } else {
             Ok(Source::File(arg.into()))
         }
+    }
+
+    /// `parse`, with a relative path taken as under `dir`.
+    pub fn parse_in(arg: &str, dir: &Path) -> Result<Self> {
+        Ok(match Self::parse(arg)? {
+            Source::File(path) => Source::File(dir.join(path)),
+            magnet => magnet,
+        })
     }
 
     /// A short name for the torrent, for logs and headings: the file's

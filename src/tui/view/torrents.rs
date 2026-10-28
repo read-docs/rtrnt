@@ -234,7 +234,7 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
     }
     if visible.is_empty() {
         let note = if snapshot.torrents.is_empty() {
-            " no torrents yet"
+            " no torrents yet: press a to add a torrent"
         } else {
             " no torrent matches the filter"
         };

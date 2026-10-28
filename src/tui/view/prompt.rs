@@ -16,11 +16,15 @@ pub fn draw(frame: &mut Frame, app: &App, input: &Input, area: Rect) {
         Span::styled(format!(" {}", input.kind.prompt()), theme.key_style()),
         Span::styled(input.text.clone(), Style::new().fg(theme.bright())),
         Span::styled("▏", Style::new().fg(theme.down())),
-        Span::raw("   "),
     ];
+    if let Some(placeholder) = input.kind.placeholder().filter(|_| input.text.is_empty()) {
+        spans.push(Span::styled(placeholder, theme.dim_style()));
+    }
+    spans.push(Span::raw("   "));
     let hints = match input.kind {
         InputKind::Filter => [("enter", "keep"), ("esc", "clear")],
         InputKind::DownloadLimit | InputKind::UploadLimit => [("enter", "set"), ("esc", "cancel")],
+        InputKind::Add => [("enter", "add"), ("esc", "cancel")],
     };
     spans.extend(keys(theme, &hints));
     frame.render_widget(Clear, area);

@@ -24,7 +24,7 @@ const KEYS: &[(&str, &str)] = &[
 
 /// Keys shown after them where there is room, after `p` and `x` for the
 /// selected torrent.
-const MORE_KEYS: &[(&str, &str)] = &[("d u", "limits"), ("m", "mouse")];
+const MORE_KEYS: &[(&str, &str)] = &[("a", "add"), ("d u", "limits"), ("m", "mouse")];
 
 pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
     let theme = app.theme;
@@ -36,6 +36,7 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
     } else if snapshot.finished {
         let text = match app.pause_command(snapshot) {
             Some((Command::Resume(_), _)) => " nothing running, press p to resume or q to exit",
+            _ if snapshot.torrents.is_empty() => " press a to add a torrent, or q to exit",
             _ => " nothing running, press q to exit",
         };
         Line::from(Span::styled(

@@ -17,6 +17,7 @@ use rtrnt::tui::{self, SessionFeed};
 use rtrnt::{config, torrent, tracker};
 use shutdown::Shutdown;
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -32,14 +33,18 @@ const PROBLEMS_SHOWN_AFTER_UI: Duration = Duration::from_secs(10);
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
     let args = Args::parse();
+    // Relative paths given to the UI's `a` are under it. Should it be gone,
+    // they stay relative, and fail to load.
+    let start_dir = std::env::current_dir().unwrap_or_default();
     // Read before logging starts, which depends on it; any error is printed
     // on the way out.
     let file = config::load(args.config.as_deref());
-    let use_tui = !(args.check || args.scrape || args.print_config)
-        && args
-            .tui()
-            .or(file.as_ref().ok().and_then(|file| file.options.tui))
-            .unwrap_or_else(|| std::io::stdout().is_terminal() && std::io::stderr().is_terminal());
+    let use_tui = args.use_tui(file.as_ref().ok().and_then(|file| file.options.tui), || {
+        std::io::stdout().is_terminal() && std::io::stderr().is_terminal()
+    });
+    if let Err(e) = args.check_torrents(use_tui) {
+        e.exit();
+    }
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let logs = LogBuffer::default();
@@ -82,11 +87,6 @@ async fn main() -> anyhow::Result<ExitCode> {
     }
     let mut config = config::resolve(cli, file.options);
     config.recheck = args.recheck;
-    // clap requires a torrent unless --print-config is given.
-    if args.torrents.is_empty() {
-        bail!("no torrent given");
-    }
-
     if args.check || args.scrape {
         let (config, check_mode) = (&config, args.check);
         return each_in_turn(&args.torrents, |source| async move {
@@ -105,6 +105,9 @@ async fn main() -> anyhow::Result<ExitCode> {
         let shutdown = Arc::clone(&shutdown);
         move || Arc::clone(&shutdown).signal()
     });
+    if use_tui {
+        manager.expect_more();
+    }
     manager.start(args.torrents).await;
     let (commands, commands_rx) = mpsc::unbounded_channel();
     if !use_tui {
@@ -114,13 +117,13 @@ async fn main() -> anyhow::Result<ExitCode> {
     }
     let finished = manager.idle();
     let run = manager.run(commands_rx);
-    with_tui(run, finished, commands, client, shutdown, logs).await
+    with_tui(run, finished, commands, client, shutdown, logs, start_dir).await
 }
 
 /// Shows `run`, the manager's run, in the terminal UI, which sends it
 /// `commands` until the user leaves; the run goes on until then. Leaving the
 /// UI before every torrent has stopped exits at once, as a second Ctrl-C
-/// does.
+/// does. Torrents added by path are under `start_dir`.
 async fn with_tui(
     run: impl Future<Output = anyhow::Result<ExitCode>> + Send + 'static,
     finished: watch::Receiver<bool>,
@@ -128,11 +131,12 @@ async fn with_tui(
     client: Arc<Client>,
     shutdown: Arc<Shutdown>,
     logs: LogBuffer,
+    start_dir: PathBuf,
 ) -> anyhow::Result<ExitCode> {
     let downloads = tokio::spawn(run);
     let stop = move || shutdown.request_stop();
     let feed = SessionFeed::new(Arc::clone(client.stats()), logs.clone(), stop, commands);
-    let exit = tui::run(feed, finished).await;
+    let exit = tui::run(feed, finished, start_dir).await;
     // The terminal is back to normal: say what went wrong lately, which the
     // UI showed but which is gone with it.
     for line in logs.problems_since(SystemTime::now(), PROBLEMS_SHOWN_AFTER_UI) {

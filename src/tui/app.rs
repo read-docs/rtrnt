@@ -5,12 +5,14 @@ use super::Command;
 use super::snapshot::{Detail, Snapshot, TorrentSnapshot};
 use super::theme::Theme;
 use super::view::Areas;
+use crate::source::Source;
 use crate::stats::TorrentState;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Samples of rate history kept: 30 s at 4 a second.
@@ -126,6 +128,8 @@ pub enum InputKind {
     Filter,
     DownloadLimit,
     UploadLimit,
+    /// A torrent to add.
+    Add,
 }
 
 impl InputKind {
@@ -135,6 +139,15 @@ impl InputKind {
             InputKind::Filter => "/",
             InputKind::DownloadLimit => "download limit, KiB/s (0: none): ",
             InputKind::UploadLimit => "upload limit, KiB/s (0: none): ",
+            InputKind::Add => "add: ",
+        }
+    }
+
+    /// What the input line says in place of the text while there is none.
+    pub fn placeholder(self) -> Option<&'static str> {
+        match self {
+            InputKind::Add => Some("path to a .torrent or magnet link"),
+            InputKind::Filter | InputKind::DownloadLimit | InputKind::UploadLimit => None,
         }
     }
 }
@@ -209,6 +222,9 @@ pub struct App {
     pub mouse: bool,
     /// Set once a stop was asked for.
     pub stopping: bool,
+    /// The directory rtrnt was started in, which a relative path given to
+    /// `a` is under.
+    pub dir: PathBuf,
     pub rates: Rates,
 }
 
@@ -231,6 +247,7 @@ impl App {
             removal: None,
             mouse: true,
             stopping: false,
+            dir: PathBuf::new(),
             rates: Rates::default(),
         }
     }
@@ -503,6 +520,10 @@ impl App {
                 let limit = snapshot.session.rate_limits.1.to_string();
                 self.input = Some(Input::new(InputKind::UploadLimit, limit));
             }
+            // Once stopping, an added torrent would stop at once too.
+            KeyCode::Char('a') if !self.stopping => {
+                self.input = Some(Input::new(InputKind::Add, String::new()));
+            }
             KeyCode::Esc => self.filter.clear(),
             KeyCode::Char('?') => self.show_help = true,
             _ => {}
@@ -621,13 +642,25 @@ impl App {
         let command = match input.kind {
             // Applied already, as it was typed.
             InputKind::Filter => return Action::None,
-            InputKind::DownloadLimit => limit().map(|down| Command::SetRateLimits(down, up)),
-            InputKind::UploadLimit => limit().map(|up| Command::SetRateLimits(down, up)),
+            InputKind::DownloadLimit => limit()
+                .map(|down| Command::SetRateLimits(down, up))
+                .map_err(|_| "enter a whole number of KiB/s, 0 for none".to_string()),
+            InputKind::UploadLimit => limit()
+                .map(|up| Command::SetRateLimits(down, up))
+                .map_err(|_| "enter a whole number of KiB/s, 0 for none".to_string()),
+            // Whether the file is there and is a torrent, the session finds
+            // out, and says so in a notice.
+            InputKind::Add => match input.text.trim() {
+                "" => Err("enter the path of a .torrent file, or a magnet link".to_string()),
+                text => Source::parse_in(text, &self.dir)
+                    .map(Command::Add)
+                    .map_err(|e| format!("{e:#}")),
+            },
         };
         match command {
             Ok(command) => Action::Command(command),
-            Err(_) => {
-                input.error = Some("enter a whole number of KiB/s, 0 for none".to_string());
+            Err(error) => {
+                input.error = Some(error);
                 self.input = Some(input);
                 Action::None
             }

@@ -1,4 +1,5 @@
-use clap::Parser;
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser};
 use rtrnt::config;
 use rtrnt::source::Source;
 use std::path::PathBuf;
@@ -8,12 +9,9 @@ use std::path::PathBuf;
 #[command(version, about)]
 pub(crate) struct Args {
     /// Path to a .torrent file, or a magnet link (magnet:?xt=urn:btih:...);
-    /// several are downloaded at once
-    #[arg(
-        required_unless_present = "print_config",
-        value_parser = parse_source,
-        value_name = "TORRENT"
-    )]
+    /// several are downloaded at once. The terminal UI can start with none,
+    /// and add them
+    #[arg(value_parser = parse_source, value_name = "TORRENT")]
     pub(crate) torrents: Vec<Source>,
     // Settings that the config file can also set have no clap default, so
     // an unset flag falls back to the file. The defaults live in
@@ -107,6 +105,27 @@ impl Args {
             (true, false) => Some(true),
             (false, false) => None,
         }
+    }
+
+    /// Whether to show the terminal UI: never with --check, --scrape or
+    /// --print-config, and otherwise as the command line says, or else the
+    /// config file (`file_tui`), or else when `terminals` says stdout and
+    /// stderr both are.
+    pub(crate) fn use_tui(&self, file_tui: Option<bool>, terminals: impl FnOnce() -> bool) -> bool {
+        !(self.check || self.scrape || self.print_config)
+            && self.tui().or(file_tui).unwrap_or_else(terminals)
+    }
+
+    /// Fails as clap would without a torrent, unless --print-config needs
+    /// none or the UI, `use_tui`, is on to add them.
+    pub(crate) fn check_torrents(&self, use_tui: bool) -> Result<(), clap::Error> {
+        if self.torrents.is_empty() && !use_tui && !self.print_config {
+            return Err(Self::command().error(
+                ErrorKind::MissingRequiredArgument,
+                "a torrent is needed, unless the terminal UI is on to add one",
+            ));
+        }
+        Ok(())
     }
 }
 

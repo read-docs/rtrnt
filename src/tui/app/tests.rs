@@ -688,3 +688,64 @@ fn a_click_cancels_a_removal_and_the_wheel_does_nothing() {
     // The click only closed it.
     assert_eq!(app.selected, Some([0; 20]));
 }
+
+/// Types `text` on the input line of `app`, then presses Enter.
+fn enter(app: &mut App, snapshot: &Snapshot, text: &str) -> Action {
+    for c in text.chars() {
+        app.handle_key(key(KeyCode::Char(c)), snapshot);
+    }
+    app.handle_key(key(KeyCode::Enter), snapshot)
+}
+
+#[test]
+fn a_adds_a_path_under_the_start_dir_or_a_magnet_link() {
+    let snapshot = Snapshot::default();
+    let mut app = App::new(Theme::default());
+    app.dir = PathBuf::from("/home/me/downloads");
+    app.handle_key(key(KeyCode::Char('a')), &snapshot);
+    let input = app.input.as_ref().unwrap();
+    assert_eq!((input.kind, input.text.as_str()), (InputKind::Add, ""));
+    assert_eq!(
+        enter(&mut app, &snapshot, "linux/debian.torrent "),
+        Action::Command(Command::Add(Source::File(
+            "/home/me/downloads/linux/debian.torrent".into()
+        )))
+    );
+    assert_eq!(app.input, None);
+
+    app.handle_key(key(KeyCode::Char('a')), &snapshot);
+    assert_eq!(
+        enter(&mut app, &snapshot, "/srv/x.torrent"),
+        Action::Command(Command::Add(Source::File("/srv/x.torrent".into())))
+    );
+    let link = "magnet:?xt=urn:btih:c12fe1c06bba254a9dc9f519b335aa7c1367a88a";
+    app.handle_key(key(KeyCode::Char('a')), &snapshot);
+    assert_eq!(
+        enter(&mut app, &snapshot, link),
+        Action::Command(Command::Add(Source::parse(link).unwrap()))
+    );
+}
+
+#[test]
+fn a_bad_magnet_link_or_nothing_keeps_the_add_prompt_open() {
+    let snapshot = Snapshot::default();
+    let mut app = App::new(Theme::default());
+    app.handle_key(key(KeyCode::Char('a')), &snapshot);
+    assert_eq!(enter(&mut app, &snapshot, "  "), Action::None);
+    let input = app.input.as_ref().unwrap();
+    assert_eq!(
+        input.error.as_deref(),
+        Some("enter the path of a .torrent file, or a magnet link")
+    );
+    assert_eq!(enter(&mut app, &snapshot, "magnet:?dn=x"), Action::None);
+    let input = app.input.as_ref().unwrap();
+    assert!(input.error.as_ref().unwrap().contains("no info hash"));
+    // Esc cancels.
+    app.handle_key(key(KeyCode::Esc), &snapshot);
+    assert_eq!(app.input, None);
+
+    // Once stopping, nothing is added.
+    app.stopping = true;
+    app.handle_key(key(KeyCode::Char('a')), &snapshot);
+    assert_eq!(app.input, None);
+}

@@ -3,7 +3,9 @@
 //! tests.
 
 use super::log_buffer::LogLine;
-use super::snapshot::{Detail, PeerSnapshot, SessionSnapshot, Snapshot, Sources, TorrentSnapshot};
+use super::snapshot::{
+    Detail, NOTICE_SHOWN, PeerSnapshot, SessionSnapshot, Snapshot, Sources, TorrentSnapshot,
+};
 use super::{Command, Feed};
 use crate::stats::{Layout, PeerFlags, PieceSnapshot, TorrentState, TrackerResult, TrackerStatus};
 use rand::rngs::StdRng;
@@ -371,6 +373,8 @@ pub struct DemoFeed {
     rng: StdRng,
     stopped: bool,
     rate_limits: (u64, u64),
+    /// The latest notice, and when it came.
+    notice: Option<(Instant, String)>,
 }
 
 impl Default for DemoFeed {
@@ -392,6 +396,7 @@ impl DemoFeed {
             rng: StdRng::seed_from_u64(7),
             stopped: false,
             rate_limits: (0, 2048),
+            notice: None,
         }
     }
 
@@ -457,7 +462,11 @@ impl DemoFeed {
             torrents,
             detail,
             logs,
-            notice: None,
+            notice: self
+                .notice
+                .as_ref()
+                .filter(|(at, _)| at.elapsed() < NOTICE_SHOWN)
+                .map(|(_, text)| text.clone()),
             finished,
         }
     }
@@ -595,6 +604,10 @@ impl Feed for DemoFeed {
                 if let Some(live) = self.live(info_hash) {
                     live.removed = true;
                 }
+            }
+            Command::Add(source) => {
+                let text = format!("cannot add {}: the demo adds nothing", source.label());
+                self.notice = Some((Instant::now(), text));
             }
         }
         true
