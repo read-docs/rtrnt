@@ -2,7 +2,6 @@ use crate::peer::{PeerConnection, PeerMessage};
 use crate::rate_limit::Allowance;
 use crate::torrent::TorrentFile;
 use anyhow::{Result, anyhow, bail};
-use sha1::Digest;
 use std::collections::HashSet;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -328,11 +327,10 @@ impl<'a> ActivePiece<'a> {
         self.done == self.blocks.len()
     }
 
-    /// The claim and data of a complete piece, or `None` if the data does
-    /// not match the piece hash (dropping the claim).
-    pub(super) fn verify(self) -> Option<(PieceClaim<'a>, Vec<u8>)> {
-        let actual: [u8; 20] = sha1::Sha1::digest(&self.data).into();
-        (actual == self.hash).then_some((self.claim, self.data))
+    /// The claim and data of a complete piece, and the hash the data must
+    /// have, which `Storage::verify_and_write` checks.
+    pub(super) fn into_parts(self) -> (PieceClaim<'a>, Vec<u8>, [u8; 20]) {
+        (self.claim, self.data, self.hash)
     }
 }
 

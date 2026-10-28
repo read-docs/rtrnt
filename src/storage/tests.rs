@@ -2,6 +2,7 @@ use super::*;
 use crate::selection::FileSelection;
 use crate::torrent::FileInfo;
 use serde_bytes::ByteBuf;
+use sha1::Digest;
 
 fn multi_file_info(files: &[(&[&str], u64)]) -> Info {
     Info {
@@ -53,6 +54,49 @@ async fn reads_blocks_by_piece_and_offset() {
     assert_eq!(storage.read_block(0, 2, 2).await.unwrap(), b"cd");
     assert_eq!(storage.read_block(2, 0, 1).await.unwrap(), b"i");
     assert!(storage.read_block(2, 0, 2).await.is_err());
+}
+
+#[tokio::test]
+async fn writes_a_piece_only_if_it_matches_its_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = multi_file_info(&[(&["a"], 3), (&["b"], 6)]);
+    let storage = Arc::new(Storage::new(&info, dir.path(), &FileSelection::default()).unwrap());
+    let hash: [u8; 20] = sha1::Sha1::digest(b"abcd").into();
+
+    assert!(
+        !storage
+            .verify_and_write(0, b"abcx".to_vec(), hash)
+            .await
+            .unwrap()
+    );
+    assert_eq!(storage.read_at(0, 4).unwrap(), [0; 4]);
+
+    assert!(
+        storage
+            .verify_and_write(0, b"abcd".to_vec(), hash)
+            .await
+            .unwrap()
+    );
+    assert_eq!(storage.read_at(0, 4).unwrap(), b"abcd");
+}
+
+#[tokio::test]
+async fn a_failed_write_or_read_is_a_storage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = multi_file_info(&[(&["a"], 4)]);
+    let storage = Arc::new(Storage::new(&info, dir.path(), &FileSelection::default()).unwrap());
+    // A directory in place of the file cannot be opened for writing.
+    let path = dir.path().join("root/a");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+
+    let hash: [u8; 20] = sha1::Sha1::digest(b"abcd").into();
+    let err = storage
+        .verify_and_write(0, b"abcd".to_vec(), hash)
+        .await
+        .unwrap_err();
+    assert!(err.is::<StorageError>(), "{err:#}");
+    assert!(format!("{err:#}").contains("failed to open"), "{err:#}");
 }
 
 #[test]

@@ -1,4 +1,5 @@
 use super::*;
+use sha1::Digest;
 
 fn peer<'a>(queue: &'a PieceQueue, has: &[bool]) -> PeerPieces<'a> {
     let mut peer = queue.register_peer();
@@ -54,8 +55,9 @@ fn active_piece_requests_blocks_in_order_and_assembles_them() {
     }
     assert_eq!(piece.in_flight(), 0);
     assert!(piece.is_complete());
-    let (claim, assembled) = piece.verify().expect("hash mismatch");
+    let (claim, assembled, hash) = piece.into_parts();
     assert_eq!(assembled, data);
+    assert_eq!(hash, <[u8; 20]>::from(sha1::Sha1::digest(&data)));
     assert!(claim.complete());
 }
 
@@ -156,7 +158,6 @@ fn rejected_blocks_are_requested_again_first() {
     }
     assert!(piece.is_complete());
     assert_eq!(piece.in_flight(), 0);
-    assert!(piece.verify().is_some());
 }
 
 #[test]
@@ -187,18 +188,18 @@ fn a_choke_releases_pieces_with_nothing_outstanding_unless_allowed_fast() {
 }
 
 #[test]
-fn corrupt_piece_fails_verification_and_is_returned() {
+fn a_complete_piece_is_returned_when_its_claim_is_dropped() {
     let queue = PieceQueue::all_wanted(&[false; 1]);
     let seed = peer(&queue, &[true]);
-    let (mut data, mut piece) = active(&queue, &seed);
-    data[0] ^= 0xff;
+    let (data, mut piece) = active(&queue, &seed);
     for b in 0..3 {
         piece.request_next();
         piece
             .add_block(b as u32 * BLOCK_SIZE, block(&data, b))
             .unwrap();
     }
-    assert!(piece.verify().is_none());
+    let (claim, _, _) = piece.into_parts();
+    drop(claim);
     assert!(queue.lock().pending.contains(&0));
 }
 

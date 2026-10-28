@@ -394,21 +394,22 @@ pub(super) async fn peer_worker(
                     continue;
                 }
                 let index = active[pos].claim.index;
-                let Some((claim, data)) = active.swap_remove(pos).verify() else {
+                let (claim, data, hash) = active.swap_remove(pos).into_parts();
+                // In endgame another peer may have finished it meanwhile. If
+                // both get past this check, both write the same verified
+                // bytes.
+                if claim.is_completed() {
+                    continue;
+                }
+                let piece_len = data.len() as u64;
+                if !session.storage.verify_and_write(index, data, hash).await? {
                     hash_failures += 1;
                     warn!(%addr, index, "piece failed hash check");
                     if hash_failures >= MAX_HASH_FAILURES {
                         bail!(Misbehaved("too many corrupt pieces"));
                     }
                     continue;
-                };
-                // In endgame another peer may have finished it meanwhile. If
-                // both pass this check, both write the same verified bytes.
-                if claim.is_completed() {
-                    continue;
                 }
-                let piece_len = data.len() as u64;
-                session.storage.write_piece(index, data).await?;
                 if claim.complete() {
                     *pieces_done += 1;
                     progress.add(piece_len);

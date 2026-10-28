@@ -19,7 +19,7 @@ use super::{Interrupted, SeedLimits, Session};
 /// Fails unless every piece is intact.
 pub async fn check_file(torrent_path: &Path, output_dir: &Path) -> Result<()> {
     let (torrent, info_hash) = torrent::load_file(torrent_path).await?;
-    let storage = Arc::new(Storage::open_existing(&torrent.info, output_dir)?);
+    let storage = Arc::new(Storage::open_existing_async(&torrent.info, output_dir).await?);
     let pieces = verify::present(&torrent, &storage)?;
     let stats = TorrentStats::detached(&torrent, info_hash, output_dir);
     let session = Arc::new(Session {

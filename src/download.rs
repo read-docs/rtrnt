@@ -247,7 +247,7 @@ async fn download_loaded(
     // running one leaves its files alone.
     claim.claim_files(
         &torrent.info.name,
-        &Storage::paths(&torrent.info, &config.output_dir)?,
+        &Storage::paths_async(&torrent.info, &config.output_dir).await?,
     )?;
 
     // Before announcing, so a bad output directory does not leave the
@@ -258,7 +258,8 @@ async fn download_loaded(
         resume.as_ref(),
         selection::file_count(&torrent.info),
     );
-    let storage = Arc::new(Storage::new(&torrent.info, &config.output_dir, &selection)?);
+    let storage =
+        Arc::new(Storage::new_async(&torrent.info, &config.output_dir, &selection).await?);
     let dht = start_dht(&torrent, client).await;
     let session = Arc::new(Session {
         torrent,

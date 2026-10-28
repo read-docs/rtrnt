@@ -1,6 +1,7 @@
 use crate::selection::{FileSelection, Priority, priorities_of};
 use crate::torrent::Info;
 use anyhow::{Context, Result, bail};
+use sha1::{Digest, Sha1};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -185,6 +186,26 @@ impl Storage {
         Ok(Self::with_files(info, files, false))
     }
 
+    /// `paths` on the blocking thread pool, so that creating the directory
+    /// does not hold up the runtime.
+    pub async fn paths_async(info: &Info, out_dir: &Path) -> Result<Vec<PathBuf>> {
+        let (info, out_dir) = (info.clone(), out_dir.to_path_buf());
+        tokio::task::spawn_blocking(move || Self::paths(&info, &out_dir)).await?
+    }
+
+    /// `new` on the blocking thread pool, so that creating and resizing the
+    /// files does not hold up the runtime.
+    pub async fn new_async(info: &Info, out_dir: &Path, selection: &FileSelection) -> Result<Self> {
+        let (info, out_dir, selection) = (info.clone(), out_dir.to_path_buf(), selection.clone());
+        tokio::task::spawn_blocking(move || Self::new(&info, &out_dir, &selection)).await?
+    }
+
+    /// `open_existing` on the blocking thread pool.
+    pub async fn open_existing_async(info: &Info, out_dir: &Path) -> Result<Self> {
+        let (info, out_dir) = (info.clone(), out_dir.to_path_buf());
+        tokio::task::spawn_blocking(move || Self::open_existing(&info, &out_dir)).await?
+    }
+
     fn with_files(info: &Info, files: Vec<FileSpan>, writable: bool) -> Self {
         let total_length = files.iter().map(|f| f.length).sum();
         Self {
@@ -215,13 +236,28 @@ impl Storage {
             .all(|(index, _, _)| self.files[index].exists())
     }
 
-    /// Writes a verified piece to disk on the blocking thread pool.
-    pub async fn write_piece(self: &Arc<Self>, index: usize, data: Vec<u8>) -> Result<()> {
+    /// Checks the data of piece `index` against its `hash`, and writes it to
+    /// disk if it matches, all on the blocking thread pool. Returns false,
+    /// writing nothing, if it does not.
+    pub async fn verify_and_write(
+        self: &Arc<Self>,
+        index: usize,
+        data: Vec<u8>,
+        hash: [u8; 20],
+    ) -> Result<bool> {
         let storage = Arc::clone(self);
         let offset = index as u64 * self.piece_length;
-        tokio::task::spawn_blocking(move || storage.write_at(offset, &data))
-            .await?
-            .context(StorageError)
+        tokio::task::spawn_blocking(move || {
+            let actual: [u8; 20] = Sha1::digest(&data).into();
+            if actual != hash {
+                return Ok(false);
+            }
+            storage
+                .write_at(offset, &data)
+                .map(|()| true)
+                .context(StorageError)
+        })
+        .await?
     }
 
     /// Reads `length` bytes from offset `begin` in piece `index` on the
