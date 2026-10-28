@@ -131,3 +131,10 @@ fn rejects_inconsistent_piece_count() {
     t.info.pieces = ByteBuf::from(vec![0u8; 81]);
     assert!(t.validate().is_err());
 }
+
+#[test]
+fn rejects_deeply_nested_torrent() {
+    let mut data = b"d5:otherl".to_vec();
+    data.extend(std::iter::repeat_n(b'l', 100_000));
+    assert!(parse(&data).is_err());
+}

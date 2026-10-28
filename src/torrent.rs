@@ -155,6 +155,9 @@ pub fn parse(data: &[u8]) -> Result<(TorrentFile, [u8; 20])> {
 
 /// Parses a `.torrent` file, keeping the bytes of its info dictionary.
 pub fn parse_metainfo(data: &[u8]) -> Result<Metainfo> {
+    // Scanned first because it limits the nesting depth, which
+    // `serde_bencode` would follow until the stack overflows.
+    bencode::value_len(data).context("invalid torrent file")?;
     let torrent: TorrentFile = serde_bencode::from_bytes(data).context("invalid torrent file")?;
     torrent.validate()?;
 
