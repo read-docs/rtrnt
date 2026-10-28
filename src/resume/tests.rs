@@ -46,7 +46,6 @@ fn config(output: &Path, resume: &Path) -> DownloadConfig {
         max_download_rate: 0,
         max_upload_rate: 0,
         resume_dir: Some(resume.to_path_buf()),
-        recheck: false,
     }
 }
 
@@ -222,7 +221,7 @@ async fn trusts_a_resume_file_until_a_file_changes() {
     // No resume file yet: everything on disk is hashed, then saved.
     let have = initial_pieces(
         &session(&config),
-        &config,
+        false,
         &Semaphore::new(1),
         std::future::pending(),
     )
@@ -237,7 +236,7 @@ async fn trusts_a_resume_file_until_a_file_changes() {
     corrupt(out.path(), "b", 4, b_time);
     let have = initial_pieces(
         &session(&config),
-        &config,
+        false,
         &Semaphore::new(1),
         std::future::pending(),
     )
@@ -255,7 +254,7 @@ async fn trusts_a_resume_file_until_a_file_changes() {
     );
     let have = initial_pieces(
         &session(&config),
-        &config,
+        false,
         &Semaphore::new(1),
         std::future::pending(),
     )
@@ -264,13 +263,9 @@ async fn trusts_a_resume_file_until_a_file_changes() {
     assert_eq!(have, [false, true, true]);
 
     // `--recheck` ignores the resume file and finds piece 2 wrong too.
-    let recheck = DownloadConfig {
-        recheck: true,
-        ..config
-    };
     let have = initial_pieces(
-        &session(&recheck),
-        &recheck,
+        &session(&config),
+        true,
         &Semaphore::new(1),
         std::future::pending(),
     )
@@ -291,7 +286,7 @@ async fn falls_back_to_hashing_without_a_usable_resume_file() {
         std::fs::write(&resume_file, contents).unwrap();
         let have = initial_pieces(
             &session(&config),
-            &config,
+            false,
             &Semaphore::new(1),
             std::future::pending(),
         )

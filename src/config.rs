@@ -124,7 +124,6 @@ impl Options {
                 std::env::var_os("XDG_STATE_HOME"),
                 std::env::home_dir().as_deref(),
             ),
-            recheck: false,
         }
     }
 }

@@ -340,7 +340,6 @@ pub(crate) fn resume_config(out: &Path, state: &Path) -> DownloadConfig {
         max_download_rate: 0,
         max_upload_rate: 0,
         resume_dir: Some(state.to_path_buf()),
-        recheck: false,
     }
 }
 

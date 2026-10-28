@@ -1,4 +1,4 @@
-use crate::download::Interrupted;
+use crate::download::{CheckedOnly, Interrupted};
 use crate::magnet::FetchInterrupted;
 use crate::torrent::TorrentFile;
 use crate::tracker::AnnounceResponse;
@@ -305,6 +305,7 @@ impl TorrentStats {
     pub(crate) fn finish(&self, result: &anyhow::Result<()>) {
         let state = match result {
             Ok(()) => TorrentState::Done,
+            Err(e) if e.is::<CheckedOnly>() => TorrentState::Paused,
             Err(e) if e.is::<Interrupted>() || e.is::<FetchInterrupted>() => {
                 if self.state() == TorrentState::Pausing {
                     let _ = self.finished.set(Instant::now());

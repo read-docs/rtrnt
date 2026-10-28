@@ -1,6 +1,7 @@
 use crate::client::{Client, ConnectionSlots};
 use crate::dht::Dht;
 use crate::listener::Listener;
+use crate::manager::{Recheck, StartOptions};
 use crate::rate_limit::RateLimits;
 use crate::resume::{self, Target};
 use crate::stats::{PeerSource, TorrentStats};
@@ -56,9 +57,6 @@ pub struct DownloadConfig {
     /// Directory the resume files (see `resume`) are kept in, or `None` to
     /// keep none.
     pub resume_dir: Option<PathBuf>,
-    /// Whether to ignore the resume files and hash the data on disk, as
-    /// without one.
-    pub recheck: bool,
 }
 
 /// How long to keep seeding once every piece is done. Seeding stops at
@@ -138,12 +136,14 @@ pub async fn download_file(
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let metainfo = torrent::load_metainfo(torrent_path).await?;
-    download_metainfo(metainfo, client, shutdown).await
+    download_metainfo(metainfo, &StartOptions::default(), client, shutdown).await
 }
 
-/// `download_file` for a torrent file loaded already.
+/// `download_file` for a torrent file loaded already, run as `options`
+/// say.
 pub async fn download_metainfo(
     metainfo: torrent::Metainfo,
+    options: &StartOptions,
     client: &Client,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
@@ -153,7 +153,7 @@ pub async fn download_metainfo(
         &client.config().output_dir,
     );
     stats.set_torrent(&metainfo.torrent);
-    let result = download_loaded(metainfo, client, &stats, shutdown).await;
+    let result = download_loaded(metainfo, options, client, &stats, shutdown).await;
     stats.finish(&result);
     result
 }
@@ -161,6 +161,7 @@ pub async fn download_metainfo(
 /// `download_metainfo`, publishing its progress in `stats`.
 async fn download_loaded(
     metainfo: torrent::Metainfo,
+    options: &StartOptions,
     client: &Client,
     stats: &Arc<TorrentStats>,
     shutdown: impl Future<Output = ()>,
@@ -205,8 +206,12 @@ async fn download_loaded(
     });
 
     let mut shutdown = std::pin::pin!(shutdown);
+    let recheck = options.recheck != Recheck::No;
     let have =
-        resume::initial_pieces(&session, config, client.hashing(), shutdown.as_mut()).await?;
+        resume::initial_pieces(&session, recheck, client.hashing(), shutdown.as_mut()).await?;
+    if options.recheck == Recheck::ThenPause {
+        bail!(CheckedOnly);
+    }
     let left = session.torrent.length() - verified_bytes(&session.torrent, &have)?;
     if left == 0 {
         info!(output = %config.output_dir.display(), "already complete");
@@ -373,6 +378,19 @@ impl std::fmt::Display for Interrupted {
 }
 
 impl std::error::Error for Interrupted {}
+
+/// The data was checked and the run ended there, as `Recheck::ThenPause`
+/// asks. The resume file is saved.
+#[derive(Debug)]
+pub struct CheckedOnly;
+
+impl std::fmt::Display for CheckedOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "data checked")
+    }
+}
+
+impl std::error::Error for CheckedOnly {}
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()

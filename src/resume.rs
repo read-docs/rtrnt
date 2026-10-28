@@ -129,7 +129,7 @@ struct Saved {
 /// not list are not hashed: they are zeros we pre-allocated.
 ///
 /// Without a usable resume file (none, unreadable, for another torrent or
-/// download directory, or `config.recheck`), every piece that may hold data
+/// download directory, or `recheck`), every piece that may hold data
 /// from an earlier run is hashed. Either way the resume file is saved
 /// afterwards.
 ///
@@ -138,14 +138,14 @@ struct Saved {
 /// error.
 pub async fn initial_pieces(
     session: &Arc<Session>,
-    config: &DownloadConfig,
+    recheck: bool,
     hashing: &Semaphore,
     shutdown: impl Future<Output = ()>,
 ) -> Result<Vec<bool>> {
     let torrent = &session.torrent;
     let candidates = verify::candidates(torrent, &session.storage)?;
     let saved = match &session.resume {
-        Some(target) if !config.recheck => load(target, session).await,
+        Some(target) if !recheck => load(target, session).await,
         _ => None,
     };
     let have = match saved {

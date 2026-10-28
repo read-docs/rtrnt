@@ -1,5 +1,5 @@
 use rtrnt::download::SeedLimits;
-use rtrnt::manager::{Command, Manager};
+use rtrnt::manager::{Command, Manager, StartOptions};
 use rtrnt::peer::PeerMessage;
 use rtrnt::source::Source;
 use rtrnt::stats::TorrentState;
@@ -93,7 +93,9 @@ async fn a_paused_download_resumes_where_it_stopped() {
     let _turn = client.hashing().acquire().await.unwrap();
     let mut manager = Manager::new(Arc::clone(&client), pending::<()>);
     let mut idle = manager.idle();
-    manager.start(vec![Source::File(path)]).await;
+    manager
+        .start(vec![Source::File(path)], StartOptions::default())
+        .await;
     let (commands, commands_rx) = mpsc::unbounded_channel();
     let run = tokio::spawn(manager.run(commands_rx));
     let stats = client.stats();
@@ -236,7 +238,9 @@ async fn a_paused_seed_keeps_its_ratio() {
     let client = Arc::new(client(config));
     let mut manager = Manager::new(Arc::clone(&client), pending::<()>);
     let mut idle = manager.idle();
-    manager.start(vec![Source::File(path)]).await;
+    manager
+        .start(vec![Source::File(path)], StartOptions::default())
+        .await;
     let (commands, commands_rx) = mpsc::unbounded_channel();
     let run = tokio::spawn(manager.run(commands_rx));
     // The leecher finds us through the port we announce.

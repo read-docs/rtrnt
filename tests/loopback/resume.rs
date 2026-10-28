@@ -195,7 +195,7 @@ async fn interrupted_after_one_piece(
     });
 
     let session = resumable_session(torrent, info_hash, config);
-    let have = resume::initial_pieces(&session, config, &Semaphore::new(1), pending())
+    let have = resume::initial_pieces(&session, false, &Semaphore::new(1), pending())
         .await
         .unwrap();
     assert_eq!(have, vec![false; num_pieces]);
@@ -236,7 +236,7 @@ async fn resumes_from_the_resume_file_without_hashing() {
     corrupt_file(out.path(), "a.bin", 0, before);
 
     let session = resumable_session(torrent, info_hash, &config);
-    let have = resume::initial_pieces(&session, &config, &Semaphore::new(1), pending())
+    let have = resume::initial_pieces(&session, false, &Semaphore::new(1), pending())
         .await
         .unwrap();
     assert_eq!(have, [true, false, false]);
@@ -302,7 +302,7 @@ async fn rehashes_only_the_files_changed_since_the_resume_file() {
 
     // No resume file yet: everything on disk is hashed, then saved.
     let session = resumable_session(torrent.clone(), info_hash, &config);
-    let have = resume::initial_pieces(&session, &config, &Semaphore::new(1), pending())
+    let have = resume::initial_pieces(&session, false, &Semaphore::new(1), pending())
         .await
         .unwrap();
     assert_eq!(have, [true; 3]);
@@ -315,17 +315,13 @@ async fn rehashes_only_the_files_changed_since_the_resume_file() {
     corrupt_file(out.path(), "a.bin", 0, a_time);
     corrupt_file(out.path(), "b.bin", 50_000, b_time);
     let session = resumable_session(torrent.clone(), info_hash, &config);
-    let have = resume::initial_pieces(&session, &config, &Semaphore::new(1), pending())
+    let have = resume::initial_pieces(&session, false, &Semaphore::new(1), pending())
         .await
         .unwrap();
     assert_eq!(have, [false, true, true]);
 
-    let recheck = DownloadConfig {
-        recheck: true,
-        ..resume_config(out.path(), state.path())
-    };
-    let session = resumable_session(torrent, info_hash, &recheck);
-    let have = resume::initial_pieces(&session, &recheck, &Semaphore::new(1), pending())
+    let session = resumable_session(torrent, info_hash, &config);
+    let have = resume::initial_pieces(&session, true, &Semaphore::new(1), pending())
         .await
         .unwrap();
     assert_eq!(have, [false, true, false]);

@@ -1,6 +1,7 @@
 use rtrnt::download::{DownloadConfig, SeedLimits, check_file, download_from_peers};
 use rtrnt::magnet::metadata::{self, Message};
 use rtrnt::magnet::{self, MagnetLink, download_magnet};
+use rtrnt::manager::StartOptions;
 use rtrnt::peer::extension::{ExtendedHandshake, UT_METADATA, UT_METADATA_ID};
 use rtrnt::peer::{PeerMessage, generate_peer_id, handshake_bytes, parse_handshake};
 use rtrnt::torrent::{self, TorrentFile};
@@ -168,12 +169,11 @@ async fn downloads_a_magnet_link_banning_a_peer_with_bad_metadata() {
         max_download_rate: 0,
         max_upload_rate: 0,
         resume_dir: None,
-        recheck: false,
     };
     let client = client(config);
     tokio::time::timeout(
         Duration::from_secs(30),
-        download_magnet(&link, &client, pending()),
+        download_magnet(&link, &StartOptions::default(), &client, pending()),
     )
     .await
     .expect("download timed out")
@@ -213,7 +213,7 @@ async fn downloads_a_magnet_link_banning_a_peer_with_bad_metadata() {
 
     tokio::time::timeout(
         Duration::from_secs(10),
-        download_magnet(&link, &client, pending()),
+        download_magnet(&link, &StartOptions::default(), &client, pending()),
     )
     .await
     .expect("second run timed out")
@@ -349,12 +349,11 @@ async fn downloads_a_magnet_link_from_another_rtrnt() {
         max_download_rate: 0,
         max_upload_rate: 0,
         resume_dir: None,
-        recheck: false,
     };
     let client = client(config);
     tokio::time::timeout(
         Duration::from_secs(20),
-        download_magnet(&link, &client, pending()),
+        download_magnet(&link, &StartOptions::default(), &client, pending()),
     )
     .await
     .expect("download timed out")

@@ -13,7 +13,8 @@
 use crate::client::Client;
 use crate::dht::DhtSearch;
 use crate::download::peer_pool::PeerPool;
-use crate::download::{self, Limits, Session, StartPeers};
+use crate::download::{self, CheckedOnly, Limits, Session, StartPeers};
+use crate::manager::{Recheck, StartOptions};
 use crate::peer::extension::Advertised;
 use crate::resume::{self, Target};
 use crate::stats::{PeerSource, TorrentState, TorrentStats};
@@ -241,13 +242,15 @@ pub async fn saved_torrent(link: &MagnetLink, output_dir: &Path) -> Option<PathB
 /// `download_file`.
 pub async fn download_magnet(
     link: &MagnetLink,
+    options: &StartOptions,
     client: &Client,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let config = client.config();
     if let Some(path) = saved_torrent(link, &config.output_dir).await {
         info!(path = %path.display(), "using metadata saved by an earlier run");
-        return download::download_file(&path, client, shutdown).await;
+        let metainfo = torrent::load_metainfo(&path).await?;
+        return download::download_metainfo(metainfo, options, client, shutdown).await;
     }
     let name = link.name.clone().unwrap_or_else(|| hex(&link.info_hash));
     let stats = client
@@ -258,7 +261,7 @@ pub async fn download_magnet(
         total: 0,
         peers: 0,
     });
-    let result = fetch_and_download(link, client, &stats, shutdown).await;
+    let result = fetch_and_download(link, options, client, &stats, shutdown).await;
     stats.finish(&result);
     result
 }
@@ -267,6 +270,7 @@ pub async fn download_magnet(
 /// its progress in `stats`.
 async fn fetch_and_download(
     link: &MagnetLink,
+    options: &StartOptions,
     client: &Client,
     stats: &Arc<TorrentStats>,
     shutdown: impl Future<Output = ()>,
@@ -373,8 +377,12 @@ async fn fetch_and_download(
             resume: Target::new(config, info_hash),
             stats: Arc::clone(stats),
         });
+        let recheck = options.recheck != Recheck::No;
         let have =
-            resume::initial_pieces(&session, config, client.hashing(), shutdown.as_mut()).await?;
+            resume::initial_pieces(&session, recheck, client.hashing(), shutdown.as_mut()).await?;
+        if options.recheck == Recheck::ThenPause {
+            bail!(CheckedOnly);
+        }
         let left = session.torrent.length() - download::verified_bytes(&session.torrent, &have)?;
         anyhow::Ok((session, have, left))
     };

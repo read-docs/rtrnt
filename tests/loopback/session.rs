@@ -64,7 +64,6 @@ async fn two_torrents_share_one_listening_port() {
         max_download_rate: 0,
         max_upload_rate: 0,
         resume_dir: None,
-        recheck: false,
     });
     let (first, second) = tokio::time::timeout(Duration::from_secs(30), async {
         tokio::join!(
@@ -117,7 +116,6 @@ async fn a_client_runs_a_torrent_once() {
         max_download_rate: 0,
         max_upload_rate: 0,
         resume_dir: None,
-        recheck: false,
     });
     let (stop, stop_rx) = oneshot::channel::<()>();
     let first = download_file(&path, &client, async {
@@ -373,7 +371,7 @@ async fn a_torrent_waits_its_turn_to_check_its_data() {
 
     // Stopped while it waits: nothing is checked, and no resume file is
     // written for data that was never looked at.
-    let stopped = resume::initial_pieces(&session, &config, &hashing, async {})
+    let stopped = resume::initial_pieces(&session, false, &hashing, async {})
         .await
         .unwrap_err();
     assert!(stopped.is::<Interrupted>(), "{stopped:#}");
@@ -383,7 +381,7 @@ async fn a_torrent_waits_its_turn_to_check_its_data() {
 
     // Waiting without a shutdown: nothing is checked until the turn is
     // given up, and then the data is.
-    let waiting = resume::initial_pieces(&session, &config, &hashing, pending());
+    let waiting = resume::initial_pieces(&session, false, &hashing, pending());
     let release = async {
         assert!(!term.drawn().contains("checking multi"));
         drop(turn);
@@ -448,7 +446,6 @@ async fn stats_follow_a_download() {
         max_download_rate: 0,
         max_upload_rate: 0,
         resume_dir: None,
-        recheck: false,
     }));
     // Another torrent's turn at checking.
     let turn = client.hashing().acquire().await.unwrap();

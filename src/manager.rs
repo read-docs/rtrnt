@@ -2,7 +2,7 @@
 //! UI asks of them, and the exit code once they have all ended.
 
 use crate::client::Client;
-use crate::download::{self, Interrupted};
+use crate::download::{self, CheckedOnly, Interrupted};
 use crate::magnet::{self, FetchInterrupted, MagnetLink};
 use crate::resume;
 use crate::source::Source;
@@ -45,7 +45,28 @@ pub enum Command {
 pub type StopSignal = BoxFuture<'static, ()>;
 
 /// How a torrent is run for real: `download_metainfo` or `download_magnet`.
-pub type RunTorrent = fn(Arc<Client>, Torrent, StopSignal) -> BoxFuture<'static, Result<()>>;
+pub type RunTorrent =
+    fn(Arc<Client>, Torrent, StartOptions, StopSignal) -> BoxFuture<'static, Result<()>>;
+
+/// What differs between runs of one torrent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StartOptions {
+    /// Whether to hash the data on disk rather than trust the resume file.
+    pub recheck: Recheck,
+}
+
+/// Whether, and what next, a run hashes the data on disk, ignoring the
+/// resume file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Recheck {
+    /// Trust the resume file where it can be.
+    #[default]
+    No,
+    /// Hash everything, then carry on.
+    ThenRun,
+    /// Hash everything, save the result and stop, paused.
+    ThenPause,
+}
 
 /// A torrent ready to start: the metainfo of a file, loaded already, or a
 /// magnet link.
@@ -68,6 +89,8 @@ impl Torrent {
 pub enum Outcome {
     Done,
     Interrupted,
+    /// Stopped after checking the data, as `Recheck::ThenPause` asks.
+    Checked,
     Failed(anyhow::Error),
 }
 
@@ -80,6 +103,12 @@ pub enum State {
     /// Its task was stopped by a pause, to be started again.
     Paused,
     Ended(Outcome),
+    /// Its task was asked to stop, as a pause asks, to be started again
+    /// with `then` once it has.
+    Restarting {
+        stop: watch::Sender<bool>,
+        then: StartOptions,
+    },
     /// Its task was asked to stop, as a pause asks, and the entry goes once
     /// it has; with `delete`, its files go too.
     Removing {
@@ -136,7 +165,7 @@ impl<S, F, R, Fut> Manager<S, R>
 where
     S: Fn() -> F,
     F: Future<Output = ()> + Send + 'static,
-    R: Fn(Arc<Client>, Torrent, StopSignal) -> Fut,
+    R: Fn(Arc<Client>, Torrent, StartOptions, StopSignal) -> Fut,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     /// `new`, running each torrent through `run_torrent`.
@@ -169,10 +198,10 @@ where
         self.several = true;
     }
 
-    /// Starts every torrent in `sources` at once, loading the files first.
-    /// One that fails does not stop the others. With several, each one's
-    /// logs carry its name.
-    pub async fn start(&mut self, sources: Vec<Source>) {
+    /// Starts every torrent in `sources` at once with `options`, loading
+    /// the files first. One that fails does not stop the others. With
+    /// several, each one's logs carry its name.
+    pub async fn start(&mut self, sources: Vec<Source>, options: StartOptions) {
         self.several |= sources.len() > 1;
         for source in sources {
             let span = self.span(&source);
@@ -187,7 +216,7 @@ where
                 }
             };
             let info_hash = torrent.info_hash();
-            let state = self.spawn(torrent, span);
+            let state = self.spawn(torrent, options.clone(), span);
             self.entries.push(Entry {
                 source,
                 info_hash,
@@ -207,9 +236,9 @@ where
         }
     }
 
-    /// Runs `torrent` in a task of its own, and returns the state of its
-    /// entry.
-    fn spawn(&mut self, torrent: Torrent, span: Span) -> State {
+    /// Runs `torrent` with `options` in a task of its own, and returns the
+    /// state of its entry.
+    fn spawn(&mut self, torrent: Torrent, options: StartOptions, span: Span) -> State {
         let info_hash = torrent.info_hash();
         let (stop, stopped) = watch::channel(false);
         let paused = stopped.clone();
@@ -220,7 +249,7 @@ where
                 () = own_stop(stopped) => {}
             }
         });
-        let run = (self.run_torrent)(Arc::clone(&self.client), torrent, stop_signal);
+        let run = (self.run_torrent)(Arc::clone(&self.client), torrent, options, stop_signal);
         let several = self.several;
         let task = self.tasks.spawn(
             async move {
@@ -268,7 +297,10 @@ where
         let index = self.running.remove(&id).and_then(|info_hash| {
             self.entries.iter().position(|entry| {
                 entry.info_hash == info_hash
-                    && matches!(entry.state, State::Running { .. } | State::Removing { .. })
+                    && matches!(
+                        entry.state,
+                        State::Running { .. } | State::Restarting { .. } | State::Removing { .. }
+                    )
             })
         });
         if let Some(index) = index
@@ -276,6 +308,11 @@ where
         {
             let entry = self.entries.remove(index);
             self.forget(entry, delete).await;
+        } else if let Some(index) = index
+            && let State::Restarting { then, .. } = &self.entries[index].state
+        {
+            let then = then.clone();
+            self.start_again(index, then, "restarting", "restart").await;
         } else if let Some(index) = index {
             let span = self.span(&self.entries[index].source);
             let entry = &mut self.entries[index];
@@ -288,6 +325,10 @@ where
                         stats.set_state(TorrentState::Paused);
                     }
                     span.in_scope(|| info!("paused"));
+                    State::Paused
+                }
+                Outcome::Checked => {
+                    span.in_scope(|| info!("checked; paused"));
                     State::Paused
                 }
                 Outcome::Failed(e) => {
@@ -306,8 +347,19 @@ where
     }
 
     /// Asks the running torrent with info hash `info_hash` to stop, for a
-    /// pause; its task ends as it does on Ctrl-C.
+    /// pause; its task ends as it does on Ctrl-C. One that is to restart
+    /// is paused instead, once it has stopped.
     fn pause(&mut self, info_hash: [u8; 20]) {
+        let restarting = self.entries.iter_mut().find(|entry| {
+            entry.info_hash == info_hash && matches!(entry.state, State::Restarting { .. })
+        });
+        if let Some(entry) = restarting {
+            entry.state = match std::mem::replace(&mut entry.state, State::Paused) {
+                State::Restarting { stop, .. } => State::Running { stop },
+                state => state,
+            };
+            return;
+        }
         let Some(State::Running { stop }) = self
             .entries
             .iter()
@@ -327,6 +379,34 @@ where
         }
     }
 
+    /// Asks the running torrent with info hash `info_hash` to stop, as a
+    /// pause does, and starts it again from its source with `then` once it
+    /// has. A torrent that is not running is left alone.
+    pub fn restart(&mut self, info_hash: [u8; 20], then: StartOptions) {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.info_hash == info_hash)
+        else {
+            return;
+        };
+        let State::Running { stop } = &entry.state else {
+            return;
+        };
+        if stop.send_replace(true) {
+            // Already asked to stop, by a pause.
+            return;
+        }
+        entry.state = match std::mem::replace(&mut entry.state, State::Paused) {
+            State::Running { stop } => State::Restarting { stop, then },
+            state => state,
+        };
+        let running = |state: &TorrentState| !state.is_finished();
+        if let Some(stats) = stats_of(&self.client, info_hash, running) {
+            stats.set_state(TorrentState::Pausing);
+        }
+    }
+
     /// Starts the paused or ended torrent with info hash `info_hash` again,
     /// from its source. A torrent file is loaded again; a magnet link finds
     /// the metadata its earlier run saved, if it got that far.
@@ -336,12 +416,21 @@ where
         }) else {
             return;
         };
+        self.start_again(index, StartOptions::default(), "resuming", "resume")
+            .await;
+    }
+
+    /// Runs the torrent of entry `index` again with `options`, from its
+    /// source, as `resume` and `restart` do, or ends it as failed, with a
+    /// notice that says it cannot `verb`; `doing` is what the log says.
+    async fn start_again(&mut self, index: usize, options: StartOptions, doing: &str, verb: &str) {
+        let info_hash = self.entries[index].info_hash;
         let source = self.entries[index].source.clone();
         let span = self.span(&source);
         let state = match load(&source, &span).await {
             Ok(torrent) if torrent.info_hash() == info_hash => {
-                span.in_scope(|| info!("resuming"));
-                self.spawn(torrent, span.clone())
+                span.in_scope(|| info!("{doing}"));
+                self.spawn(torrent, options, span.clone())
             }
             Ok(_) => State::Ended(Outcome::Failed(anyhow::anyhow!(
                 "the torrent file has changed"
@@ -350,7 +439,7 @@ where
         };
         if let State::Ended(Outcome::Failed(e)) = &state {
             span.in_scope(|| error!("{e:#}"));
-            self.client.stats().notice(format!("cannot resume: {e:#}"));
+            self.client.stats().notice(format!("cannot {verb}: {e:#}"));
             let ended = |state: &TorrentState| state.is_finished();
             if let Some(stats) = stats_of(&self.client, info_hash, ended) {
                 stats.set_state(TorrentState::Failed(format!("{e:#}")));
@@ -366,14 +455,17 @@ where
     /// meanwhile. With `delete`, its files go too.
     async fn remove(&mut self, info_hash: [u8; 20], delete: bool) {
         let with_hash = |entry: &Entry| entry.info_hash == info_hash;
-        let running = self
-            .entries
-            .iter()
-            .position(|entry| with_hash(entry) && matches!(entry.state, State::Running { .. }));
+        let running = self.entries.iter().position(|entry| {
+            with_hash(entry)
+                && matches!(
+                    entry.state,
+                    State::Running { .. } | State::Restarting { .. }
+                )
+        });
         if let Some(index) = running {
             let entry = &mut self.entries[index];
             entry.state = match std::mem::replace(&mut entry.state, State::Paused) {
-                State::Running { stop } => {
+                State::Running { stop } | State::Restarting { stop, .. } => {
                     stop.send_replace(true);
                     State::Removing { stop, delete }
                 }
@@ -421,6 +513,7 @@ where
         {
             let why = match entry.state {
                 State::Running { .. } => "already running",
+                State::Restarting { .. } => "already running, restarting",
                 State::Paused => "already added, press p to resume",
                 State::Ended(_) => "already added, press p to run it again",
                 State::Removing { .. } => "still being removed, add it again once it has gone",
@@ -431,7 +524,7 @@ where
             return;
         }
         span.in_scope(|| info!("added"));
-        let state = self.spawn(torrent, span);
+        let state = self.spawn(torrent, StartOptions::default(), span);
         self.entries.push(Entry {
             source,
             info_hash,
@@ -514,7 +607,10 @@ where
                 }
                 State::Ended(Outcome::Interrupted) => interrupted = true,
                 // A removed torrent has no entry, so it counts for nothing.
-                State::Ended(Outcome::Done) | State::Running { .. } | State::Removing { .. } => {}
+                State::Ended(Outcome::Done | Outcome::Checked)
+                | State::Running { .. }
+                | State::Restarting { .. }
+                | State::Removing { .. } => {}
             }
         }
         if !failed.is_empty() {
@@ -537,12 +633,15 @@ where
 fn run_torrent(
     client: Arc<Client>,
     torrent: Torrent,
+    options: StartOptions,
     stop: StopSignal,
 ) -> BoxFuture<'static, Result<()>> {
     Box::pin(async move {
         match torrent {
-            Torrent::File(metainfo) => download::download_metainfo(metainfo, &client, stop).await,
-            Torrent::Magnet(link) => magnet::download_magnet(&link, &client, stop).await,
+            Torrent::File(metainfo) => {
+                download::download_metainfo(metainfo, &options, &client, stop).await
+            }
+            Torrent::Magnet(link) => magnet::download_magnet(&link, &options, &client, stop).await,
         }
     })
 }
@@ -658,6 +757,7 @@ async fn own_stop(mut stop: watch::Receiver<bool>) {
 fn outcome(result: Result<()>, several: bool, paused: bool) -> Outcome {
     match result {
         Ok(()) => Outcome::Done,
+        Err(e) if e.is::<CheckedOnly>() => Outcome::Checked,
         Err(e) if e.is::<Interrupted>() || e.is::<FetchInterrupted>() => {
             // Stopped on its own, it was paused or is being removed, and the
             // manager says which.

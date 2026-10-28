@@ -10,7 +10,7 @@ use log_line::LogLine;
 use rtrnt::client::Client;
 use rtrnt::download::{self, DownloadConfig};
 use rtrnt::magnet;
-use rtrnt::manager::{Command, EXIT_INTERRUPTED, Manager};
+use rtrnt::manager::{Command, EXIT_INTERRUPTED, Manager, Recheck, StartOptions};
 use rtrnt::source::Source;
 use rtrnt::tui::log_buffer::LogBuffer;
 use rtrnt::tui::{self, SessionFeed};
@@ -85,8 +85,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     if let Some(path) = &file.path {
         info!(path = %path.display(), "loaded config file");
     }
-    let mut config = config::resolve(cli, file.options);
-    config.recheck = args.recheck;
+    let config = config::resolve(cli, file.options);
     if args.check || args.scrape {
         let (config, check_mode) = (&config, args.check);
         return each_in_turn(&args.torrents, |source| async move {
@@ -108,7 +107,14 @@ async fn main() -> anyhow::Result<ExitCode> {
     if use_tui {
         manager.expect_more();
     }
-    manager.start(args.torrents).await;
+    let options = StartOptions {
+        recheck: if args.recheck {
+            Recheck::ThenRun
+        } else {
+            Recheck::No
+        },
+    };
+    manager.start(args.torrents, options).await;
     let (commands, commands_rx) = mpsc::unbounded_channel();
     if !use_tui {
         // Nothing sends commands, so the run ends with the last torrent.

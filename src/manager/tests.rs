@@ -4,6 +4,7 @@ use crate::stats::TorrentState;
 use anyhow::anyhow;
 use indicatif::{MultiProgress, ProgressDrawTarget};
 use std::future::Future;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn client() -> Arc<Client> {
@@ -17,7 +18,6 @@ fn client() -> Arc<Client> {
         max_download_rate: 0,
         max_upload_rate: 0,
         resume_dir: None,
-        recheck: false,
     };
     Arc::new(Client::new(
         config,
@@ -40,14 +40,18 @@ fn magnet(how: u8) -> Source {
 }
 
 /// Ends each torrent as the first byte of its info hash says, without a
-/// swarm.
+/// swarm, unless it is only to be checked.
 fn fake_run(
     _: Arc<Client>,
     torrent: Torrent,
+    options: StartOptions,
     stop: StopSignal,
 ) -> impl Future<Output = Result<()>> + Send + 'static {
     let how = torrent.info_hash()[0];
     async move {
+        if options.recheck == Recheck::ThenPause {
+            return Err(CheckedOnly.into());
+        }
         let interrupted = Interrupted {
             remaining: 1,
             pieces: 2,
@@ -78,7 +82,7 @@ fn closed() -> mpsc::UnboundedReceiver<Command> {
 /// The exit code of a session of `sources`, with no commands.
 async fn exit_code(sources: Vec<Source>) -> Result<ExitCode> {
     let mut manager = Manager::with_runner(client(), never, fake_run);
-    manager.start(sources).await;
+    manager.start(sources, StartOptions::default()).await;
     manager.run(closed()).await
 }
 
@@ -87,7 +91,10 @@ async fn every_torrent_is_started_and_its_outcome_kept() {
     let mut manager = Manager::with_runner(client(), never, fake_run);
     let idle = manager.idle();
     manager
-        .start(vec![magnet(DONE), magnet(INTERRUPTED), magnet(FAILED)])
+        .start(
+            vec![magnet(DONE), magnet(INTERRUPTED), magnet(FAILED)],
+            StartOptions::default(),
+        )
         .await;
     assert!(!*idle.borrow());
     let hashes: Vec<_> = manager.entries().iter().map(|e| e.info_hash).collect();
@@ -155,7 +162,9 @@ async fn with_several_any_failure_fails_and_otherwise_an_interruption_shows() {
     // A file that cannot be loaded has no entry, but still fails the run.
     let missing = Source::File("no such dir/x.torrent".into());
     let mut manager = Manager::with_runner(client(), never, fake_run);
-    manager.start(vec![missing, magnet(DONE)]).await;
+    manager
+        .start(vec![missing, magnet(DONE)], StartOptions::default())
+        .await;
     assert_eq!(manager.entries().len(), 1);
     assert_eq!(manager.run(closed()).await.unwrap(), ExitCode::FAILURE);
 }
@@ -170,7 +179,9 @@ async fn the_session_stop_stops_the_torrents() {
         }
     };
     let mut manager = Manager::with_runner(client(), session_stop, fake_run);
-    manager.start(vec![magnet(UNTIL_STOPPED)]).await;
+    manager
+        .start(vec![magnet(UNTIL_STOPPED)], StartOptions::default())
+        .await;
     let run = tokio::spawn(manager.run(closed()));
     tokio::task::yield_now().await;
     assert!(!run.is_finished());
@@ -184,7 +195,9 @@ async fn the_session_stop_stops_the_torrents() {
 #[tokio::test]
 async fn a_torrent_stops_on_its_own_stop() {
     let mut manager = Manager::with_runner(client(), never, fake_run);
-    manager.start(vec![magnet(UNTIL_STOPPED)]).await;
+    manager
+        .start(vec![magnet(UNTIL_STOPPED)], StartOptions::default())
+        .await;
     let State::Running { stop } = &manager.entries()[0].state else {
         panic!("not running");
     };
@@ -199,7 +212,9 @@ async fn the_run_ends_once_the_commands_end() {
     let client = client();
     let mut manager = Manager::with_runner(Arc::clone(&client), never, fake_run);
     let mut idle = manager.idle();
-    manager.start(vec![magnet(DONE)]).await;
+    manager
+        .start(vec![magnet(DONE)], StartOptions::default())
+        .await;
     let (commands, commands_rx) = mpsc::unbounded_channel();
     let run = tokio::spawn(manager.run(commands_rx));
     idle.wait_for(|&idle| idle).await.unwrap();
@@ -219,13 +234,30 @@ async fn the_run_ends_once_the_commands_end() {
 /// `fake_run`, counting the runs in `runs`.
 fn counting(
     runs: &Arc<AtomicUsize>,
-) -> impl Fn(Arc<Client>, Torrent, StopSignal) -> BoxFuture<'static, Result<()>> + use<> {
+) -> impl Fn(Arc<Client>, Torrent, StartOptions, StopSignal) -> BoxFuture<'static, Result<()>> + use<>
+{
     let runs = Arc::clone(runs);
-    move |client, torrent, stop| {
+    move |client, torrent, options, stop| {
         runs.fetch_add(1, Ordering::Relaxed);
-        Box::pin(fake_run(client, torrent, stop))
+        Box::pin(fake_run(client, torrent, options, stop))
     }
 }
+
+/// `fake_run`, keeping the options of each run in `seen`.
+fn recording(
+    seen: &Arc<Mutex<Vec<StartOptions>>>,
+) -> impl Fn(Arc<Client>, Torrent, StartOptions, StopSignal) -> BoxFuture<'static, Result<()>> + use<>
+{
+    let seen = Arc::clone(seen);
+    move |client, torrent, options, stop| {
+        seen.lock().unwrap().push(options.clone());
+        Box::pin(fake_run(client, torrent, options, stop))
+    }
+}
+
+const RECHECK: StartOptions = StartOptions {
+    recheck: Recheck::ThenRun,
+};
 
 #[tokio::test]
 async fn a_paused_torrent_resumes_and_the_session_can_end_paused() {
@@ -234,7 +266,9 @@ async fn a_paused_torrent_resumes_and_the_session_can_end_paused() {
     let mut manager = Manager::with_runner(Arc::clone(&client), never, counting(&runs));
     let idle = manager.idle();
     let hash = [UNTIL_STOPPED; 20];
-    manager.start(vec![magnet(UNTIL_STOPPED)]).await;
+    manager
+        .start(vec![magnet(UNTIL_STOPPED)], StartOptions::default())
+        .await;
     // What the real run would have published.
     let stats = client.stats().add_torrent(hash, "t", ".".as_ref());
 
@@ -273,7 +307,9 @@ async fn a_paused_torrent_resumes_and_the_session_can_end_paused() {
 async fn an_ended_torrent_can_be_run_again() {
     let runs = Arc::new(AtomicUsize::new(0));
     let mut manager = Manager::with_runner(client(), never, counting(&runs));
-    manager.start(vec![magnet(DONE), magnet(FAILED)]).await;
+    manager
+        .start(vec![magnet(DONE), magnet(FAILED)], StartOptions::default())
+        .await;
     manager.drive(closed()).await;
     // Neither is running, so neither pauses.
     manager.command(Command::Pause([DONE; 20])).await;
@@ -299,7 +335,9 @@ async fn a_running_torrent_is_removed_once_its_task_has_ended() {
     let mut manager = Manager::with_runner(Arc::clone(&client), never, fake_run);
     let idle = manager.idle();
     let hash = [UNTIL_STOPPED; 20];
-    manager.start(vec![magnet(UNTIL_STOPPED)]).await;
+    manager
+        .start(vec![magnet(UNTIL_STOPPED)], StartOptions::default())
+        .await;
     let stats = client.stats().add_torrent(hash, "t", ".".as_ref());
 
     // Asked to pause first, it is removed all the same.
@@ -337,7 +375,10 @@ async fn a_paused_or_ended_torrent_is_removed_at_once() {
     let mut manager = Manager::with_runner(Arc::clone(&client), never, fake_run);
     let (paused, failed) = ([UNTIL_STOPPED; 20], [FAILED; 20]);
     manager
-        .start(vec![magnet(UNTIL_STOPPED), magnet(FAILED), magnet(DONE)])
+        .start(
+            vec![magnet(UNTIL_STOPPED), magnet(FAILED), magnet(DONE)],
+            StartOptions::default(),
+        )
         .await;
     // What the real runs would have published.
     client.stats().add_torrent(paused, "paused", ".".as_ref());
@@ -383,7 +424,7 @@ async fn an_added_magnet_link_starts_with_the_others() {
     let idle = manager.idle();
     // A session can start with none, for the UI to add them.
     manager.expect_more();
-    manager.start(Vec::new()).await;
+    manager.start(Vec::new(), StartOptions::default()).await;
     assert!(*idle.borrow());
 
     manager.command(Command::Add(magnet(UNTIL_STOPPED))).await;
@@ -405,7 +446,10 @@ async fn a_torrent_the_session_has_is_not_added_again() {
     let mut manager = Manager::with_runner(Arc::clone(&client), never, counting(&runs));
     let (running, done) = ([UNTIL_STOPPED; 20], [DONE; 20]);
     manager
-        .start(vec![magnet(UNTIL_STOPPED), magnet(DONE)])
+        .start(
+            vec![magnet(UNTIL_STOPPED), magnet(DONE)],
+            StartOptions::default(),
+        )
         .await;
     // What the real runs would have published.
     client.stats().add_torrent(running, "running", ".".as_ref());
@@ -467,7 +511,7 @@ async fn a_session_with_no_torrents_waits_for_the_commands() {
     let runs = Arc::new(AtomicUsize::new(0));
     let mut manager = Manager::with_runner(client(), never, counting(&runs));
     manager.expect_more();
-    manager.start(Vec::new()).await;
+    manager.start(Vec::new(), StartOptions::default()).await;
     let mut idle = manager.idle();
     let (commands, commands_rx) = mpsc::unbounded_channel();
     let run = tokio::spawn(manager.run(commands_rx));
@@ -482,4 +526,104 @@ async fn a_session_with_no_torrents_waits_for_the_commands() {
     assert!(!run.is_finished());
     drop(commands);
     assert_eq!(run.await.unwrap().unwrap(), ExitCode::SUCCESS);
+}
+
+#[tokio::test]
+async fn a_restarted_torrent_runs_again_with_the_new_options() {
+    let client = client();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, recording(&seen));
+    let hash = [UNTIL_STOPPED; 20];
+    manager
+        .start(vec![magnet(UNTIL_STOPPED)], StartOptions::default())
+        .await;
+    let stats = client.stats().add_torrent(hash, "t", ".".as_ref());
+
+    manager.restart(hash, RECHECK);
+    assert!(
+        matches!(&manager.entries()[0].state, State::Restarting { stop, then } if *stop.borrow() && *then == RECHECK)
+    );
+    assert_eq!(stats.state(), TorrentState::Pausing);
+    // Asking again, or to pause, does not stop it twice.
+    manager.restart(hash, StartOptions::default());
+    assert!(
+        matches!(&manager.entries()[0].state, State::Restarting { then, .. } if *then == RECHECK)
+    );
+
+    let joined = manager.tasks.join_next_with_id().await.unwrap();
+    manager.ended(joined).await;
+    assert!(matches!(&manager.entries()[0].state, State::Running { stop } if !*stop.borrow()));
+    assert_eq!(*seen.lock().unwrap(), [StartOptions::default(), RECHECK]);
+    // A torrent that is not running is not restarted.
+    manager.restart([DONE; 20], RECHECK);
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_torrent_restarting_can_be_paused_or_removed_meanwhile() {
+    let client = client();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, counting(&runs));
+    let hash = [UNTIL_STOPPED; 20];
+    manager
+        .start(vec![magnet(UNTIL_STOPPED)], StartOptions::default())
+        .await;
+
+    manager.restart(hash, RECHECK);
+    manager.command(Command::Pause(hash)).await;
+    let joined = manager.tasks.join_next_with_id().await.unwrap();
+    manager.ended(joined).await;
+    assert!(matches!(manager.entries()[0].state, State::Paused));
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+
+    manager.command(Command::Resume(hash)).await;
+    manager.restart(hash, RECHECK);
+    manager
+        .command(Command::Remove {
+            info_hash: hash,
+            delete: false,
+        })
+        .await;
+    assert!(matches!(
+        manager.entries()[0].state,
+        State::Removing { delete: false, .. }
+    ));
+    // Restarting a torrent being removed is ignored.
+    manager.restart(hash, RECHECK);
+    assert!(matches!(manager.entries()[0].state, State::Removing { .. }));
+    manager.drive(closed()).await;
+    assert!(manager.entries().is_empty());
+    assert_eq!(runs.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn adding_a_torrent_restarting_says_so() {
+    let client = client();
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, fake_run);
+    manager
+        .start(vec![magnet(UNTIL_STOPPED)], StartOptions::default())
+        .await;
+    manager.restart([UNTIL_STOPPED; 20], RECHECK);
+    // A magnet link is always loaded, so this is the session's own torrent.
+    manager.command(Command::Add(magnet(UNTIL_STOPPED))).await;
+    let (_, notice) = client.stats().last_notice().unwrap();
+    assert!(notice.ends_with("already running, restarting"), "{notice}");
+    assert_eq!(manager.entries().len(), 1);
+}
+
+#[tokio::test]
+async fn a_torrent_only_checked_ends_paused() {
+    let client = client();
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, fake_run);
+    let only_check = StartOptions {
+        recheck: Recheck::ThenPause,
+    };
+    manager.start(vec![magnet(UNTIL_STOPPED)], only_check).await;
+    manager.drive(closed()).await;
+    assert!(matches!(manager.entries()[0].state, State::Paused));
+    // It is paused, so the session says to run again, as for any pause.
+    assert_eq!(
+        manager.run(closed()).await.unwrap(),
+        ExitCode::from(EXIT_INTERRUPTED)
+    );
 }

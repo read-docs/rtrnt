@@ -1,4 +1,4 @@
-use rtrnt::manager::{Command, Manager};
+use rtrnt::manager::{Command, Manager, StartOptions};
 use rtrnt::peer::PeerMessage;
 use rtrnt::source::Source;
 use rtrnt::stats::TorrentState;
@@ -43,7 +43,7 @@ async fn an_added_torrent_downloads_and_is_not_added_twice() {
     let mut manager = Manager::new(Arc::clone(&client), pending::<()>);
     manager.expect_more();
     let mut idle = manager.idle();
-    manager.start(Vec::new()).await;
+    manager.start(Vec::new(), StartOptions::default()).await;
     let (commands, commands_rx) = mpsc::unbounded_channel();
     let run = tokio::spawn(manager.run(commands_rx));
     let stats = client.stats();

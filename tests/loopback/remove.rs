@@ -1,5 +1,5 @@
 use rtrnt::download::SeedLimits;
-use rtrnt::manager::{Command, Manager};
+use rtrnt::manager::{Command, Manager, StartOptions};
 use rtrnt::source::Source;
 use std::future::pending;
 use std::path::Path;
@@ -32,7 +32,9 @@ async fn seed_and_remove(out: &Path, state: &Path, delete: bool) {
     let client = Arc::new(client(config));
     let mut manager = Manager::new(Arc::clone(&client), pending::<()>);
     let mut idle = manager.idle();
-    manager.start(vec![Source::File(path)]).await;
+    manager
+        .start(vec![Source::File(path)], StartOptions::default())
+        .await;
     let (commands, commands_rx) = mpsc::unbounded_channel();
     let run = tokio::spawn(manager.run(commands_rx));
 
