@@ -95,3 +95,26 @@ fn completion_makes_the_next_announce_due_at_once() {
     assert_eq!(a.completion, Completion::Sent);
     assert_eq!(a.timer.next, now + Duration::from_secs(1800));
 }
+
+#[test]
+fn completed_is_not_pushed_back_by_an_announce_in_flight() {
+    let now = Instant::now();
+    let min = Duration::from_secs(120);
+    let mut a = announcer(now);
+    a.schedule(&response(Some(1800), Some(120)));
+    // A regular announce went out at `now`; the download finishes while it
+    // is on its way, and it answers with the usual interval.
+    a.complete();
+    a.announced(AnnounceEvent::Regular, Ok(response(Some(1800), Some(120))));
+    assert_eq!(a.timer.next, now + min);
+    // The same when it failed.
+    a.announced(AnnounceEvent::Regular, Err(anyhow::anyhow!("down")));
+    assert_eq!(a.timer.next, now + min);
+    // Once the tracker has heard it, back to the interval.
+    a.announced(
+        AnnounceEvent::Completed,
+        Ok(response(Some(1800), Some(120))),
+    );
+    assert_eq!(a.completion, Completion::Sent);
+    assert_eq!(a.timer.next, now + Duration::from_secs(1800));
+}

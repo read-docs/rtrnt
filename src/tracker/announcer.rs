@@ -121,9 +121,20 @@ impl Announcer {
         self.interval = secs(response.interval)
             .unwrap_or(DEFAULT_INTERVAL)
             .clamp(self.min_interval, MAX_INTERVAL);
-        self.timer.next = self.timer.last + self.interval;
-        self.publish_next();
+        self.reschedule();
         debug!(interval = ?self.interval, "next announce scheduled");
+    }
+
+    /// Plans the next announce after the last one was sent: on the interval,
+    /// or, while `completed` is still to be sent, as soon as the tracker
+    /// allows.
+    fn reschedule(&mut self) {
+        let wait = match self.completion {
+            Completion::Due => self.min_interval,
+            _ => self.interval,
+        };
+        self.timer.next = self.timer.last + wait;
+        self.publish_next();
     }
 
     /// Tells the stats when the next announce is due.
@@ -208,6 +219,15 @@ impl Announcer {
             }
             Err(e) => (AnnounceEvent::Regular, Err(e.into())),
         };
+        self.announced(event, result)
+    }
+
+    /// Takes the `result` of the announce of `event`, returning its peers.
+    fn announced(
+        &mut self,
+        event: AnnounceEvent,
+        result: Result<AnnounceResponse>,
+    ) -> Vec<SocketAddr> {
         match result {
             Ok(response) => {
                 if event == AnnounceEvent::Completed {
@@ -219,8 +239,7 @@ impl Announcer {
             }
             Err(e) => {
                 warn!("re-announce failed: {e:#}");
-                self.timer.next = self.timer.last + self.interval;
-                self.publish_next();
+                self.reschedule();
                 Vec::new()
             }
         }
