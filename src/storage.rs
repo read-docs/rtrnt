@@ -7,6 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
+use unicode_normalization::UnicodeNormalization;
 
 pub mod verify;
 
@@ -436,12 +437,17 @@ fn touched_by_wanted_pieces(
     touched
 }
 
-/// `path` as it is compared with others: lowercased on macOS and Windows,
-/// whose default file systems treat names that differ only in case as one
-/// file.
+/// `path` as it is compared with others: normalized to NFC and lowercased
+/// on macOS and Windows, whose default file systems treat names that differ
+/// only in case (or, on macOS, in how an accent is composed) as one file.
 fn fold_case(path: &Path) -> PathBuf {
     if cfg!(any(target_os = "macos", windows)) {
-        PathBuf::from(path.to_string_lossy().to_lowercase())
+        PathBuf::from(
+            path.to_string_lossy()
+                .nfc()
+                .collect::<String>()
+                .to_lowercase(),
+        )
     } else {
         path.to_path_buf()
     }

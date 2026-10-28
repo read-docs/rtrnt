@@ -200,6 +200,21 @@ fn rejects_the_same_path_twice() {
 }
 
 #[test]
+fn composed_and_decomposed_names_are_one_file() {
+    // HFS+ and APFS-style file systems treat these as the same name.
+    let dir = tempfile::tempdir().unwrap();
+    let info = multi_file_info(&[(&["caf\u{e9}"], 1), (&["cafe\u{301}"], 1)]);
+    assert_eq!(
+        Storage::new(&info, dir.path(), &FileSelection::default()).is_err(),
+        cfg!(any(target_os = "macos", windows))
+    );
+    assert_eq!(
+        fold_case(Path::new("caf\u{e9}")) == fold_case(Path::new("cafe\u{301}")),
+        cfg!(any(target_os = "macos", windows))
+    );
+}
+
+#[test]
 fn paths_sit_under_the_absolute_output_dir() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("new").join("out");
