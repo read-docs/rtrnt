@@ -45,15 +45,21 @@ pub struct FileInfo {
 }
 
 impl TorrentFile {
-    /// Total size of all files in bytes.
+    /// Total size of all files in bytes. A torrent whose size overflows is
+    /// refused by `validate`, so this is exact for every parsed torrent.
     pub fn length(&self) -> u64 {
-        self.info.length.unwrap_or_else(|| {
-            self.info
-                .files
-                .as_ref()
-                .map(|files| files.iter().map(|f| f.length).sum())
-                .unwrap_or(0)
-        })
+        self.checked_length().unwrap_or(0)
+    }
+
+    /// Total size of all files, or `None` if it does not fit in a `u64`.
+    fn checked_length(&self) -> Option<u64> {
+        match (self.info.length, &self.info.files) {
+            (Some(length), _) => Some(length),
+            (None, Some(files)) => files
+                .iter()
+                .try_fold(0u64, |total, f| total.checked_add(f.length)),
+            (None, None) => Some(0),
+        }
     }
 
     /// Whether the torrent is private (BEP 27).
@@ -122,7 +128,9 @@ impl TorrentFile {
             (Some(_), None) | (None, Some(_)) => {}
             _ => bail!("torrent must have exactly one of `length` or `files`"),
         }
-        let length = self.length();
+        let Some(length) = self.checked_length() else {
+            bail!("total size of the files overflows");
+        };
         if length == 0 {
             bail!("torrent has no data");
         }

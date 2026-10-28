@@ -138,3 +138,18 @@ fn rejects_deeply_nested_torrent() {
     data.extend(std::iter::repeat_n(b'l', 100_000));
     assert!(parse(&data).is_err());
 }
+
+#[test]
+fn rejects_total_length_overflow() {
+    let mut t = single_file(1, 32);
+    t.info.length = None;
+    t.info.files = Some(
+        ["a", "b"]
+            .map(|name| FileInfo {
+                path: vec![name.into()],
+                length: u64::MAX / 2 + 1,
+            })
+            .to_vec(),
+    );
+    assert!(t.validate().is_err());
+}
