@@ -319,17 +319,18 @@ async fn fetch_and_download(
             left: UNKNOWN_LEFT,
             event: AnnounceEvent::Started,
         };
-        match Announcer::start_reporting(tiers.clone(), request, Some(Arc::clone(stats))).await {
-            Ok((started, peers)) => {
-                info!(peers = peers.len(), "tracker announce succeeded");
-                stats.add_source(PeerSource::Tracker, peers.len());
-                pool.add(peers);
-                announcer = Some(started);
-            }
-            Err(e) => info!("{e:#}"),
-        }
+        let started = Announcer::start_reporting(tiers.clone(), request, Some(Arc::clone(stats)));
+        let (started, peers) = started.await;
+        stats.add_source(PeerSource::Tracker, peers.len());
+        pool.add(peers);
+        announcer = Some(started);
     }
-    if announcer.is_none() && dht.is_none() && link.peers.is_empty() {
+    // A tracker that did not answer is tried again, but not worth waiting
+    // for with nowhere else to look.
+    if !announcer.as_ref().is_some_and(Announcer::has_answered)
+        && dht.is_none()
+        && link.peers.is_empty()
+    {
         bail!("no tracker answered, the magnet link names no peers, and the DHT is off");
     }
 

@@ -5,7 +5,7 @@
 use super::{AnnounceEvent, AnnounceRequest, AnnounceResponse, Tiers};
 use crate::periodic::Periodic;
 use crate::stats::TorrentStats;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,6 +20,9 @@ const MIN_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
 /// How long the final `completed` and `stopped` announces may take in total.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to wait before announcing `started` again when no tracker
+/// answered it. It doubles with each failure, up to the interval.
+const START_RETRY: Duration = Duration::from_secs(30);
 
 /// Payload bytes moved this session, as reported to the tracker.
 #[derive(Debug, Default)]
@@ -59,6 +62,11 @@ pub struct Announcer {
     /// event, on a copy of the tiers that it hands back, reordered to put
     /// the tracker that answered first.
     timer: Periodic<(Tiers, AnnounceEvent, Result<AnnounceResponse>)>,
+    /// Whether a tracker has answered `started`. Until one has, that is the
+    /// announce sent, and retried.
+    answered: bool,
+    /// Announces of `started` in a row that no tracker answered.
+    failures: u32,
     completion: Completion,
     /// Told what each tracker answered, and when the next announce is due.
     stats: Option<Arc<TorrentStats>>,
@@ -67,21 +75,27 @@ pub struct Announcer {
 impl Announcer {
     /// Sends `request` as the `started` announce to the tracker `tiers`.
     /// Returns the announcer and the peers the tracker sent back, which may
-    /// be none.
+    /// be none. Fails if no tracker answered.
     pub async fn start(
         tiers: Vec<Vec<String>>,
         request: AnnounceRequest,
     ) -> Result<(Self, Vec<SocketAddr>)> {
-        Self::start_reporting(tiers, request, None).await
+        let (announcer, peers) = Self::start_reporting(tiers, request, None).await;
+        if !announcer.has_answered() {
+            bail!("no tracker answered the started announce");
+        }
+        Ok((announcer, peers))
     }
 
     /// `start`, recording in `stats` what each tracker answers, now and on
-    /// every announce after.
+    /// every announce after. Returns the announcer even when no tracker
+    /// answered, with the peers none: `poll` sends `started` again, after a
+    /// while.
     pub async fn start_reporting(
         tiers: Vec<Vec<String>>,
         request: AnnounceRequest,
         stats: Option<Arc<TorrentStats>>,
-    ) -> Result<(Self, Vec<SocketAddr>)> {
+    ) -> (Self, Vec<SocketAddr>) {
         if let Some(stats) = &stats {
             stats.set_trackers(&tiers);
         }
@@ -89,12 +103,17 @@ impl Announcer {
         announcer.stats = stats;
         let started = announcer.started;
         let stats = announcer.stats.clone();
-        let response = announcer
+        let result = announcer
             .trackers
             .announce_reporting(&started, |url, result| report(&stats, url, result))
-            .await?;
-        announcer.schedule(&response);
-        Ok((announcer, response.peers))
+            .await;
+        let peers = announcer.announced(AnnounceEvent::Started, result);
+        (announcer, peers)
+    }
+
+    /// Whether a tracker has answered the `started` announce.
+    pub fn has_answered(&self) -> bool {
+        self.answered
     }
 
     fn new(trackers: Tiers, request: AnnounceRequest, now: Instant) -> Self {
@@ -107,6 +126,8 @@ impl Announcer {
             interval: DEFAULT_INTERVAL,
             min_interval: MIN_INTERVAL,
             timer: Periodic::new(now, now + DEFAULT_INTERVAL),
+            answered: false,
+            failures: 0,
             completion: Completion::Downloading,
             stats: None,
         }
@@ -126,10 +147,14 @@ impl Announcer {
     }
 
     /// Plans the next announce after the last one was sent: on the interval,
-    /// or, while `completed` is still to be sent, as soon as the tracker
-    /// allows.
+    /// or sooner while `started` keeps failing, or while `completed` is
+    /// still to be sent, as soon as the tracker allows.
     fn reschedule(&mut self) {
         let wait = match self.completion {
+            _ if self.failures > 0 => {
+                let doubled = START_RETRY.saturating_mul(1 << (self.failures - 1).min(16));
+                doubled.min(self.interval)
+            }
             Completion::Due => self.min_interval,
             _ => self.interval,
         };
@@ -191,13 +216,15 @@ impl Announcer {
 
     /// Waits until the next announce is due, sends it in the background
     /// with the current `transferred` counts, and returns the peers it got
-    /// (none if every tracker failed). It is `completed` if the download has
-    /// finished since the last one, otherwise a regular announce.
+    /// (none if every tracker failed). It is `started` if no tracker has
+    /// answered that yet, else `completed` if the download has finished since
+    /// the last one, otherwise a regular announce.
     ///
     /// Cancel-safe: an announce already sent is kept, and the next call
     /// waits for its answer.
     pub async fn poll(&mut self, transferred: &Transferred) -> Vec<SocketAddr> {
         let event = match self.completion {
+            _ if !self.answered => AnnounceEvent::Started,
             Completion::Due => AnnounceEvent::Completed,
             _ => AnnounceEvent::Regular,
         };
@@ -230,15 +257,23 @@ impl Announcer {
     ) -> Vec<SocketAddr> {
         match result {
             Ok(response) => {
-                if event == AnnounceEvent::Completed {
-                    self.completion = Completion::Sent;
+                match event {
+                    AnnounceEvent::Started => {
+                        self.answered = true;
+                        self.failures = 0;
+                    }
+                    AnnounceEvent::Completed => self.completion = Completion::Sent,
+                    _ => {}
                 }
-                info!(peers = response.peers.len(), ?event, "re-announced");
+                info!(peers = response.peers.len(), ?event, "announced");
                 self.schedule(&response);
                 response.peers
             }
             Err(e) => {
-                warn!("re-announce failed: {e:#}");
+                if !self.answered {
+                    self.failures += 1;
+                }
+                warn!(?event, "announce failed: {e:#}");
                 self.reschedule();
                 Vec::new()
             }
@@ -255,7 +290,10 @@ impl Announcer {
         }
         self.timer.cancel();
         let counts = transferred.load();
-        let events: &[AnnounceEvent] = if self.completion == Completion::Due {
+        let events: &[AnnounceEvent] = if !self.answered {
+            // No tracker knows of us.
+            &[]
+        } else if self.completion == Completion::Due {
             &[AnnounceEvent::Completed, AnnounceEvent::Stopped]
         } else {
             &[AnnounceEvent::Stopped]
