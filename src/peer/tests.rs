@@ -480,6 +480,41 @@ async fn tracks_have_all_have_none_and_allowed_fast() {
 }
 
 #[tokio::test]
+async fn a_bitfield_with_spare_bits_set_is_a_protocol_violation() {
+    // Ten pieces: the last six bits of the second byte are spare.
+    for spare in [0b0000_0001, 0b0010_0000] {
+        let bitfield = vec![0xff, 0b1100_0000 | spare];
+        let (mut conn, _remote) =
+            mock_peer(10, false, vec![PeerMessage::Bitfield { bitfield }]).await;
+        let err = conn.receive().await.unwrap_err();
+        assert!(err.is::<ProtocolViolation>(), "{err:#}");
+        assert_eq!(conn.peer_has(), [false; 10]);
+    }
+
+    // The same when the piece count is learned later.
+    let messages = vec![PeerMessage::Bitfield {
+        bitfield: vec![0xff, 0b1100_0001],
+    }];
+    let (mut conn, _remote) = mock_peer(0, false, messages).await;
+    conn.defer_pieces();
+    conn.receive().await.unwrap();
+    let err = conn.set_piece_count(10).unwrap_err();
+    assert!(err.is::<ProtocolViolation>(), "{err:#}");
+
+    // Spare bits that are clear are fine.
+    let (mut conn, _remote) = mock_peer(
+        10,
+        false,
+        vec![PeerMessage::Bitfield {
+            bitfield: vec![0xff, 0b1100_0000],
+        }],
+    )
+    .await;
+    conn.receive().await.unwrap();
+    assert_eq!(conn.peer_has(), [true; 10]);
+}
+
+#[tokio::test]
 async fn fast_messages_without_the_fast_extension_are_a_protocol_violation() {
     let fast_messages = [
         PeerMessage::HaveAll,

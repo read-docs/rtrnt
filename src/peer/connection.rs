@@ -443,6 +443,10 @@ impl PeerConnection {
                         expected
                     );
                 }
+                let spare_bits = self.peer_has.len() % 8;
+                if spare_bits != 0 && bitfield[expected - 1] & (0xff >> spare_bits) != 0 {
+                    bail!(ProtocolViolation("bitfield has spare bits set"));
+                }
                 for (i, has) in self.peer_has.iter_mut().enumerate() {
                     *has = bitfield[i / 8] & (0x80 >> (i % 8)) != 0;
                 }
