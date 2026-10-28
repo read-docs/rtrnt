@@ -28,14 +28,6 @@ fn write_torrent(
     path
 }
 
-/// Waits for the next announce, failing after 5 s.
-async fn next_announce(queries: &mut mpsc::UnboundedReceiver<String>) -> String {
-    tokio::time::timeout(Duration::from_secs(5), queries.recv())
-        .await
-        .expect("no announce")
-        .unwrap()
-}
-
 /// A download paused partway: the tracker hears `stopped`, the seed's
 /// connection closes and the task ends, with the resume file saved. Resumed,
 /// it trusts the resume file (the turn to hash is held throughout, so any

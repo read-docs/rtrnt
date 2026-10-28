@@ -201,6 +201,15 @@ impl Client {
         })
     }
 
+    /// The name of a running torrent that writes any of `paths` (see
+    /// `Storage::paths`), if one does.
+    pub fn file_owner(&self, paths: &[PathBuf]) -> Option<Arc<str>> {
+        let files = self.lock_files();
+        paths
+            .iter()
+            .find_map(|path| files.get(path).map(|(_, name)| Arc::clone(name)))
+    }
+
     fn lock_torrents(&self) -> MutexGuard<'_, HashSet<[u8; 20]>> {
         self.torrents.lock().unwrap_or_else(PoisonError::into_inner)
     }

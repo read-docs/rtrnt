@@ -243,7 +243,7 @@ async fn a_paused_torrent_resumes_and_the_session_can_end_paused() {
     assert!(matches!(&manager.entries()[0].state, State::Running { stop } if *stop.borrow()));
     assert_eq!(stats.state(), TorrentState::Pausing);
     let joined = manager.tasks.join_next_with_id().await.unwrap();
-    manager.ended(joined);
+    manager.ended(joined).await;
     assert!(matches!(manager.entries()[0].state, State::Paused));
     assert_eq!(stats.state(), TorrentState::Paused);
     assert!(*idle.borrow());
@@ -291,4 +291,88 @@ async fn an_ended_torrent_can_be_run_again() {
     };
     assert!(matches!(done.state, State::Ended(Outcome::Done)));
     assert!(matches!(failed.state, State::Ended(Outcome::Failed(_))));
+}
+
+#[tokio::test]
+async fn a_running_torrent_is_removed_once_its_task_has_ended() {
+    let client = client();
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, fake_run);
+    let idle = manager.idle();
+    let hash = [UNTIL_STOPPED; 20];
+    manager.start(vec![magnet(UNTIL_STOPPED)]).await;
+    let stats = client.stats().add_torrent(hash, "t", ".".as_ref());
+
+    // Asked to pause first, it is removed all the same.
+    manager.command(Command::Pause(hash)).await;
+    manager
+        .command(Command::Remove {
+            info_hash: hash,
+            delete: false,
+        })
+        .await;
+    assert!(
+        matches!(&manager.entries()[0].state, State::Removing { stop, delete: false } if *stop.borrow())
+    );
+    assert_eq!(stats.state(), TorrentState::Removing);
+    // Nothing else is done to it meanwhile.
+    manager.command(Command::Pause(hash)).await;
+    manager.command(Command::Resume(hash)).await;
+    assert!(matches!(manager.entries()[0].state, State::Removing { .. }));
+    assert_eq!(stats.state(), TorrentState::Removing);
+
+    let joined = manager.tasks.join_next_with_id().await.unwrap();
+    manager.ended(joined).await;
+    assert!(manager.entries().is_empty());
+    assert!(client.stats().torrents().is_empty());
+    assert!(*idle.borrow());
+    let (_, notice) = client.stats().last_notice().unwrap();
+    assert_eq!(notice, "removed t");
+    // Stopped by the removal, it does not make the run interrupted.
+    assert_eq!(manager.run(closed()).await.unwrap(), ExitCode::SUCCESS);
+}
+
+#[tokio::test]
+async fn a_paused_or_ended_torrent_is_removed_at_once() {
+    let client = client();
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, fake_run);
+    let (paused, failed) = ([UNTIL_STOPPED; 20], [FAILED; 20]);
+    manager
+        .start(vec![magnet(UNTIL_STOPPED), magnet(FAILED), magnet(DONE)])
+        .await;
+    // What the real runs would have published.
+    client.stats().add_torrent(paused, "paused", ".".as_ref());
+    let failed_stats = client.stats().add_torrent(failed, "failed", ".".as_ref());
+    failed_stats.set_state(TorrentState::Failed("x".into()));
+    manager.command(Command::Pause(paused)).await;
+    manager.drive(closed()).await;
+    assert!(matches!(manager.entries()[0].state, State::Paused));
+
+    manager
+        .command(Command::Remove {
+            info_hash: paused,
+            delete: false,
+        })
+        .await;
+    // A magnet link without metadata has no files to delete.
+    manager
+        .command(Command::Remove {
+            info_hash: failed,
+            delete: true,
+        })
+        .await;
+    let hashes: Vec<_> = manager.entries().iter().map(|e| e.info_hash).collect();
+    assert_eq!(hashes, [[DONE; 20]]);
+    assert!(client.stats().torrents().is_empty());
+    let (_, notice) = client.stats().last_notice().unwrap();
+    assert_eq!(notice, "removed failed and deleted its files");
+    // Removing what is not there does nothing.
+    manager
+        .command(Command::Remove {
+            info_hash: failed,
+            delete: false,
+        })
+        .await;
+    assert_eq!(manager.entries().len(), 1);
+    // The failure went with its torrent, and so did the pause.
+    assert_eq!(manager.run(closed()).await.unwrap(), ExitCode::SUCCESS);
 }

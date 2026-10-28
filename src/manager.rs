@@ -4,10 +4,12 @@
 use crate::client::Client;
 use crate::download::{self, Interrupted};
 use crate::magnet::{self, FetchInterrupted, MagnetLink};
+use crate::resume;
 use crate::source::Source;
 use crate::stats::{TorrentState, TorrentStats};
-use crate::torrent::{self, Metainfo};
-use anyhow::Result;
+use crate::storage::{self, Storage};
+use crate::torrent::{self, Info, Metainfo};
+use anyhow::{Result, anyhow};
 use futures_util::future::BoxFuture;
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -32,6 +34,9 @@ pub enum Command {
     /// Start the paused or ended torrent with this info hash again, from
     /// where it got to.
     Resume([u8; 20]),
+    /// Drop the torrent with this info hash from the session, stopping it
+    /// first if it runs, and with `delete` its files and resume file too.
+    Remove { info_hash: [u8; 20], delete: bool },
 }
 
 /// Resolves when a torrent is to stop.
@@ -73,6 +78,12 @@ pub enum State {
     /// Its task was stopped by a pause, to be started again.
     Paused,
     Ended(Outcome),
+    /// Its task was asked to stop, as a pause asks, and the entry goes once
+    /// it has; with `delete`, its files go too.
+    Removing {
+        stop: watch::Sender<bool>,
+        delete: bool,
+    },
 }
 
 /// A torrent of the session.
@@ -229,7 +240,7 @@ where
         let mut open = true;
         while open || !self.tasks.is_empty() {
             tokio::select! {
-                Some(joined) = self.tasks.join_next_with_id() => self.ended(joined),
+                Some(joined) = self.tasks.join_next_with_id() => self.ended(joined).await,
                 command = commands.recv(), if open => match command {
                     Some(command) => self.command(command).await,
                     None => open = false,
@@ -238,17 +249,28 @@ where
         }
     }
 
-    /// Records how a task ended in its entry.
-    fn ended(&mut self, joined: Result<(task::Id, Outcome), JoinError>) {
+    /// Records how a task ended in its entry, or drops the entry if it was
+    /// being removed.
+    async fn ended(&mut self, joined: Result<(task::Id, Outcome), JoinError>) {
         let (id, outcome) = match joined {
             Ok(ended) => ended,
             Err(e) => (e.id(), Outcome::Failed(e.into())),
         };
-        if let Some(info_hash) = self.running.remove(&id)
-            && let Some(entry) = self.entries.iter_mut().find(|entry| {
-                entry.info_hash == info_hash && matches!(entry.state, State::Running { .. })
+        let index = self.running.remove(&id).and_then(|info_hash| {
+            self.entries.iter().position(|entry| {
+                entry.info_hash == info_hash
+                    && matches!(entry.state, State::Running { .. } | State::Removing { .. })
             })
+        });
+        if let Some(index) = index
+            && let State::Removing { delete, .. } = self.entries[index].state
         {
+            let entry = self.entries.remove(index);
+            self.forget(entry, delete).await;
+        } else if let Some(index) = index {
+            let span = self.span(&self.entries[index].source);
+            let entry = &mut self.entries[index];
+            let info_hash = entry.info_hash;
             let paused = matches!(&entry.state, State::Running { stop } if *stop.borrow());
             entry.state = match outcome {
                 Outcome::Interrupted if paused => {
@@ -256,6 +278,7 @@ where
                     if let Some(stats) = stats_of(&self.client, info_hash, pausing) {
                         stats.set_state(TorrentState::Paused);
                     }
+                    span.in_scope(|| info!("paused"));
                     State::Paused
                 }
                 Outcome::Failed(e) => {
@@ -300,7 +323,7 @@ where
     /// the metadata its earlier run saved, if it got that far.
     async fn resume(&mut self, info_hash: [u8; 20]) {
         let Some(index) = self.entries.iter().position(|entry| {
-            entry.info_hash == info_hash && !matches!(entry.state, State::Running { .. })
+            entry.info_hash == info_hash && matches!(entry.state, State::Paused | State::Ended(_))
         }) else {
             return;
         };
@@ -328,6 +351,78 @@ where
         self.idle.send_replace(self.tasks.is_empty());
     }
 
+    /// Removes the torrent with info hash `info_hash` from the session: at
+    /// once if it is paused or has ended, and otherwise once its task,
+    /// stopped as a pause stops it, has ended. Its row shows `removing`
+    /// meanwhile. With `delete`, its files go too.
+    async fn remove(&mut self, info_hash: [u8; 20], delete: bool) {
+        let with_hash = |entry: &Entry| entry.info_hash == info_hash;
+        let running = self
+            .entries
+            .iter()
+            .position(|entry| with_hash(entry) && matches!(entry.state, State::Running { .. }));
+        if let Some(index) = running {
+            let entry = &mut self.entries[index];
+            entry.state = match std::mem::replace(&mut entry.state, State::Paused) {
+                State::Running { stop } => {
+                    stop.send_replace(true);
+                    State::Removing { stop, delete }
+                }
+                state => state,
+            };
+            let running = |state: &TorrentState| !state.is_finished();
+            if let Some(stats) = stats_of(&self.client, info_hash, running) {
+                stats.set_state(TorrentState::Removing);
+            }
+            return;
+        }
+        let stopped = self.entries.iter().position(|entry| {
+            with_hash(entry) && matches!(entry.state, State::Paused | State::Ended(_))
+        });
+        if let Some(index) = stopped {
+            let entry = self.entries.remove(index);
+            self.forget(entry, delete).await;
+        }
+    }
+
+    /// Drops the row of `entry`, removed from the session, and with
+    /// `delete` its files, its resume file and a magnet link's saved
+    /// `.torrent`. What cannot be deleted is logged and shown as a notice.
+    async fn forget(&self, entry: Entry, delete: bool) {
+        let gone = |state: &TorrentState| *state == TorrentState::Removing || state.is_finished();
+        let stats = stats_of(&self.client, entry.info_hash, gone);
+        let name = stats
+            .as_ref()
+            .map_or_else(|| entry.source.label(), |stats| stats.name());
+        if let Some(stats) = &stats {
+            self.client.stats().remove_torrent(stats);
+        }
+        let span = self.span(&entry.source);
+        if !delete {
+            span.in_scope(|| info!("removed"));
+            self.client.stats().notice(format!("removed {name}"));
+            return;
+        }
+        let failures = delete_data(&self.client, &entry)
+            .instrument(span.clone())
+            .await;
+        span.in_scope(|| {
+            for e in &failures {
+                warn!("{e:#}");
+            }
+            info!("removed, with its files");
+        });
+        let notice = match failures.as_slice() {
+            [] => format!("removed {name} and deleted its files"),
+            [e] => format!("removed {name}, but: {e:#}"),
+            [e, ..] => format!(
+                "removed {name}, but {} things were not deleted: {e:#}",
+                failures.len()
+            ),
+        };
+        self.client.stats().notice(notice);
+    }
+
     async fn command(&mut self, command: Command) {
         let limit = |kib: u64| match kib {
             0 => "none".to_string(),
@@ -344,6 +439,7 @@ where
             }
             Command::Pause(info_hash) => self.pause(info_hash),
             Command::Resume(info_hash) => self.resume(info_hash).await,
+            Command::Remove { info_hash, delete } => self.remove(info_hash, delete).await,
             // The feed stops the torrents itself.
             Command::Stop => {}
         }
@@ -361,7 +457,8 @@ where
                     interrupted = true;
                 }
                 State::Ended(Outcome::Interrupted) => interrupted = true,
-                State::Ended(Outcome::Done) | State::Running { .. } => {}
+                // A removed torrent has no entry, so it counts for nothing.
+                State::Ended(Outcome::Done) | State::Running { .. } | State::Removing { .. } => {}
             }
         }
         if !failed.is_empty() {
@@ -407,6 +504,76 @@ async fn load(source: &Source, span: &Span) -> Result<Torrent> {
     })
 }
 
+/// Deletes the files of the torrent of `entry`, then its resume file and a
+/// magnet link's saved `.torrent`, and returns what could not be. The files
+/// are those the torrent file lists, or the metadata the magnet link saved;
+/// a magnet link whose metadata never arrived has none. Nothing is deleted
+/// while a running torrent writes any of the files.
+async fn delete_data(client: &Arc<Client>, entry: &Entry) -> Vec<anyhow::Error> {
+    let output_dir = client.config().output_dir.clone();
+    let mut failures = Vec::new();
+    let mut others = Vec::new();
+    let info: Option<Info> = match &entry.source {
+        Source::File(path) => match torrent::load_metainfo(path).await {
+            Ok(metainfo) if metainfo.info_hash == entry.info_hash => Some(metainfo.torrent.info),
+            Ok(_) => {
+                failures.push(anyhow!(
+                    "the torrent file has changed, so its files are not known"
+                ));
+                None
+            }
+            Err(e) => {
+                failures.push(e.context("cannot tell which files are the torrent's"));
+                None
+            }
+        },
+        Source::Magnet(link) => match magnet::saved_torrent(link, &output_dir).await {
+            Some(path) => {
+                let info = torrent::load_file(&path).await;
+                others.push(path);
+                info.map(|(torrent, _)| torrent.info).ok()
+            }
+            None => None,
+        },
+    };
+    if let Some(target) = resume::Target::new(client.config(), entry.info_hash) {
+        others.push(target.path().to_path_buf());
+    }
+    let client = Arc::clone(client);
+    let deleted = task::spawn_blocking(move || {
+        let mut failures = Vec::new();
+        if let Some(info) = info {
+            match Storage::paths(&info, &output_dir) {
+                Ok(paths) => {
+                    if let Some(owner) = client.file_owner(&paths) {
+                        return vec![anyhow!(
+                            "nothing deleted, since the torrent {owner} writes its files"
+                        )];
+                    }
+                    failures.extend(storage::delete_files(&info, &output_dir));
+                }
+                Err(e) => failures.push(e),
+            }
+        }
+        for path in others {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => failures.push(
+                    anyhow::Error::new(e).context(format!("failed to delete {}", path.display())),
+                ),
+            }
+        }
+        failures
+    })
+    .await;
+    match deleted {
+        Ok(more) => failures.extend(more),
+        Err(e) => failures.push(anyhow::Error::new(e).context("failed to delete the files")),
+    }
+    failures
+}
+
 /// The stats of the torrent with info hash `info_hash` whose state is
 /// `wanted`: of the run the manager means, should two share it.
 fn stats_of(
@@ -430,14 +597,15 @@ async fn own_stop(mut stop: watch::Receiver<bool>) {
 
 /// What `result` says of how a torrent ended, logged. With `several`, a
 /// failure is logged here, since the session goes on. A torrent `paused`
-/// can be resumed in this session, so it does not say to run again.
+/// (or removed) can be resumed in this session, so it does not say to run
+/// again.
 fn outcome(result: Result<()>, several: bool, paused: bool) -> Outcome {
     match result {
         Ok(()) => Outcome::Done,
         Err(e) if e.is::<Interrupted>() || e.is::<FetchInterrupted>() => {
-            if paused {
-                info!("paused");
-            } else {
+            // Stopped on its own, it was paused or is being removed, and the
+            // manager says which.
+            if !paused {
                 warn!("{e}; run again to resume");
             }
             Outcome::Interrupted

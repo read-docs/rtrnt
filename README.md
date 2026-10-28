@@ -38,12 +38,15 @@ When stdout and stderr are terminals, a run shows a full-screen UI instead of pr
 | `s` / `S` | sort by the next column / reverse the order |
 | `/` | filter torrents by name; `esc` clears the filter |
 | `p` | pause the selected torrent, or resume it; a finished or failed torrent is run again |
+| `x` | remove the selected torrent from the session, after asking: `y` keeps its files, `D` deletes them too |
 | `d` / `u` | set the download / upload limit in KiB/s, 0 for none, until the run ends; the header shows the limits next to the rates |
 | `m` | turn the mouse off, so the terminal can select text, or on again |
 | `?` | help |
 | `q`, `Ctrl-C` | stop the torrents, as Ctrl-C does without the UI; pressed again, quit at once |
 
 A pause stops the torrent as Ctrl-C does: the tracker hears `stopped`, its peers are let go, and the resume file is saved once the pieces being written are on disk. The files stay as they are. Resuming starts it again from that resume file, so nothing is hashed, and a magnet link whose metadata had arrived from the `.torrent` it saved, so the metadata is not fetched again. A complete torrent resumed seeds if `--seed-ratio` or `--seed-time` says to, and is otherwise done at once. The row keeps its place, and its totals, ratio and time active count the earlier runs; so does the seed ratio, so a pause does not start the share over (the seed time does start over). A torrent still paused when the session ends makes the exit code 130, as Ctrl-C does, and the next run resumes it.
+
+Removing a torrent stops it first if it runs, as a pause does, and its row shows `removing` until it has; then the row goes. `y` leaves its files and its resume file as they are, so adding it again later starts without hashing. `D` (uppercase only) also deletes its files, the directories they leave empty (never the output directory itself), its resume file and, for a magnet link, the `.torrent` it saved; the `.torrent` file it was started from stays. Only regular files are deleted: a symbolic link where a file or directory of the torrent's should be is left alone, and so is what it points to. Nothing is deleted while another running torrent writes one of the files, and whatever could not be deleted is logged and shown at the bottom. A magnet link still fetching its metadata has no files yet. A removed torrent no longer counts toward the exit code.
 
 The mouse works too: click a torrent or a peer to select it, a column heading to sort by it (again to reverse), or a tab title to show it; the wheel moves the selection, or scrolls the detail panel, under the pointer. While the UI has the mouse, most terminals still select text with Shift held down, or press `m` to give the mouse back.
 

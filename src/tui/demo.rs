@@ -223,6 +223,8 @@ struct Live {
     state: TorrentState,
     /// What it was doing before it was paused.
     paused: Option<TorrentState>,
+    /// Gone from the session.
+    removed: bool,
     verified: f64,
     received: f64,
     uploaded: f64,
@@ -269,6 +271,7 @@ impl Live {
         Self {
             state,
             paused: None,
+            removed: false,
             verified,
             received: 0.0,
             uploaded: 0.0,
@@ -404,6 +407,7 @@ impl DemoFeed {
             .torrents
             .iter()
             .enumerate()
+            .filter(|(_, live)| !live.removed)
             .map(|(i, live)| TorrentSnapshot {
                 info_hash: info_hash(i),
                 name: live.torrent.name.to_string(),
@@ -429,7 +433,7 @@ impl DemoFeed {
             .collect();
         let detail = selected.and_then(|hash| {
             let index = (0..self.torrents.len()).find(|&i| info_hash(i) == hash)?;
-            Some(self.detail(index, t))
+            (!self.torrents[index].removed).then(|| self.detail(index, t))
         });
         let now = SystemTime::now();
         let logs = LOGS
@@ -584,6 +588,12 @@ impl Feed for DemoFeed {
                     && let Some(state) = live.paused.take()
                 {
                     live.state = state;
+                }
+            }
+            // Nothing is on disk to delete.
+            Command::Remove { info_hash, .. } => {
+                if let Some(live) = self.live(info_hash) {
+                    live.removed = true;
                 }
             }
         }

@@ -164,6 +164,7 @@ pub fn status(theme: Theme, torrent: &TorrentSnapshot) -> (String, Color) {
         TorrentState::Seeding => ("seeding".into(), theme.up()),
         TorrentState::Pausing => ("pausing".into(), theme.warn()),
         TorrentState::Paused => ("paused".into(), theme.dim()),
+        TorrentState::Removing => ("removing".into(), theme.warn()),
         TorrentState::Done => ("done".into(), theme.up()),
         TorrentState::Interrupted => ("stopped".into(), theme.dim()),
         TorrentState::Failed(_) => ("failed".into(), theme.error()),

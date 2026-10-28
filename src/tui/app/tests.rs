@@ -605,3 +605,86 @@ fn p_pauses_a_running_torrent_and_resumes_a_stopped_one() {
         Action::None
     );
 }
+
+#[test]
+fn x_asks_before_removing_and_only_d_deletes() {
+    let mut snapshot = snapshot(&["a"]);
+    snapshot.torrents[0].layout = Some(crate::stats::Layout {
+        size: 300,
+        piece_length: 100,
+        pieces: 3,
+        private: false,
+        files: vec![("f".into(), 100), ("g".into(), 200)],
+    });
+    let mut app = App::new(Theme::default());
+    app.ensure_selection(&snapshot);
+    let hash = [0; 20];
+    let remove = |delete| {
+        Action::Command(Command::Remove {
+            info_hash: hash,
+            delete,
+        })
+    };
+    let x = |app: &mut App, snapshot: &Snapshot| {
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('x')), snapshot),
+            Action::None
+        );
+    };
+
+    x(&mut app, &snapshot);
+    assert_eq!(
+        app.removal,
+        Some(Removal {
+            info_hash: hash,
+            name: "a".into(),
+            files: Some((2, 300)),
+        })
+    );
+    // Other keys, a lowercase d among them, leave the question open.
+    for code in [KeyCode::Char('d'), KeyCode::Char('q'), KeyCode::Enter] {
+        assert_eq!(app.handle_key(key(code), &snapshot), Action::None);
+        assert!(app.removal.is_some());
+    }
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('y')), &snapshot),
+        remove(false)
+    );
+    assert_eq!(app.removal, None);
+    x(&mut app, &snapshot);
+    let shift_d = KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT);
+    assert_eq!(app.handle_key(shift_d, &snapshot), remove(true));
+    // Esc cancels, and does not clear the filter as well.
+    app.filter = "a".into();
+    x(&mut app, &snapshot);
+    assert_eq!(app.handle_key(key(KeyCode::Esc), &snapshot), Action::None);
+    assert_eq!(app.removal, None);
+    assert_eq!(app.filter, "a");
+
+    // Not while it is being removed already, nor with nothing selected.
+    snapshot.torrents[0].state = TorrentState::Removing;
+    x(&mut app, &snapshot);
+    assert_eq!(app.removal, None);
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('p')), &snapshot),
+        Action::None
+    );
+    x(&mut app, &Snapshot::default());
+    assert_eq!(app.removal, None);
+}
+
+#[test]
+fn a_click_cancels_a_removal_and_the_wheel_does_nothing() {
+    let (snapshot, mut app, areas) = clickable();
+    app.handle_key(key(KeyCode::Char('x')), &snapshot);
+    app.handle_mouse(mouse(MouseEventKind::ScrollDown, 20, 4), &areas, &snapshot);
+    assert_eq!(app.selected, Some([0; 20]));
+    assert!(app.removal.is_some());
+    assert_eq!(
+        app.handle_mouse(click(20, 5), &areas, &snapshot),
+        Action::None
+    );
+    assert_eq!(app.removal, None);
+    // The click only closed it.
+    assert_eq!(app.selected, Some([0; 20]));
+}

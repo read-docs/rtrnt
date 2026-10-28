@@ -11,6 +11,7 @@ mod log;
 mod peers;
 mod pieces;
 mod prompt;
+mod remove;
 mod torrents;
 mod trackers;
 
@@ -147,6 +148,9 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App) -> Areas {
     keybar::draw(frame, snapshot, app, areas.keybar);
     if let Some(input) = &app.input {
         prompt::draw(frame, app, input, areas.keybar);
+    }
+    if let Some(removal) = &app.removal {
+        remove::draw(frame, app, removal, area);
     }
     if app.show_help {
         help::draw(frame, app, area);

@@ -435,7 +435,7 @@ fn a_paused_torrent_says_so_and_p_resumes_it() {
     let lines = text(&buffer, buffer.area);
     assert!(lines.iter().any(|line| line.contains("paused")));
     assert!(
-        lines[31].contains("  q quit  p resume  d u limits"),
+        lines[31].contains("  q quit  p resume  x remove  d u limits"),
         "{}",
         lines[31]
     );
@@ -516,9 +516,10 @@ fn the_prompt_line_sits_over_the_key_bar() {
 fn a_notice_shows_in_place_of_the_keys() {
     let mut snapshot = demo::fixture();
     let app = app(&snapshot);
-    // Without one, the keys; pause and the limit keys where there is room.
+    // Without one, the keys; pause, remove and the limit keys where there
+    // is room.
     let buffer = render(100, 32, &snapshot, &app);
-    assert!(text(&buffer, buffer.area)[31].contains("  q quit  p pause  d u limits"));
+    assert!(text(&buffer, buffer.area)[31].contains("  q quit  p pause  x remove"));
     let buffer = render(80, 24, &snapshot, &app);
     let line = &text(&buffer, buffer.area)[23];
     assert!(
@@ -646,4 +647,40 @@ fn the_peer_rows_follow_the_cursor_and_go_with_the_tab() {
         layout(Rect::new(0, 0, 59, 24), &snapshot, &app),
         Areas::default()
     );
+}
+
+#[test]
+fn the_removal_question_names_the_files_over_the_screen() {
+    let mut snapshot = demo::fixture();
+    let mut app = app(&snapshot);
+    app.handle_key(
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        &snapshot,
+    );
+    let buffer = render(80, 24, &snapshot, &app);
+    let lines = text(&buffer, buffer.area);
+    let top = lines
+        .iter()
+        .position(|line| line.contains("╭ Remove ─"))
+        .unwrap();
+    assert!(
+        lines[top + 2].contains("│ remove debian-13.7.0-amd64-netinst.iso (1 file, 754 MiB)?│"),
+        "{}",
+        lines[top + 2]
+    );
+    assert!(
+        lines[top + 4].contains(" y keep the files · D delete them too · esc cancel "),
+        "{}",
+        lines[top + 4]
+    );
+    // Drawn over what is under it, which shows around it.
+    assert!(lines[3].starts_with("│▌debian"));
+
+    // A torrent being removed says so, and x is no more on offer.
+    app.removal = None;
+    snapshot.torrents[0].state = TorrentState::Removing;
+    let buffer = render(130, 32, &snapshot, &app);
+    let lines = text(&buffer, buffer.area);
+    assert!(lines.iter().any(|line| line.contains("removing")));
+    assert!(!lines[31].contains("  x "), "{}", lines[31]);
 }

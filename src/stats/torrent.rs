@@ -31,6 +31,8 @@ pub enum TorrentState {
     Seeding,
     /// Asked to pause, and stopping.
     Pausing,
+    /// Asked to be removed, and stopping first if it runs.
+    Removing,
     /// Stopped by a pause, to be started again.
     Paused,
     Done,
@@ -281,16 +283,21 @@ impl TorrentStats {
     }
 
     /// Sets the state, except that a torrent pausing shows so until its
-    /// task has ended, whatever it does meanwhile.
+    /// task has ended, whatever it does meanwhile, and one being removed
+    /// shows so until its row goes.
     pub fn set_state(&self, state: TorrentState) {
         let mut current = lock(&self.state);
-        if *current == TorrentState::Pausing && !state.is_finished() {
-            return;
-        }
+        let keep = match *current {
+            TorrentState::Pausing => !state.is_finished(),
+            TorrentState::Removing => true,
+            _ => false,
+        };
         if state.is_finished() {
             let _ = self.finished.set(Instant::now());
         }
-        *current = state;
+        if !keep || state == TorrentState::Removing {
+            *current = state;
+        }
     }
 
     /// Records how the torrent's task ended. One stopped by a pause stays
@@ -551,6 +558,15 @@ mod tests {
         torrent.set_state(TorrentState::Paused);
         assert!(torrent.state().is_finished());
 
+        // Removing outranks pausing, and shows until the row goes.
+        let removed = TorrentStats::new([1; 20], "t", Path::new("."));
+        removed.set_state(TorrentState::Pausing);
+        removed.set_state(TorrentState::Removing);
+        removed.set_state(TorrentState::Seeding);
+        removed.finish(&Ok(()));
+        assert_eq!(removed.state(), TorrentState::Removing);
+        assert!(removed.finished_at().is_some());
+
         // A pause that comes too late shows how it ended.
         let torrent = TorrentStats::new([1; 20], "t", Path::new("."));
         torrent.set_state(TorrentState::Pausing);
@@ -595,5 +611,11 @@ mod tests {
         assert!(again.active(Instant::now()) >= previous.active);
         again.transferred().uploaded.store(5, Ordering::Relaxed);
         assert_eq!(again.uploaded(), 45);
+
+        // Removed, its row goes, and only its.
+        session.remove_torrent(&again);
+        let torrents = session.torrents();
+        assert_eq!(torrents.len(), 2);
+        assert!(Arc::ptr_eq(&torrents[1], &duplicate));
     }
 }

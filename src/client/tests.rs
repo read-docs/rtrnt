@@ -67,7 +67,9 @@ fn a_claim_frees_its_files_when_it_ends() {
     let mut claim = client.claim([1; 20]).unwrap();
     claim.claim_files("first", &paths).unwrap();
     assert!(client.claim_files([2; 20], "second", &paths).is_err());
+    assert_eq!(client.file_owner(&paths).as_deref(), Some("first"));
     drop(claim);
+    assert_eq!(client.file_owner(&paths), None);
     assert!(client.claim_files([2; 20], "second", &paths).is_ok());
 }
 

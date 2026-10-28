@@ -401,6 +401,14 @@ pub(crate) async fn mock_tracker(
     (format!("http://{addr}/announce"), targets)
 }
 
+/// Waits for the next announce `mock_tracker` hears, failing after 5 s.
+pub(crate) async fn next_announce(queries: &mut mpsc::UnboundedReceiver<String>) -> String {
+    tokio::time::timeout(Duration::from_secs(5), queries.recv())
+        .await
+        .expect("no announce")
+        .unwrap()
+}
+
 /// A minimal HTTP server: answers every request with `body` and forwards
 /// each request's target (path and query).
 pub(crate) async fn mock_http(body: Vec<u8>) -> (SocketAddr, mpsc::UnboundedReceiver<String>) {

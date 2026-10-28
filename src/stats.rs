@@ -92,6 +92,11 @@ impl SessionStats {
         }
     }
 
+    /// Drops the row of `torrent`, removed from the session.
+    pub fn remove_torrent(&self, torrent: &Arc<TorrentStats>) {
+        lock(&self.torrents).retain(|kept| !Arc::ptr_eq(kept, torrent));
+    }
+
     pub(crate) fn set_dht(&self, dht: Dht) {
         let _ = self.dht.set(dht);
     }

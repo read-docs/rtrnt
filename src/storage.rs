@@ -358,6 +358,92 @@ fn layout(info: &Info, out_dir: &Path) -> Result<Vec<FileSpan>> {
     Ok(files)
 }
 
+/// Deletes the torrent's files from `out_dir`, then the directories they
+/// leave empty, up to the torrent's own (never `out_dir`). Keeps going past
+/// a failure, and returns every one; a file that is not there is no
+/// failure.
+///
+/// `layout` keeps every path under `out_dir`, since it rejects `..` and
+/// absolute components. So that nothing outside is reached through a
+/// symbolic link either, only regular files are removed, and only when
+/// none of their directories under `out_dir` is a link: a link is left
+/// alone, and so is what it points to. Directories are removed only if
+/// empty.
+pub fn delete_files(info: &Info, out_dir: &Path) -> Vec<anyhow::Error> {
+    let files = match layout(info, out_dir) {
+        Ok(files) => files,
+        Err(e) => return vec![e],
+    };
+    let mut failures = Vec::new();
+    // Every directory of the torrent's, deepest first once sorted.
+    let mut dirs = Vec::new();
+    for file in &files {
+        let mut parents: Vec<&Path> = file
+            .path
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| *dir != out_dir)
+            .collect();
+        // From the torrent's own directory down, to find a link on the way
+        // before anything under it is touched.
+        parents.reverse();
+        match delete_file(&file.path, &parents) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                failures.push(
+                    anyhow::Error::new(e)
+                        .context(format!("failed to delete {}", file.path.display())),
+                );
+            }
+        }
+        dirs.extend(parents.into_iter().map(Path::to_path_buf));
+    }
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    dirs.dedup();
+    for dir in dirs {
+        let removed = match std::fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() => std::fs::remove_dir(&dir),
+            Ok(_) => continue,
+            Err(e) => Err(e),
+        };
+        match removed {
+            Ok(()) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(e) => {
+                failures.push(
+                    anyhow::Error::new(e).context(format!("failed to delete {}", dir.display())),
+                );
+            }
+        }
+    }
+    failures
+}
+
+/// Removes `path` if it is a regular file in real directories `parents`.
+fn delete_file(path: &Path, parents: &[&Path]) -> io::Result<()> {
+    for dir in parents.iter().copied().chain([path]) {
+        let meta = std::fs::symlink_metadata(dir)?;
+        let real = if dir == path {
+            meta.is_file()
+        } else {
+            meta.is_dir()
+        };
+        if !real {
+            let what = if dir == path { "file" } else { "directory" };
+            return Err(io::Error::other(format!(
+                "{} is a link or not a {what}, so it was left alone",
+                dir.display()
+            )));
+        }
+    }
+    std::fs::remove_file(path)
+}
+
 /// Rejects path components that could escape the output directory.
 fn check_component(component: &str) -> Result<()> {
     let mut parts = Path::new(component).components();

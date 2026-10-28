@@ -161,3 +161,63 @@ fn paths_sit_under_the_absolute_output_dir() {
     let expected = [root.join("a"), root.join("sub").join("b")];
     assert_eq!(paths, expected.map(|path| fold_case(&path)));
 }
+
+#[cfg(unix)]
+#[test]
+fn deleting_removes_the_files_and_the_directories_they_leave_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("kept"), b"x").unwrap();
+    let info = multi_file_info(&[
+        (&["a"], 1),
+        (&["sub", "deep", "b"], 1),
+        (&["shared", "c"], 1),
+        (&["link"], 1),
+        (&["linked", "d"], 1),
+        (&["missing"], 1),
+    ]);
+    drop(Storage::new(&info, &out).unwrap());
+    let root = out.join("root");
+    std::fs::remove_file(root.join("missing")).unwrap();
+    // Not the torrent's: it keeps its directory.
+    std::fs::write(root.join("shared").join("other"), b"x").unwrap();
+    // Links where a file and a directory of the torrent's should be.
+    std::fs::remove_file(root.join("link")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.join("kept"), root.join("link")).unwrap();
+    std::fs::remove_dir_all(root.join("linked")).unwrap();
+    std::fs::write(elsewhere.join("d"), b"x").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, root.join("linked")).unwrap();
+    // Beside the torrent, in the output dir.
+    std::fs::write(out.join("beside"), b"x").unwrap();
+
+    let failures = delete_files(&info, &out);
+    let failures: Vec<String> = failures.iter().map(|e| format!("{e:#}")).collect();
+    assert_eq!(failures.len(), 2, "{failures:?}");
+    assert!(
+        failures.iter().all(|e| e.contains("left alone")),
+        "{failures:?}"
+    );
+    assert!(!root.join("a").exists());
+    assert!(!root.join("sub").exists());
+    assert!(!root.join("shared").join("c").exists());
+    assert!(root.join("shared").join("other").exists());
+    // The links stay, and what they point to.
+    assert!(root.join("link").is_symlink());
+    assert!(root.join("linked").is_symlink());
+    assert_eq!(std::fs::read(elsewhere.join("kept")).unwrap(), b"x");
+    assert_eq!(std::fs::read(elsewhere.join("d")).unwrap(), b"x");
+    assert!(out.join("beside").exists());
+
+    // Once nothing else is left, the torrent's directory goes too, but
+    // never the output dir.
+    for left in ["shared/other", "link", "linked"] {
+        std::fs::remove_file(root.join(left)).unwrap();
+    }
+    std::fs::remove_file(out.join("beside")).unwrap();
+    std::fs::write(root.join("a"), b"x").unwrap();
+    assert!(delete_files(&info, &out).is_empty());
+    assert!(!root.exists());
+    assert!(out.is_dir());
+}

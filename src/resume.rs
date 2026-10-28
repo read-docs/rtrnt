@@ -53,6 +53,11 @@ impl Target {
         })
     }
 
+    /// Where the resume file is.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Saves the resume file for the pieces marked in `have` and the files
     /// as they are now, on the blocking thread pool. The file is replaced
     /// atomically. A failure is logged, and the download goes on without a

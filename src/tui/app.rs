@@ -158,6 +158,17 @@ impl Input {
     }
 }
 
+/// The torrent `x` is about to remove, until `y`, `D` or Esc says what to
+/// do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Removal {
+    pub info_hash: [u8; 20],
+    pub name: String,
+    /// How many files it has and their total size, once its metadata is
+    /// known.
+    pub files: Option<(usize, u64)>,
+}
+
 /// What a key press or a click asks of the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -191,6 +202,8 @@ pub struct App {
     /// Set while something is being typed.
     pub input: Option<Input>,
     pub show_help: bool,
+    /// Set while asking whether to remove a torrent.
+    pub removal: Option<Removal>,
     /// Whether the terminal reports the mouse to the UI, rather than
     /// selecting text with it.
     pub mouse: bool,
@@ -215,6 +228,7 @@ impl App {
             filter: String::new(),
             input: None,
             show_help: false,
+            removal: None,
             mouse: true,
             stopping: false,
             rates: Rates::default(),
@@ -249,15 +263,24 @@ impl App {
 
     /// What `p` does to the selected torrent: pause it while it runs,
     /// resume it once paused or ended (which retries one that failed), and
-    /// nothing while it is pausing. Comes with the key bar's word for it.
+    /// nothing while it is pausing or being removed. Comes with the key
+    /// bar's word for it.
     pub fn pause_command(&self, snapshot: &Snapshot) -> Option<(Command, &'static str)> {
         let torrent = snapshot.torrent(self.selected?)?;
         let hash = torrent.info_hash;
         match torrent.state {
-            TorrentState::Pausing => None,
+            TorrentState::Pausing | TorrentState::Removing => None,
             ref state if state.is_finished() => Some((Command::Resume(hash), "resume")),
             _ => Some((Command::Pause(hash), "pause")),
         }
+    }
+
+    /// The selected torrent, if `x` can remove it: not while it is being
+    /// removed already.
+    pub fn removable<'a>(&self, snapshot: &'a Snapshot) -> Option<&'a TorrentSnapshot> {
+        snapshot
+            .torrent(self.selected?)
+            .filter(|torrent| torrent.state != TorrentState::Removing)
     }
 
     /// Selects the torrent with info hash `selected`, its detail panel
@@ -412,6 +435,24 @@ impl App {
             self.ensure_selection(snapshot);
             return action;
         }
+        if let Some(removal) = self.removal.take() {
+            let remove = |delete| {
+                Action::Command(Command::Remove {
+                    info_hash: removal.info_hash,
+                    delete,
+                })
+            };
+            // Only an uppercase D deletes, so that a stray key does not.
+            return match key.code {
+                KeyCode::Char('y') => remove(false),
+                KeyCode::Char('D') => remove(true),
+                KeyCode::Esc => Action::None,
+                _ => {
+                    self.removal = Some(removal);
+                    Action::None
+                }
+            };
+        }
         const PAGE: isize = 10;
         match key.code {
             KeyCode::Char('q') => return self.quit(snapshot),
@@ -438,6 +479,16 @@ impl App {
                     return Action::Command(command);
                 }
             }
+            KeyCode::Char('x') => {
+                self.removal = self.removable(snapshot).map(|torrent| Removal {
+                    info_hash: torrent.info_hash,
+                    name: torrent.name.clone(),
+                    files: torrent
+                        .layout
+                        .as_ref()
+                        .map(|layout| (layout.files.len(), layout.size)),
+                });
+            }
             KeyCode::Char('m') => self.mouse = !self.mouse,
             KeyCode::Char('s') => self.sort = self.sort.next(),
             KeyCode::Char('S') => self.reverse = !self.reverse,
@@ -463,9 +514,10 @@ impl App {
     /// A mouse event on the screen last drawn, laid out as `areas`. A left
     /// click selects a torrent or a peer, sorts by a column or shows a tab;
     /// the wheel moves the selection, the peer cursor or the scroll of the
-    /// box it is over, and focuses it. While help shows, a click closes it.
-    /// While the input line is open, the mouse does nothing, so the line
-    /// keeps what was typed.
+    /// box it is over, and focuses it. While help shows, a click closes it,
+    /// and while a removal is asked about, a click cancels it. While the
+    /// input line is open, the mouse does nothing, so the line keeps what
+    /// was typed.
     pub fn handle_mouse(
         &mut self,
         event: MouseEvent,
@@ -476,10 +528,14 @@ impl App {
             return Action::None;
         }
         let at = Position::new(event.column, event.row);
+        let overlay = self.show_help || self.removal.is_some();
         match event.kind {
-            MouseEventKind::Down(MouseButton::Left) if self.show_help => self.show_help = false,
+            MouseEventKind::Down(MouseButton::Left) if overlay => {
+                self.show_help = false;
+                self.removal = None;
+            }
             MouseEventKind::Down(MouseButton::Left) => self.click(at, areas, snapshot),
-            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if !self.show_help => {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if !overlay => {
                 let by = if event.kind == MouseEventKind::ScrollUp {
                     -1
                 } else {
