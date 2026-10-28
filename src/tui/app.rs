@@ -204,6 +204,9 @@ pub struct App {
     /// First row shown of the detail panel's table. The Peers tab scrolls
     /// to its cursor instead.
     pub detail_scroll: usize,
+    /// Rows the detail panel's table has room for under its heading, as of
+    /// the last screen drawn; 0 until one is.
+    detail_height: usize,
     /// Address of the peer under the Peers tab's cursor.
     pub peer: Option<SocketAddr>,
     /// Its row, for the cursor to stay near once the peer has gone.
@@ -239,6 +242,7 @@ impl App {
             focus: Focus::Torrents,
             tab: Tab::Peers,
             detail_scroll: 0,
+            detail_height: 0,
             peer: None,
             peer_row: 0,
             file: 0,
@@ -404,7 +408,16 @@ impl App {
         }
     }
 
-    /// Scrolls the detail panel `by` rows, no further than its last row.
+    /// Learns how much room the detail panel has in the screen last drawn,
+    /// laid out as `areas`, and keeps its scroll within that.
+    pub fn fit_detail(&mut self, areas: &Areas, snapshot: &Snapshot) {
+        // Two borders and the heading.
+        self.detail_height = usize::from(areas.detail.height).saturating_sub(3);
+        self.scroll_detail(snapshot, 0);
+    }
+
+    /// Scrolls the detail panel `by` rows, no further than the last row
+    /// shows at the bottom of the panel.
     fn scroll_detail(&mut self, snapshot: &Snapshot, by: isize) {
         let detail = snapshot.detail.as_ref();
         let rows = match self.tab {
@@ -416,7 +429,7 @@ impl App {
         self.detail_scroll = self
             .detail_scroll
             .saturating_add_signed(by)
-            .min(rows.saturating_sub(1));
+            .min(rows.saturating_sub(self.detail_height.max(1)));
     }
 
     /// Moves the file cursor `by` rows, to a file the selected torrent has.

@@ -191,6 +191,7 @@ pub async fn run(
         }
         app.apply_rates(&mut snapshot);
         terminal.draw(|frame| areas = view::draw(frame, &snapshot, &app))?;
+        app.fit_detail(&areas, &snapshot);
     }
 }
 

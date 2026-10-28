@@ -902,3 +902,43 @@ fn the_file_keys_do_nothing_elsewhere() {
         Action::None
     );
 }
+
+#[test]
+fn the_trackers_scroll_stops_where_the_view_does() {
+    use crate::stats::{TrackerResult, TrackerStatus};
+    let tracker = |tier| TrackerStatus {
+        tier,
+        url: format!("http://t{tier}/announce"),
+        result: TrackerResult::NotContacted,
+        peers: None,
+        seeders: None,
+        leechers: None,
+    };
+    let mut snapshot = snapshot(&["a"]);
+    snapshot.detail = Some(Detail {
+        info_hash: [0; 20],
+        trackers: (0..6).map(tracker).collect(),
+        ..Detail::default()
+    });
+    let mut app = App::new(Theme::default());
+    app.ensure_selection(&snapshot);
+    app.tab = Tab::Trackers;
+    app.focus = Focus::Detail;
+    // Ten rows, and a box of nine lines has room for six under the heading:
+    // the last scroll position shows the last row at the bottom.
+    let areas = Areas {
+        detail: Rect::new(0, 7, 40, 9),
+        ..Areas::default()
+    };
+    app.fit_detail(&areas, &snapshot);
+    app.handle_key(key(KeyCode::PageDown), &snapshot);
+    app.handle_key(key(KeyCode::PageDown), &snapshot);
+    assert_eq!(app.detail_scroll, 4);
+    // A taller box leaves less to scroll, and takes the scroll back with it.
+    let areas = Areas {
+        detail: Rect::new(0, 7, 40, 11),
+        ..Areas::default()
+    };
+    app.fit_detail(&areas, &snapshot);
+    assert_eq!(app.detail_scroll, 2);
+}
