@@ -1,7 +1,7 @@
 use crate::peer::{self};
 use crate::stats::{TorrentState, TorrentStats};
 use crate::storage::Storage;
-use crate::storage::verify;
+use crate::storage::verify::{self, OnReadError};
 use crate::torrent::{self};
 use anyhow::{Result, bail};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -36,7 +36,14 @@ pub async fn check_file(torrent_path: &Path, output_dir: &Path) -> Result<()> {
         stats,
     });
     // Nothing else is hashing, and nothing stops the check.
-    let have = hash_pieces(&session, pieces, &Semaphore::new(1), std::future::pending()).await?;
+    let have = hash_pieces(
+        &session,
+        pieces,
+        OnReadError::Fail,
+        &Semaphore::new(1),
+        std::future::pending(),
+    )
+    .await?;
 
     let report = verify::Report::new(&session.torrent, &session.storage, &have);
     print!("{report}");
@@ -53,9 +60,11 @@ pub async fn check_file(torrent_path: &Path, output_dir: &Path) -> Result<()> {
 /// that share it take turns; the bar says `queued for checking` while this
 /// one waits. If `shutdown` resolves while it waits or hashes, the check
 /// stops at the next piece and the result is an `Interrupted` error.
+/// `on_read_error` says what an unreadable piece does (see `verify::verify`).
 pub(crate) async fn hash_pieces(
     session: &Arc<Session>,
     pieces: Vec<usize>,
+    on_read_error: OnReadError,
     hashing: &Semaphore,
     shutdown: impl Future<Output = ()>,
 ) -> Result<Vec<bool>> {
@@ -110,6 +119,7 @@ pub(crate) async fn hash_pieces(
             &blocking.torrent,
             &blocking.storage,
             &pieces,
+            on_read_error,
             &cancelled,
             &|len| check_bar.set_position(blocking.stats.checked(len)),
         )

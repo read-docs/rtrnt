@@ -49,6 +49,7 @@ async fn resumes_from_data_on_disk() {
         &session.torrent,
         &session.storage,
         &candidates,
+        verify::OnReadError::Fail,
         &AtomicBool::new(false),
         &|_| {},
     )
@@ -422,6 +423,7 @@ async fn interrupted_download_keeps_pieces_and_tells_the_tracker() {
         &session.torrent,
         &session.storage,
         &all,
+        verify::OnReadError::Fail,
         &AtomicBool::new(false),
         &|_| {},
     )

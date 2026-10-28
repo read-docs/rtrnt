@@ -11,7 +11,7 @@ use crate::download::{self, DownloadConfig, Session};
 use crate::selection::{self, FileSelection, Priority};
 use crate::state::{self, write_atomically};
 use crate::stats::TorrentState;
-use crate::storage::verify;
+use crate::storage::verify::{self, OnReadError};
 use crate::storage::{FileSpan, Storage, files_between};
 use crate::torrent::TorrentFile;
 use anyhow::{Context, Result, bail};
@@ -207,7 +207,10 @@ pub async fn initial_pieces(
         _ => None,
     };
     let have = match saved {
-        None => download::hash_pieces(session, candidates, hashing, shutdown).await?,
+        None => {
+            download::hash_pieces(session, candidates, OnReadError::Missing, hashing, shutdown)
+                .await?
+        }
         Some(saved) => {
             let storage = Arc::clone(&session.storage);
             let stamps = tokio::task::spawn_blocking(move || {
@@ -229,7 +232,9 @@ pub async fn initial_pieces(
                 to_check = to_hash.len(),
                 "using the resume file"
             );
-            let hashed = download::hash_pieces(session, to_hash, hashing, shutdown).await?;
+            let hashed =
+                download::hash_pieces(session, to_hash, OnReadError::Missing, hashing, shutdown)
+                    .await?;
             for (have, hashed) in have.iter_mut().zip(hashed) {
                 *have |= hashed;
             }

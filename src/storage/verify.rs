@@ -8,10 +8,20 @@ use sha1::Digest;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tracing::warn;
 
 /// Most threads hashing at once. Reading from disk is usually the limit, and
 /// each thread holds a whole piece in memory.
 const MAX_THREADS: usize = 4;
+
+/// What `verify` does when a piece cannot be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnReadError {
+    /// Stop the check with the error.
+    Fail,
+    /// Warn and count the piece as missing, so it is downloaded again.
+    Missing,
+}
 
 /// Pieces that may hold data from an earlier run: those overlapping data
 /// that was on disk before `Storage::new` created and resized the files,
@@ -42,12 +52,14 @@ fn pieces_where(torrent: &TorrentFile, keep: impl Fn(u64, usize) -> bool) -> Res
 /// whether it is there and correct. Pieces not in `pieces` count as missing.
 ///
 /// Blocks while reading; `on_checked` gets each piece's length once it has
-/// been hashed. An I/O error stops the check, and so does `cancel` being set,
-/// which is looked at between pieces and makes the result an error.
+/// been hashed. `cancel` being set stops the check, which is looked at
+/// between pieces and makes the result an error. So does an I/O error,
+/// unless `on_read_error` is `Missing`.
 pub fn verify(
     torrent: &TorrentFile,
     storage: &Storage,
     pieces: &[usize],
+    on_read_error: OnReadError,
     cancel: &AtomicBool,
     on_checked: &(dyn Fn(u64) + Sync),
 ) -> Result<Vec<bool>> {
@@ -63,6 +75,13 @@ pub fn verify(
                     on_checked(len);
                 }
                 Ok((false, len)) => on_checked(len),
+                Err(e) if on_read_error == OnReadError::Missing => {
+                    warn!(
+                        piece = index,
+                        "treating an unreadable piece as missing: {e:#}"
+                    );
+                    on_checked(piece_range(torrent, index)?.1 as u64);
+                }
                 Err(e) => {
                     // Stop the other threads at their next piece.
                     next.store(pieces.len(), Ordering::Relaxed);

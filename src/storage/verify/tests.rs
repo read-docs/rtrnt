@@ -56,6 +56,7 @@ fn finds_intact_pieces_and_skips_fresh_files() {
         &torrent,
         &storage,
         &candidates,
+        OnReadError::Fail,
         &AtomicBool::new(false),
         &|len| {
             checked.fetch_add(len, Ordering::Relaxed);
@@ -83,6 +84,7 @@ fn complete_data_verifies_every_piece() {
         &torrent,
         &storage,
         &candidates,
+        OnReadError::Fail,
         &AtomicBool::new(false),
         &|_| {},
     )
@@ -96,7 +98,15 @@ fn nothing_to_check_in_a_new_download() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::new(&torrent.info, dir.path(), &FileSelection::default()).unwrap();
     assert!(candidates(&torrent, &storage).unwrap().is_empty());
-    let have = verify(&torrent, &storage, &[], &AtomicBool::new(false), &|_| {}).unwrap();
+    let have = verify(
+        &torrent,
+        &storage,
+        &[],
+        OnReadError::Fail,
+        &AtomicBool::new(false),
+        &|_| {},
+    )
+    .unwrap();
     assert_eq!(have, [false, false, false]);
 }
 
@@ -120,6 +130,7 @@ fn a_cancelled_check_hashes_nothing_more_and_fails() {
         &torrent,
         &storage,
         &[0, 1, 2],
+        OnReadError::Fail,
         &AtomicBool::new(true),
         &on_checked,
     );
@@ -128,9 +139,16 @@ fn a_cancelled_check_hashes_nothing_more_and_fails() {
 
     // Cancelled while hashing: the pieces already hashed are not reported.
     let cancel = AtomicBool::new(false);
-    let result = verify(&torrent, &storage, &[0, 1, 2], &cancel, &|_| {
-        cancel.store(true, Ordering::Relaxed);
-    });
+    let result = verify(
+        &torrent,
+        &storage,
+        &[0, 1, 2],
+        OnReadError::Fail,
+        &cancel,
+        &|_| {
+            cancel.store(true, Ordering::Relaxed);
+        },
+    );
     assert!(result.is_err());
 }
 
@@ -151,6 +169,7 @@ fn check(a: Option<&[u8]>, b: Option<&[u8]>) -> (Report, PathBuf) {
         &torrent,
         &storage,
         &pieces,
+        OnReadError::Fail,
         &AtomicBool::new(false),
         &|_| {},
     )
@@ -226,4 +245,57 @@ fn pieces_in_files_that_were_never_created_are_not_candidates() {
     .unwrap();
     assert!(!skipped.files()[1].exists());
     assert_eq!(candidates(&torrent, &skipped).unwrap(), [0]);
+}
+
+/// Two intact files of which "a" is then cut short, so reading piece 1 hits
+/// the end of the file.
+fn storage_with_unreadable_piece(dir: &std::path::Path) -> (TorrentFile, Storage) {
+    let data = b"abcdefghijk";
+    let torrent = torrent(data);
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a"), &data[..6]).unwrap();
+    std::fs::write(root.join("b"), &data[6..]).unwrap();
+    let storage = Storage::new(&torrent.info, dir, &FileSelection::default()).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(root.join("a"))
+        .unwrap();
+    file.set_len(5).unwrap();
+    (torrent, storage)
+}
+
+#[test]
+fn an_unreadable_piece_can_count_as_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (torrent, storage) = storage_with_unreadable_piece(dir.path());
+    let checked = AtomicU64::new(0);
+    let have = verify(
+        &torrent,
+        &storage,
+        &[0, 1, 2],
+        OnReadError::Missing,
+        &AtomicBool::new(false),
+        &|len| {
+            checked.fetch_add(len, Ordering::Relaxed);
+        },
+    )
+    .unwrap();
+    assert_eq!(have, [true, false, true]);
+    assert_eq!(checked.load(Ordering::Relaxed), 11);
+}
+
+#[test]
+fn an_unreadable_piece_can_fail_the_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let (torrent, storage) = storage_with_unreadable_piece(dir.path());
+    let result = verify(
+        &torrent,
+        &storage,
+        &[0, 1, 2],
+        OnReadError::Fail,
+        &AtomicBool::new(false),
+        &|_| {},
+    );
+    assert!(result.is_err());
 }
