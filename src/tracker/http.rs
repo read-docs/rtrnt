@@ -1,25 +1,34 @@
 use super::{AnnounceRequest, AnnounceResponse, ScrapeStats, parse_compact_v4, parse_compact_v6};
 use anyhow::{Context, Result, anyhow, bail};
+use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_bencode::value::Value;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::LazyLock;
 use std::time::Duration;
 use url::Url;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Shared by every announce and scrape, so connections to a tracker are reused.
+static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .expect("the HTTP client builds with its default settings")
+});
+
 pub(super) async fn announce_http(
     tracker: &str,
     request: &AnnounceRequest,
 ) -> Result<AnnounceResponse> {
-    let client = reqwest::Client::builder().timeout(HTTP_TIMEOUT).build()?;
-    let body = client
+    let response = CLIENT
         .get(http_announce_url(tracker, request))
         .send()
-        .await?
-        .bytes()
         .await?;
-    parse_http_response(&body)
+    let status = response.status();
+    let body = response.bytes().await?;
+    parse_http_response(status, &body)
 }
 
 fn http_announce_url(tracker: &str, request: &AnnounceRequest) -> String {
@@ -62,9 +71,9 @@ struct HttpTrackerResponse {
     peers6: Option<serde_bytes::ByteBuf>,
 }
 
-fn parse_http_response(body: &[u8]) -> Result<AnnounceResponse> {
-    let response: HttpTrackerResponse =
-        serde_bencode::from_bytes(body).context("invalid tracker response")?;
+fn parse_http_response(status: StatusCode, body: &[u8]) -> Result<AnnounceResponse> {
+    let response: HttpTrackerResponse = serde_bencode::from_bytes(body)
+        .with_context(|| format!("invalid tracker response (HTTP {status})"))?;
     if let Some(reason) = response.failure_reason {
         bail!("tracker error: {}", reason);
     }
@@ -107,8 +116,7 @@ pub(super) async fn scrape_http(
     url: &Url,
     info_hashes: &[[u8; 20]],
 ) -> Result<Vec<Option<ScrapeStats>>> {
-    let client = reqwest::Client::builder().timeout(HTTP_TIMEOUT).build()?;
-    let body = client
+    let body = CLIENT
         .get(http_scrape_url(url, info_hashes)?)
         .send()
         .await?

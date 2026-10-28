@@ -8,7 +8,7 @@ fn http_response_compact() {
         b"d8:completei5e10:incompletei2e8:intervali1800e12:min intervali60e5:peers6:".to_vec();
     body.extend_from_slice(&[1, 2, 3, 4, 0, 80]);
     body.push(b'e');
-    let response = parse_http_response(&body).unwrap();
+    let response = parse_http_response(StatusCode::OK, &body).unwrap();
     assert_eq!(response.interval, Some(1800));
     assert_eq!(response.min_interval, Some(60));
     assert_eq!((response.seeders, response.leechers), (Some(5), Some(2)));
@@ -18,15 +18,41 @@ fn http_response_compact() {
 #[test]
 fn http_response_dict_list() {
     let body = b"d5:peersld2:ip7:1.2.3.47:peer id20:aaaaaaaaaaaaaaaaaaaa4:porti6881eed2:ip8:hostname4:porti1eeee";
-    let response = parse_http_response(body).unwrap();
+    let response = parse_http_response(StatusCode::OK, body).unwrap();
     assert_eq!(response.peers, ["1.2.3.4:6881".parse().unwrap()]);
     assert_eq!((response.seeders, response.leechers), (None, None));
 }
 
 #[test]
 fn http_response_failure() {
-    let err = parse_http_response(b"d14:failure reason9:not founde").unwrap_err();
+    let err = parse_http_response(StatusCode::OK, b"d14:failure reason9:not founde").unwrap_err();
     assert!(err.to_string().contains("not found"));
+}
+
+#[test]
+fn http_response_that_is_not_bencode_names_the_status() {
+    let err = parse_http_response(StatusCode::BAD_GATEWAY, b"<html>oops</html>").unwrap_err();
+    assert!(err.to_string().contains("502"), "{err}");
+}
+
+#[tokio::test]
+async fn announce_reports_the_status_of_a_page_that_is_not_a_response() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tracker = format!("http://{}/announce", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0; 1024];
+        let _ = stream.read(&mut buf).await.unwrap();
+        let page = "<html>not found</html>";
+        let reply = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+            page.len()
+        );
+        stream.write_all(reply.as_bytes()).await.unwrap();
+    });
+    let err = announce_http(&tracker, &request()).await.unwrap_err();
+    assert!(err.to_string().contains("404"), "{err}");
 }
 
 #[test]
