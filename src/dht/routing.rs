@@ -272,6 +272,17 @@ impl RoutingTable {
         self.buckets[index].questionable_to_ping(now)
     }
 
+    /// Gives up pinging `id` without evicting it, for a ping that could not
+    /// be sent.
+    pub fn stop_pinging(&mut self, id: &NodeId) {
+        let index = self.index(id);
+        for entry in &mut self.buckets[index].entries {
+            if entry.node.id == *id {
+                entry.pinging = false;
+            }
+        }
+    }
+
     /// Drops a node that did not answer a ping, taking a replacement in.
     pub fn evict(&mut self, id: &NodeId, now: Instant) {
         let index = self.index(id);

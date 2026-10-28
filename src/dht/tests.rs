@@ -116,3 +116,31 @@ fn unknown_methods_get_error_204() {
         }
     ));
 }
+
+#[tokio::test]
+async fn a_full_pending_table_does_not_evict_nodes() {
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let dht = Dht::start(socket, Vec::new()).unwrap();
+    let node = &dht.0.node;
+    let known = NodeInfo {
+        id: NodeId([2; 20]),
+        addr: addr(2),
+    };
+    {
+        let mut state = node.lock();
+        state.table.insert(known, Instant::now());
+        for tid in 0..MAX_PENDING as u16 {
+            let (reply, _) = oneshot::channel();
+            state.pending.insert(
+                tid,
+                Pending {
+                    addr: addr(3),
+                    reply,
+                },
+            );
+        }
+    }
+    // The ping cannot even be sent, which says nothing about the node.
+    Arc::clone(node).evict_check(known).await;
+    assert_eq!(node.lock().table.len(), 1);
+}
