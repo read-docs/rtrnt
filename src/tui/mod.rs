@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use theme::Theme;
 use tokio::sync::{mpsc, watch};
+use tokio::time::MissedTickBehavior;
 
 /// How often the stats are read and the screen drawn.
 pub const TICK: Duration = Duration::from_millis(250);
@@ -119,6 +120,8 @@ pub async fn run(
     app.dir = dir;
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(TICK);
+    // After a stall, one redraw is enough, not a burst of them.
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut done = *finished.borrow();
     let mut snapshot = Snapshot::default();
     // Where the last screen put everything, for the mouse.
