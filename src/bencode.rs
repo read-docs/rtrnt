@@ -4,7 +4,9 @@
 //! hash must be computed over the exact bytes of the `info` dictionary, so we
 //! walk the raw input to find them.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use serde_bencode::value::Value;
+use std::collections::HashMap;
 use std::ops::Range;
 
 /// Nesting limit, so a malicious file cannot overflow the stack.
@@ -38,6 +40,20 @@ pub fn value_len(data: &[u8]) -> Result<usize> {
     let mut pos = 0;
     skip_value(data, &mut pos, 0)?;
     Ok(pos)
+}
+
+/// Decodes the dictionary at the start of `payload`, which may be followed
+/// by other bytes, and returns it with its length in bytes. The nesting depth
+/// is checked first, because `serde_bencode` would follow it until the stack
+/// overflows.
+pub fn decode_dict(payload: &[u8]) -> Result<(HashMap<Vec<u8>, Value>, usize)> {
+    let len = value_len(payload)?;
+    let value: Value =
+        serde_bencode::from_bytes(&payload[..len]).context("payload is not bencoded")?;
+    match value {
+        Value::Dict(dict) => Ok((dict, len)),
+        _ => bail!("payload is not a dictionary"),
+    }
 }
 
 /// Parses `<len>:<bytes>` at `pos` and returns the bytes.
@@ -139,6 +155,23 @@ mod tests {
         data.extend(std::iter::repeat_n(b'l', 1000));
         assert!(info_span(&data).is_err());
         assert!(value_len(&data).is_err());
+    }
+
+    #[test]
+    fn decodes_a_dict_followed_by_other_bytes() {
+        let (dict, len) = decode_dict(b"d1:ai1eeextra").unwrap();
+        assert_eq!(len, 8);
+        assert_eq!(dict.get(b"a".as_slice()), Some(&Value::Int(1)));
+    }
+
+    #[test]
+    fn decode_dict_rejects_other_values_and_deep_nesting() {
+        for case in [&b""[..], b"i1e", b"l1:ae", b"1:a", b"d1:a"] {
+            assert!(decode_dict(case).is_err(), "accepted {case:?}");
+        }
+        let mut deep = b"d1:a".to_vec();
+        deep.extend(std::iter::repeat_n(b'l', 100_000));
+        assert!(decode_dict(&deep).is_err());
     }
 
     #[test]

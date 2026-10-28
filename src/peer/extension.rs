@@ -9,7 +9,7 @@
 
 use super::pex;
 use crate::bencode;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_bencode::value::Value;
 use serde_bytes::ByteBuf;
@@ -141,14 +141,8 @@ impl ExtendedHandshake {
     /// is out of range. Only a payload that is not a bencoded dictionary is
     /// an error. Bytes after the dictionary are ignored.
     pub fn decode(payload: &[u8]) -> Result<Self> {
-        // Scanned first because it limits the nesting depth, which
-        // `serde_bencode` would follow until the stack overflows.
-        let len = bencode::value_len(payload).context("extension handshake is not bencoded")?;
-        let value: Value = serde_bencode::from_bytes(&payload[..len])
-            .context("extension handshake is not bencoded")?;
-        let Value::Dict(dict) = value else {
-            bail!("extension handshake is not a dictionary");
-        };
+        let (dict, _) = bencode::decode_dict(payload)
+            .context("extension handshake is not a bencoded dictionary")?;
         let int = |key: &[u8]| match dict.get(key) {
             Some(Value::Int(n)) => Some(*n),
             _ => None,

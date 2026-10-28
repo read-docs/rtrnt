@@ -20,7 +20,7 @@ pub(crate) use fetch::MetadataFetch;
 use crate::bencode;
 use crate::peer::extension::UT_METADATA;
 use crate::peer::{PeerConnection, ProtocolViolation};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde_bencode::value::Value;
 use tracing::debug;
 
@@ -77,14 +77,8 @@ impl Message {
     /// `total_size`. Only a payload that does not start with a bencoded
     /// dictionary is an error.
     pub fn decode(payload: &[u8]) -> Result<Option<Self>> {
-        // Scanned first because it limits the nesting depth, which
-        // `serde_bencode` would follow until the stack overflows.
-        let len = bencode::value_len(payload).context("ut_metadata message is not bencoded")?;
-        let value: Value = serde_bencode::from_bytes(&payload[..len])
-            .context("ut_metadata message is not bencoded")?;
-        let Value::Dict(dict) = value else {
-            bail!("ut_metadata message is not a dictionary");
-        };
+        let (dict, len) = bencode::decode_dict(payload)
+            .context("ut_metadata message is not a bencoded dictionary")?;
         let int = |key: &[u8]| match dict.get(key) {
             Some(Value::Int(n)) => Some(*n),
             _ => None,

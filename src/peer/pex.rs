@@ -15,7 +15,7 @@
 use super::{PeerConnection, ProtocolViolation};
 use crate::bencode;
 use crate::tracker::{parse_compact_v4, parse_compact_v6};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_bencode::value::Value;
 use serde_bytes::ByteBuf;
@@ -113,14 +113,8 @@ impl PexMessage {
     /// bencoded dictionary is an error. Bytes after the dictionary are
     /// ignored.
     pub fn decode(payload: &[u8]) -> Result<Self> {
-        // Scanned first because it limits the nesting depth, which
-        // `serde_bencode` would follow until the stack overflows.
-        let len = bencode::value_len(payload).context("peer exchange message is not bencoded")?;
-        let value: Value = serde_bencode::from_bytes(&payload[..len])
-            .context("peer exchange message is not bencoded")?;
-        let Value::Dict(dict) = value else {
-            bail!("peer exchange message is not a dictionary");
-        };
+        let (dict, _) = bencode::decode_dict(payload)
+            .context("peer exchange message is not a bencoded dictionary")?;
         let bytes = |key: &[u8]| match dict.get(key) {
             Some(Value::Bytes(bytes)) => bytes.as_slice(),
             _ => &[],
