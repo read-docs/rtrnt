@@ -171,10 +171,10 @@ fn bad_nodes_are_replaced() {
             .iter()
             .any(|n| n.addr == dead)
     );
-    assert!(t.wants(&id_at(0, 60)));
+    assert!(t.wants(&node(id_at(0, 60), 60)));
     assert_eq!(t.insert(node(id_at(0, 60), 60), now), Insert::Added);
     assert_eq!(t.buckets[0].entries.len(), K);
-    assert!(!t.wants(&id_at(0, 61)));
+    assert!(!t.wants(&node(id_at(0, 61), 61)));
 
     // With a replacement waiting, a node going bad is swapped out at once.
     assert_eq!(t.insert(node(id_at(0, 61), 61), now), Insert::Full);
@@ -236,4 +236,133 @@ fn refresh_targets_fall_in_stale_buckets() {
         t.refresh_targets(later, &mut rng).len(),
         t.buckets.len() - 1
     );
+}
+
+/// A node at a public address, with an id that is not valid for it.
+fn invalid(prefix: usize, n: u8) -> NodeInfo {
+    let addr = SocketAddrV4::new(Ipv4Addr::new(8, 8, prefix as u8, n), 6881);
+    let id = id_at(prefix, n);
+    assert!(!id.is_secure_v4(*addr.ip()));
+    NodeInfo { id, addr }
+}
+
+/// A node in bucket 0 (an id starting with a 1 bit, as against our all
+/// zero id) at a public address, with an id that is valid for it.
+fn valid_in_bucket_0(n: u8) -> NodeInfo {
+    (0..=255u8)
+        .map(|host| Ipv4Addr::new(9, 9, n, host))
+        .flat_map(|ip| (0..=255u8).map(move |r| (ip, r)))
+        .map(|(ip, r)| NodeInfo {
+            id: NodeId::secure_v4_with(ip, r, [0xff; 20]),
+            addr: SocketAddrV4::new(ip, 6881),
+        })
+        .find(|node| node.id.bit(0))
+        .unwrap()
+}
+
+/// A table whose bucket 0 is full of invalid nodes and cannot split.
+fn full_of_invalid(now: Instant) -> RoutingTable {
+    let mut t = table(now);
+    for n in 0..K as u8 {
+        assert_eq!(t.insert(invalid(0, n), now), Insert::Added);
+    }
+    assert_eq!(t.insert(node(id_at(3, 0), 100), now), Insert::Added);
+    assert_eq!(t.buckets.len(), 2);
+    t
+}
+
+#[test]
+fn invalid_nodes_are_welcome_while_there_is_room_but_give_way() {
+    let now = Instant::now();
+    let mut t = full_of_invalid(now);
+    // Another invalid node is only kept as a replacement.
+    let before = t.len();
+    assert!(!t.wants(&invalid(0, 50)));
+    assert_eq!(t.insert(invalid(0, 50), now), Insert::Full);
+    assert_eq!(t.len(), before);
+    // A valid one takes the place of the invalid node heard of longest ago.
+    let valid = valid_in_bucket_0(1);
+    assert!(valid.is_secure() && t.wants(&valid));
+    let later = now + Duration::from_secs(1);
+    assert_eq!(t.insert(valid, later), Insert::Added);
+    assert_eq!(t.len(), before);
+    let ids: Vec<_> = t.buckets[0].entries.iter().map(|e| e.node.id).collect();
+    assert!(ids.contains(&valid.id));
+    // All were heard of at the same time, so the first of them went.
+    assert!(!ids.contains(&invalid(0, 0).id));
+    // Once the bucket holds only valid nodes, a valid one finds no room.
+    for n in 2..=K as u8 {
+        t.insert(valid_in_bucket_0(n), later);
+    }
+    assert!(t.buckets[0].entries.iter().all(|e| e.secure));
+    let late = valid_in_bucket_0(100);
+    assert!(!t.wants(&late));
+    assert_eq!(t.insert(late, later), Insert::Full);
+}
+
+#[test]
+fn a_node_being_pinged_is_not_displaced() {
+    let now = Instant::now();
+    let mut t = full_of_invalid(now);
+    for entry in &mut t.buckets[0].entries {
+        entry.pinging = true;
+    }
+    assert!(!t.wants(&valid_in_bucket_0(1)));
+    assert_eq!(t.insert(valid_in_bucket_0(1), now), Insert::Full);
+    assert!(t.buckets[0].entries.iter().all(|e| !e.secure));
+}
+
+#[test]
+fn replacements_and_pings_favour_valid_nodes() {
+    let now = Instant::now();
+    let mut t = full_of_invalid(now);
+    // Fill the bucket's replacement cache past its size with invalid nodes
+    // and one valid one: the valid one outlasts them.
+    let valid = valid_in_bucket_0(1);
+    t.buckets[0].cache(Entry::new(valid, now));
+    for n in 0..K as u8 + 2 {
+        t.buckets[0].cache(Entry::new(invalid(0, 100 + n), now));
+    }
+    assert_eq!(t.buckets[0].replacements.len(), K);
+    assert!(t.buckets[0].replacements.iter().any(|e| e.node == valid));
+    // An eviction takes it in, though it is not the newest.
+    let gone = invalid(0, 3).id;
+    t.evict(&gone, now);
+    assert!(t.buckets[0].entries.iter().any(|e| e.node == valid));
+    assert!(!t.buckets[0].entries.iter().any(|e| e.node.id == gone));
+
+    // Among questionable nodes, an invalid one is pinged before a valid
+    // one that is older.
+    let much_later = now + QUESTIONABLE_AFTER * 2;
+    t.buckets[0].entries[0].last_seen = now - Duration::from_secs(1);
+    t.buckets[0].entries[0].secure = true;
+    let pinged = t.buckets[0].questionable_to_ping(much_later).unwrap();
+    assert!(!pinged.is_secure());
+}
+
+#[test]
+fn a_new_own_id_regroups_the_nodes() {
+    let now = Instant::now();
+    let mut t = table(now);
+    let nodes: Vec<_> = (0..12u8)
+        .map(|n| node(id_at(usize::from(n) % 6, n), 1000 + u16::from(n)))
+        .collect();
+    for node in &nodes {
+        t.insert(*node, now);
+    }
+    let known = t.len();
+    let own = id_at(2, 77);
+    t.set_own(own, now);
+    assert_eq!(t.own(), own);
+    assert_eq!(t.len(), known, "nothing is lost while there is room");
+    for (i, bucket) in t.buckets.iter().enumerate() {
+        for entry in &bucket.entries {
+            assert_eq!(t.index(&entry.node.id), i);
+            assert!(!entry.pinging);
+        }
+    }
+    // Looked up from the new id, the closest node is the nearest one.
+    let nearest = t.closest(&own, 1)[0];
+    let best = nodes.iter().min_by_key(|n| n.id.distance(&own)).unwrap();
+    assert_eq!(nearest.id, best.id);
 }

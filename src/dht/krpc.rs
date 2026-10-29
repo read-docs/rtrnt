@@ -8,7 +8,7 @@
 use super::routing::{NodeId, NodeInfo};
 use anyhow::{Result, anyhow, bail};
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 /// KRPC messages are three levels deep; anything much deeper is garbage.
 const MAX_DEPTH: usize = 8;
@@ -167,6 +167,9 @@ fn parse_bytes<'a>(data: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> {
 pub struct Message {
     /// Transaction id, echoed in the answer to a query.
     pub tid: Vec<u8>,
+    /// Our address as the sender sees it (BEP 42): the top-level `ip` of a
+    /// response.
+    pub ip: Option<SocketAddr>,
     pub body: Body,
 }
 
@@ -236,8 +239,14 @@ impl Message {
             b"e" => decode_error(&dict)?,
             _ => bail!("unknown message type"),
         };
+        // A malformed `ip` only costs us the hint.
+        let ip = match dict.get(b"ip".as_slice()) {
+            Some(Value::Bytes(ip)) => decode_addr(ip),
+            _ => None,
+        };
         Ok(Message {
             tid: tid.to_vec(),
+            ip,
             body,
         })
     }
@@ -247,6 +256,9 @@ impl Message {
         let mut put = |key: &[u8], value| dict.insert(key.to_vec(), value);
         put(b"t", Value::Bytes(self.tid.clone()));
         put(b"v", Value::Bytes(VERSION.to_vec()));
+        if let Some(ip) = self.ip {
+            put(b"ip", Value::Bytes(encode_addr(ip)));
+        }
         match &self.body {
             Body::Query { id, query } => {
                 put(b"y", Value::Bytes(b"q".to_vec()));
@@ -485,6 +497,29 @@ pub fn decode_peer(bytes: &[u8]) -> Option<SocketAddrV4> {
         Ipv4Addr::new(a, b, c, d),
         u16::from_be_bytes([p1, p2]),
     ))
+}
+
+/// A compact address of either family: 4 or 16 bytes of address, then the
+/// port.
+pub fn encode_addr(addr: SocketAddr) -> Vec<u8> {
+    match addr {
+        SocketAddr::V4(addr) => encode_peer(addr).to_vec(),
+        SocketAddr::V6(addr) => {
+            let mut out = addr.ip().octets().to_vec();
+            out.extend_from_slice(&addr.port().to_be_bytes());
+            out
+        }
+    }
+}
+
+pub fn decode_addr(bytes: &[u8]) -> Option<SocketAddr> {
+    if bytes.len() == COMPACT_PEER {
+        return decode_peer(bytes).map(SocketAddr::V4);
+    }
+    let (ip, port) = bytes.split_at_checked(16)?;
+    let ip: [u8; 16] = ip.try_into().ok()?;
+    let port: [u8; 2] = port.try_into().ok()?;
+    Some(SocketAddr::new(ip.into(), u16::from_be_bytes(port)))
 }
 
 #[cfg(test)]

@@ -142,3 +142,95 @@ async fn a_full_pending_table_does_not_evict_nodes() {
     Arc::clone(node).evict_check(known).await;
     assert_eq!(node.lock().table.len(), 1);
 }
+
+fn public(n: u8) -> Ipv4Addr {
+    Ipv4Addr::new(1, 2, 3, n)
+}
+
+#[test]
+fn own_id_follows_the_address_nodes_agree_on() {
+    let now = Instant::now();
+    let mut state = State::new(OWN, now);
+    let known = NodeInfo {
+        id: NodeId([2; 20]),
+        addr: addr(2),
+    };
+    state.table.insert(known, now);
+    let ours = Ipv4Addr::new(124, 31, 75, 21);
+    // A few reports are not enough, however often they come.
+    for _ in 0..5 {
+        assert_eq!(state.learn_external(public(1), ours, now), None);
+    }
+    assert_eq!(state.learn_external(public(2), ours, now), None);
+    assert_eq!(state.learn_external(public(3), ours, now), None);
+    let id = state.learn_external(public(4), ours, now).unwrap();
+    assert!(id.is_secure_v4(ours));
+    assert_eq!(state.table.own(), id);
+    assert_eq!(state.external, Some(ours));
+    assert_eq!(state.table.len(), 1, "known nodes are kept");
+    // Once the id is valid, more reports change nothing.
+    assert_eq!(state.learn_external(public(5), ours, now), None);
+    assert_eq!(state.table.own(), id);
+}
+
+#[test]
+fn a_valid_id_is_kept_and_local_reports_are_ignored() {
+    let now = Instant::now();
+    let ours = Ipv4Addr::new(124, 31, 75, 21);
+    let id = NodeId::secure_v4(ours);
+    let mut state = State::new(id, now);
+    for n in 1..=8 {
+        assert_eq!(state.learn_external(public(n), ours, now), None);
+    }
+    assert_eq!(state.table.own(), id);
+
+    let mut state = State::new(OWN, now);
+    for n in 1..=8 {
+        let lan = Ipv4Addr::new(192, 168, 1, 5);
+        assert_eq!(state.learn_external(public(n), lan, now), None);
+    }
+    assert_eq!(state.table.own(), OWN);
+    assert_eq!(state.external, None);
+}
+
+#[tokio::test]
+async fn answers_carry_the_senders_address() {
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let dht = Dht::start(socket, Vec::new()).unwrap();
+    let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let ping = Message {
+        tid: vec![1, 2],
+        ip: None,
+        body: Body::Query {
+            id: NodeId([7; 20]),
+            query: Query::Ping,
+        },
+    };
+    client
+        .send_to(&ping.encode(), dht.local_addr())
+        .await
+        .unwrap();
+    let mut buf = [0u8; 1500];
+    let (len, _) = timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let reply = Message::decode(&buf[..len]).unwrap();
+    assert_eq!(reply.ip, Some(client.local_addr().unwrap()));
+}
+
+#[test]
+fn the_routers_address_counts_at_once_if_it_can_be_public() {
+    let now = Instant::now();
+    let mut state = State::new(OWN, now);
+    // Not an address the nodes outside could see.
+    for ip in [[192, 168, 1, 5], [100, 64, 1, 1], [0, 0, 0, 0]] {
+        assert_eq!(state.adopt(Ipv4Addr::from(ip), now), None);
+        assert_eq!(state.external, None);
+    }
+    let ours = Ipv4Addr::new(124, 31, 75, 21);
+    let id = state.adopt(ours, now).unwrap();
+    assert!(id.is_secure_v4(ours));
+    assert_eq!(state.table.own(), id);
+    assert_eq!(state.adopt(ours, now), None);
+}

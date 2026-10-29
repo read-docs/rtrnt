@@ -172,6 +172,8 @@ pub(super) async fn peer_worker(
     // Fast extension: requests we cancelled that the peer has not answered
     // yet. It still answers each, with the block or a Reject.
     let mut cancelled: HashSet<BlockRef> = HashSet::new();
+    // Whether the DHT has heard what the peer says our address is.
+    let mut told_dht = false;
     loop {
         // Registered before anything is checked, so that a change in the
         // queue from here on still wakes the idle wait below.
@@ -236,6 +238,14 @@ pub(super) async fn peer_worker(
         let choking = !slot.is_unchoked();
         conn.set_choking(choking).await?;
         publish_peer(&stats, &conn, fast, torrent.is_private());
+        // The peer's `yourip` is one vote on our external address, which
+        // the DHT derives its node id from (BEP 42).
+        if !told_dht && let Some(your_ip) = conn.peer_extensions().and_then(|h| h.your_ip) {
+            told_dht = true;
+            if let Some(dht) = &session.dht {
+                dht.report_external_ip(addr.ip(), your_ip);
+            }
+        }
         if choking {
             // A choke drops the peer's requests, except those for its
             // allowed fast pieces. With the fast extension each dropped one

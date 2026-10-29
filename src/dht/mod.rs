@@ -8,13 +8,16 @@
 //! for one torrent while it downloads.
 //!
 //! IPv4 only: IPv6 nodes and peers (`nodes6`, 18-byte values) are ignored.
-//! The node id is random rather than derived from our address (BEP 42),
-//! and the routing table is not saved between runs.
+//! The node id starts out random. Once enough nodes agree on our external
+//! address (the `ip` field of their answers, BEP 42), it is replaced by an
+//! id derived from that address, and nodes with such ids are preferred in
+//! the routing table. The routing table is not saved between runs.
 
 mod krpc;
 mod lookup;
 mod routing;
 mod search;
+mod secure;
 mod store;
 mod token;
 
@@ -24,9 +27,10 @@ use anyhow::{Context, Result, anyhow};
 use krpc::{Body, ERROR_METHOD_UNKNOWN, ERROR_PROTOCOL, Message, Query, Response};
 use lookup::Lookup;
 use routing::{Insert, K, NodeId, NodeInfo, RoutingTable};
+use secure::IpVotes;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use store::PeerStore;
@@ -116,7 +120,6 @@ impl Dht {
         let node = Arc::new(Node {
             socket,
             addr,
-            id,
             routers,
             state: Mutex::new(State::new(id, Instant::now())),
             verify,
@@ -136,6 +139,28 @@ impl Dht {
     /// messages.
     pub fn port(&self) -> u16 {
         self.0.node.addr.port()
+    }
+
+    /// Our node id. It changes once we learn our external address.
+    pub fn node_id(&self) -> [u8; 20] {
+        self.0.node.id().0
+    }
+
+    /// Tells the node our external address, as the router reported it. Unlike
+    /// `report_external_ip` it counts at once. Addresses that cannot be
+    /// public are ignored.
+    pub fn set_external_ip(&self, ip: Ipv4Addr) {
+        self.0.node.set_external(ip, Instant::now());
+    }
+
+    /// Tells the node that `reporter` says our external address is `ip`,
+    /// as a peer does with `yourip` in its extension handshake (BEP 10).
+    /// It counts like one more node's word, so that a lone peer cannot
+    /// change our id.
+    pub fn report_external_ip(&self, reporter: IpAddr, ip: IpAddr) {
+        if let (IpAddr::V4(reporter), IpAddr::V4(ip)) = (reporter, ip) {
+            self.0.node.learn_external(reporter, ip, Instant::now());
+        }
     }
 
     /// Nodes in the routing table.
@@ -175,7 +200,6 @@ impl Dht {
 struct Node {
     socket: UdpSocket,
     addr: SocketAddr,
-    id: NodeId,
     routers: Vec<String>,
     state: Mutex<State>,
     /// Unknown nodes to ping, and add to the table if they answer.
@@ -191,6 +215,10 @@ struct State {
     /// Resolved bootstrap routers. They help lookups but stay out of the
     /// table: they hold no peers and do not want the traffic.
     routers: HashSet<SocketAddrV4>,
+    /// What nodes say our external address is.
+    votes: IpVotes,
+    /// Our external address once nodes agree on it.
+    external: Option<Ipv4Addr>,
 }
 
 impl State {
@@ -201,7 +229,39 @@ impl State {
             store: PeerStore::default(),
             pending: HashMap::new(),
             routers: HashSet::new(),
+            votes: IpVotes::default(),
+            external: None,
         }
+    }
+
+    /// Counts `reporter`'s word that our address is `reported`. When enough
+    /// nodes agree on an address and our id is not valid for it, a new id
+    /// takes its place and the routing table is rebuilt around it. Returns
+    /// the new id.
+    fn learn_external(
+        &mut self,
+        reporter: Ipv4Addr,
+        reported: Ipv4Addr,
+        now: Instant,
+    ) -> Option<NodeId> {
+        let ip = self.votes.vote(reporter, reported)?;
+        self.adopt(ip, now)
+    }
+
+    /// Takes `ip` as our external address. If our id is not valid for it, a
+    /// new one takes its place and the routing table is rebuilt around it,
+    /// which is returned.
+    fn adopt(&mut self, ip: Ipv4Addr, now: Instant) -> Option<NodeId> {
+        if !secure::is_public(ip) {
+            return None;
+        }
+        self.external = Some(ip);
+        if self.table.own().is_secure_v4(ip) {
+            return None;
+        }
+        let id = NodeId::secure_v4(ip);
+        self.table.set_own(id, now);
+        Some(id)
     }
 }
 
@@ -249,6 +309,32 @@ impl Node {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Our current node id.
+    fn id(&self) -> NodeId {
+        self.lock().table.own()
+    }
+
+    /// See `State::learn_external`.
+    fn learn_external(self: &Arc<Self>, reporter: Ipv4Addr, reported: Ipv4Addr, now: Instant) {
+        let new = self.lock().learn_external(reporter, reported, now);
+        self.new_id(new, reported);
+    }
+
+    /// See `State::adopt`.
+    fn set_external(self: &Arc<Self>, ip: Ipv4Addr, now: Instant) {
+        let new = self.lock().adopt(ip, now);
+        self.new_id(new, ip);
+    }
+
+    /// Logs a new id, and looks it up to fill the buckets around it.
+    fn new_id(self: &Arc<Self>, id: Option<NodeId>, ip: Ipv4Addr) {
+        if let Some(id) = id {
+            info!(%ip, ?id, "DHT node id changed to match our external address");
+            let node = Arc::clone(self);
+            tokio::spawn(async move { node.lookup(id, false).await });
+        }
+    }
+
     /// Receives and handles datagrams until the node stops. Malformed ones
     /// are dropped.
     async fn receive(self: Arc<Self>) {
@@ -276,21 +362,33 @@ impl Node {
         let now = Instant::now();
         match message.body {
             Body::Query { id, query } => {
-                let (body, verify) = answer(&mut self.lock(), self.id, id, query, from, now);
+                let (body, verify) = {
+                    let mut state = self.lock();
+                    let own = state.table.own();
+                    answer(&mut state, own, id, query, from, now)
+                };
                 // If the queue is full, the node gets another chance with
                 // its next query.
                 if verify && self.verify.try_send(from).is_err() {
                     debug!(%from, "too many DHT nodes to verify; skipping");
                 }
+                // Tells the node its address as we see it (BEP 42).
+                let ip = matches!(body, Body::Response(_)).then_some(SocketAddr::V4(from));
                 let reply = Message {
                     tid: message.tid,
+                    ip,
                     body,
                 };
                 if let Err(e) = self.socket.send_to(&reply.encode(), from).await {
                     debug!(%from, "cannot answer DHT query: {e}");
                 }
             }
-            Body::Response(response) => self.resolve(&message.tid, from, Ok(response), now),
+            Body::Response(response) => {
+                self.resolve(&message.tid, from, Ok(response), now);
+                if let Some(SocketAddr::V4(ip)) = message.ip {
+                    self.learn_external(*from.ip(), *ip.ip(), now);
+                }
+            }
             Body::Error {
                 code,
                 message: text,
@@ -374,7 +472,11 @@ impl Node {
         let _unregister = Unregister { node: self, tid };
         let message = Message {
             tid: tid.to_be_bytes().to_vec(),
-            body: Body::Query { id: self.id, query },
+            ip: None,
+            body: Body::Query {
+                id: self.id(),
+                query,
+            },
         };
         let packet = message.encode();
         for attempt in 1..=QUERY_ATTEMPTS {
@@ -428,7 +530,7 @@ impl Node {
         } else {
             Vec::new()
         };
-        let mut lookup = Lookup::new(self.id, target, seeds, routers);
+        let mut lookup = Lookup::new(self.id(), target, seeds, routers);
         let mut queries = JoinSet::new();
         // When each query becomes slow, in the order they were sent.
         let mut slow = VecDeque::new();
@@ -498,7 +600,7 @@ impl Node {
     }
 
     async fn bootstrap(self: &Arc<Self>) -> usize {
-        self.lookup(self.id, false).await;
+        self.lookup(self.id(), false).await;
         let nodes = self.lock().table.len();
         if nodes == 0 {
             warn!("DHT bootstrap found no nodes");
@@ -663,7 +765,8 @@ fn answer(
     from: SocketAddrV4,
     now: Instant,
 ) -> (Body, bool) {
-    let verify = !state.table.heard_from(&id, from, now) && state.table.wants(&id);
+    let node = NodeInfo { id, addr: from };
+    let verify = !state.table.heard_from(&id, from, now) && state.table.wants(&node);
     let ip = *from.ip();
     let response = |response: Response| {
         Body::Response(Response {

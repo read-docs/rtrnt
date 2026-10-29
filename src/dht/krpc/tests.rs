@@ -1,4 +1,5 @@
 use super::*;
+use std::net::Ipv6Addr;
 
 const ID: &[u8; 20] = b"abcdefghij0123456789";
 const OTHER: &[u8; 20] = b"mnopqrstuvwxyz123456";
@@ -55,6 +56,7 @@ fn decodes_bep_5_examples() {
         Message {
             tid,
             body: Body::Query { id, query },
+            ..
         } => {
             assert_eq!((tid.as_slice(), id), (b"aa".as_slice(), NodeId(*ID)));
             query
@@ -163,6 +165,7 @@ fn messages_roundtrip() {
     for body in bodies {
         let message = Message {
             tid: vec![0, 7],
+            ip: None,
             body,
         };
         let encoded = message.encode();
@@ -242,6 +245,7 @@ fn caps_nodes_and_values_per_response() {
     };
     let message = Message {
         tid: vec![1],
+        ip: None,
         body: Body::Response(response),
     };
     let Body::Response(decoded) = Message::decode(&message.encode()).unwrap().body else {
@@ -251,4 +255,26 @@ fn caps_nodes_and_values_per_response() {
         (decoded.nodes.len(), decoded.values.len()),
         (MAX_NODES, MAX_VALUES)
     );
+}
+
+#[test]
+fn carries_our_address_as_top_level_ip() {
+    let message = |ip| Message {
+        tid: vec![1],
+        ip,
+        body: Body::Response(Response::default()),
+    };
+    let v4 = Some(SocketAddr::from(([1, 2, 3, 4], 6881)));
+    let v6 = Some(SocketAddr::from((Ipv6Addr::LOCALHOST, 6881)));
+    for ip in [None, v4, v6] {
+        let encoded = message(ip).encode();
+        assert_eq!(Message::decode(&encoded).unwrap(), message(ip));
+    }
+    // The BEP's compact form, in the top-level dictionary.
+    let encoded = message(v4).encode();
+    let needle = b"2:ip6:\x01\x02\x03\x04\x1a\xe1";
+    assert!(encoded.windows(needle.len()).any(|w| w == needle));
+    // A malformed one is dropped, not an error.
+    let data = b"d2:ip3:abc1:rd2:id20:abcdefghij0123456789e1:t2:aa1:y1:re";
+    assert_eq!(Message::decode(data).unwrap().ip, None);
 }

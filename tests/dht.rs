@@ -101,9 +101,15 @@ async fn answers_raw_queries_and_survives_garbage() {
         .await
         .unwrap();
     let reply = recv_answer(&client).await;
-    assert!(reply.starts_with(b"d1:rd2:id20:"), "{reply:?}");
+    // The sender's address comes first, as BEP 42 has it, then the answer.
+    assert!(reply.starts_with(b"d2:ip6:\x7f\x00\x00\x01"), "{reply:?}");
+    let answer = b"1:rd2:id20:";
     assert!(
-        reply.ends_with(b"e1:t2:aa1:v4:RT\x01\x001:y1:re"),
+        reply.windows(answer.len()).any(|w| w == answer),
+        "{reply:?}"
+    );
+    assert!(
+        reply.ends_with(b"1:t2:aa1:v4:RT\x01\x001:y1:re"),
         "{reply:?}"
     );
 
