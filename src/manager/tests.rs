@@ -970,6 +970,7 @@ async fn a_saved_session_is_restored_in_order_and_paused_torrents_stay_paused() 
                 saved(UNTIL_STOPPED, false),
             ],
             rate_limits: Some(limits),
+            alt_speed: None,
         })
         .await;
     manager
@@ -1016,6 +1017,7 @@ async fn a_saved_torrent_that_no_longer_loads_is_reported_and_dropped() {
                 paused: true,
             }],
             rate_limits: None,
+            alt_speed: None,
         })
         .await;
     assert!(manager.entries().is_empty());
@@ -1221,4 +1223,75 @@ async fn a_paused_torrent_keeps_the_choice_of_files_in_its_resume_file() {
         resume::load_selection(&target, 2),
         Some(FileSelection::new(vec![Priority::High; 2]))
     );
+}
+
+#[tokio::test]
+async fn toggling_alt_speed_swaps_the_limits_and_keeps_the_switch() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path().to_path_buf());
+    let client = client();
+    client.set_rate_limits(1000, 100);
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, fake_run)
+        .with_alt_speed((50, 10), Schedule::default())
+        .with_session(store.clone());
+    assert_eq!(saved_session(&store).alt_speed, None);
+
+    manager.command(Command::ToggleAltSpeed).await;
+    assert_eq!(client.stats().rate_limits(), (50, 10));
+    assert!(client.stats().alt_speed());
+    let (_, notice) = client.stats().last_notice().unwrap();
+    assert_eq!(
+        notice,
+        "alternative speed limits on: download 50 KiB/s, upload 10 KiB/s"
+    );
+    let saved = saved_session(&store).alt_speed.unwrap();
+    assert_eq!(saved.manual.map(|manual| manual.alt), Some(true));
+
+    // The limit keys edit the alternative pair while it is on.
+    manager.command(Command::SetRateLimits(70, 0)).await;
+    assert_eq!(client.stats().rate_limits(), (70, 0));
+    let session = saved_session(&store);
+    assert_eq!(
+        session.alt_speed.unwrap().limits,
+        Some(SavedLimits {
+            download: 70,
+            upload: 0
+        })
+    );
+    assert_eq!(session.rate_limits, None);
+
+    manager.command(Command::ToggleAltSpeed).await;
+    assert_eq!(client.stats().rate_limits(), (1000, 100));
+    assert!(!client.stats().alt_speed());
+    assert_eq!(saved_session(&store).alt_speed.unwrap().manual, None);
+    manager.command(Command::SetRateLimits(2000, 100)).await;
+    assert_eq!(
+        saved_session(&store).rate_limits,
+        Some(SavedLimits {
+            download: 2000,
+            upload: 100
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_restored_switch_is_applied_on_restore() {
+    let client = client();
+    client.set_rate_limits(1000, 100);
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, fake_run)
+        .with_alt_speed((50, 10), Schedule::default());
+    manager
+        .restore(SavedSession {
+            alt_speed: Some(SavedAltSpeed {
+                limits: None,
+                manual: Some(crate::altspeed::Override {
+                    alt: true,
+                    scheduled: false,
+                }),
+            }),
+            ..SavedSession::default()
+        })
+        .await;
+    assert_eq!(client.stats().rate_limits(), (50, 10));
+    assert!(client.stats().alt_speed());
 }

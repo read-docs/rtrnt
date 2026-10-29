@@ -26,7 +26,12 @@ const KEYS: &[(&str, &str)] = &[
 /// Files tab has the focus, and `p`, `x` and `r` for the selected torrent.
 const FILE_KEYS: &[(&str, &str)] = &[("space", "skip"), ("+ -", "priority")];
 
-const MORE_KEYS: &[(&str, &str)] = &[("a", "add"), ("d u", "limits"), ("m", "mouse")];
+const MORE_KEYS: &[(&str, &str)] = &[
+    ("a", "add"),
+    ("d u", "limits"),
+    ("t", "alt speed"),
+    ("m", "mouse"),
+];
 
 pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
     let theme = app.theme;

@@ -9,6 +9,7 @@ use crate::client::ConnectionSlots;
 use crate::dht::Dht;
 use crate::rate_limit::RateLimits;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
@@ -32,6 +33,8 @@ pub struct SessionStats {
     /// The directory watched for torrents, if there is one.
     watch_dir: OnceLock<PathBuf>,
     rate_limits: Arc<RateLimits>,
+    /// Whether the alternative speed limits are on (see `altspeed`).
+    alt_speed: AtomicBool,
     slots: ConnectionSlots,
     /// The latest notice, and when it came.
     notice: Mutex<Option<(Instant, String)>>,
@@ -47,6 +50,7 @@ impl SessionStats {
             port: OnceLock::new(),
             watch_dir: OnceLock::new(),
             rate_limits,
+            alt_speed: AtomicBool::new(false),
             slots,
             notice: Mutex::new(None),
         }
@@ -131,6 +135,16 @@ impl SessionStats {
     /// Download and upload limits in KiB/s, 0 for none, as they are now.
     pub fn rate_limits(&self) -> (u64, u64) {
         self.rate_limits.kib()
+    }
+
+    /// Records whether the alternative speed limits are on.
+    pub fn set_alt_speed(&self, on: bool) {
+        self.alt_speed.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether the alternative speed limits are on.
+    pub fn alt_speed(&self) -> bool {
+        self.alt_speed.load(Ordering::Relaxed)
     }
 
     /// Peer connections open now, across every torrent.

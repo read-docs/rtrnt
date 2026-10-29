@@ -40,6 +40,8 @@ pub struct SessionSnapshot {
     pub max_connections: usize,
     /// Download and upload limits in KiB/s, 0 for none.
     pub rate_limits: (u64, u64),
+    /// Whether the limits are the alternative ("turtle") ones.
+    pub alt_speed: bool,
     /// The directory watched for torrents, if there is one.
     pub watch_dir: Option<PathBuf>,
 }
@@ -197,6 +199,7 @@ impl Snapshot {
                 connections: stats.connections(),
                 max_connections: stats.max_connections(),
                 rate_limits: stats.rate_limits(),
+                alt_speed: stats.alt_speed(),
                 watch_dir: stats.watch_dir(),
             },
             torrents: torrents

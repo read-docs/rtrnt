@@ -101,6 +101,7 @@ async fn a_paused_torrent_and_the_limits_survive_a_new_manager() {
         .restore(SavedSession {
             torrents: saved.torrents,
             rate_limits: saved.rate_limits,
+            alt_speed: None,
         })
         .await;
     assert_eq!(manager.entries().len(), 1);

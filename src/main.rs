@@ -104,6 +104,14 @@ async fn main() -> anyhow::Result<ExitCode> {
     let from_session = config::Options {
         max_download_rate: saved.rate_limits.map(|limits| limits.download),
         max_upload_rate: saved.rate_limits.map(|limits| limits.upload),
+        alt_speed_download: saved
+            .alt_speed
+            .and_then(|alt| alt.limits)
+            .map(|limits| limits.download),
+        alt_speed_upload: saved
+            .alt_speed
+            .and_then(|alt| alt.limits)
+            .map(|limits| limits.upload),
         ..config::Options::default()
     };
     if args.print_config {
@@ -118,7 +126,9 @@ async fn main() -> anyhow::Result<ExitCode> {
         .watch_dir_delete
         .or(file.options.watch_dir_delete)
         .unwrap_or(config::DEFAULT_WATCH_DIR_DELETE);
-    let config = config::resolve(cli.or(from_session), file.options);
+    let effective = cli.or(from_session).or(file.options);
+    let (alt_limits, alt_schedule) = effective.alt_speed();
+    let config = effective.into_download_config();
     if args.check || args.scrape {
         let (config, check_mode) = (&config, args.check);
         return each_in_turn(&args.torrents, |source| async move {
@@ -136,7 +146,8 @@ async fn main() -> anyhow::Result<ExitCode> {
     let mut manager = Manager::new(Arc::clone(&client), {
         let shutdown = Arc::clone(&shutdown);
         move || Arc::clone(&shutdown).signal()
-    });
+    })
+    .with_alt_speed(alt_limits, alt_schedule);
     let mut sources = args.torrents;
     // The watch directory keeps its copies of .torrent files in the
     // session's store, or else in the state directory even though the
@@ -156,6 +167,7 @@ async fn main() -> anyhow::Result<ExitCode> {
             .restore(SavedSession {
                 torrents,
                 rate_limits: saved.rate_limits,
+                alt_speed: saved.alt_speed,
             })
             .await;
     }

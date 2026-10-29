@@ -256,7 +256,10 @@ fn describe_names_each_source() {
          # tui: when stdout and stderr are terminals  # default\n\
          # session: only in the terminal UI  # default\n\
          # watch-dir: none  # default\n\
-         watch-dir-delete = false  # default\n"
+         watch-dir-delete = false  # default\n\
+         alt-speed-download = 50  # default\n\
+         alt-speed-upload = 50  # default\n\
+         # alt-speed-schedule: only by hand  # default\n"
     );
     // The settings part is valid TOML that parses to the same values.
     let reparsed = parse(&text, None).unwrap();
@@ -270,6 +273,8 @@ fn describe_names_each_source() {
             max_download_rate: Some(0),
             max_upload_rate: Some(64),
             watch_dir_delete: Some(false),
+            alt_speed_download: Some(50),
+            alt_speed_upload: Some(50),
             ..options(Some("/data"), Some(5), Some(6881))
         }
     );
@@ -376,4 +381,52 @@ fn the_watch_directory_comes_from_the_command_line_or_the_file() {
         parse(&text, None).unwrap().watch_dir,
         Some(PathBuf::from("/home/me/incoming"))
     );
+}
+
+#[test]
+fn the_alt_speed_settings_come_from_the_file_and_default_to_50() {
+    assert_eq!(
+        Options::default().alt_speed(),
+        ((50, 50), Schedule::default())
+    );
+    let text = "alt-speed-download = 100\nalt-speed-upload = 0\n\
+                alt-speed-schedule = [{ days = [\"sat\", \"sun\"], from = \"22:00\", to = \"06:00\" }]\n";
+    let parsed = parse(text, None).unwrap();
+    let (limits, schedule) = parsed.alt_speed();
+    assert_eq!(limits, (100, 0));
+    assert_eq!(schedule.len(), 1);
+    // The command line's limits win over the file's.
+    let cli = Options {
+        alt_speed_download: Some(10),
+        ..Options::default()
+    };
+    assert_eq!(cli.or(parsed).alt_speed().0, (10, 0));
+}
+
+#[test]
+fn print_config_shows_the_schedule_as_the_file_spells_it() {
+    let schedule = r#"[{ days = ["mon"], from = "22:00", to = "06:00" }]"#;
+    let file = ConfigFile {
+        path: None,
+        options: parse(&format!("alt-speed-schedule = {schedule}\n"), None).unwrap(),
+    };
+    let text = describe(&Options::default(), &Options::default(), &file);
+    assert!(
+        text.contains(&format!("alt-speed-schedule = {schedule}  # config file\n")),
+        "{text}"
+    );
+    assert_eq!(
+        parse(&text, None).unwrap().alt_speed(),
+        file.options.alt_speed()
+    );
+}
+
+#[test]
+fn a_bad_schedule_names_the_problem() {
+    let e = parse(
+        "alt-speed-schedule = [{ from = \"8am\", to = \"9:00\" }]\n",
+        None,
+    )
+    .unwrap_err();
+    assert!(format!("{e:#}").contains("8am"), "{e:#}");
 }

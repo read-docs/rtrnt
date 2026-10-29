@@ -515,6 +515,28 @@ fn the_header_shows_the_limits_next_to_the_rates() {
 }
 
 #[test]
+fn the_header_marks_the_alt_speed_limits() {
+    let mut snapshot = demo::fixture();
+    snapshot.session.rate_limits = (50, 50);
+    let app = app(&snapshot);
+    let header = |snapshot: &Snapshot| {
+        text(&render(100, 32, snapshot, &app), Rect::new(0, 0, 100, 1))[0].clone()
+    };
+    assert!(!header(&snapshot).contains("alt speed"));
+    snapshot.session.alt_speed = true;
+    let line = header(&snapshot);
+    assert!(
+        line.starts_with(
+            " rtrnt │ ↓ 6.6 MiB/s (50 KiB/s)  ↑ 1.1 MiB/s (50 KiB/s) alt speed │ 5 torrents"
+        ),
+        "{line}"
+    );
+    let buffer = render(100, 32, &snapshot, &app);
+    let x = line[..line.find("alt speed").unwrap()].chars().count() as u16;
+    assert_eq!(buffer[(x, 0)].fg, Theme::default().warn());
+}
+
+#[test]
 fn the_header_names_the_watch_directory() {
     let mut snapshot = demo::fixture();
     let app = app(&snapshot);
