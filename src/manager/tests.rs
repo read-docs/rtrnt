@@ -1570,6 +1570,51 @@ async fn a_restored_session_queues_in_its_order() {
     assert_eq!(in_file, [(3, false), (1, true), (2, false), (4, false)]);
 }
 
+#[tokio::test]
+async fn a_queued_torrent_keeps_its_choice_to_download_in_order() {
+    let client = client();
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path().to_path_buf());
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, fake_run)
+        .with_queue_limits(download_limit(1))
+        .with_session(store.clone());
+    manager.expect_more();
+    let saved = |n: u8, sequential| SavedTorrent {
+        info_hash: until_hash(n),
+        source: until(n),
+        paused: false,
+        sequential,
+    };
+    manager
+        .restore(SavedSession {
+            torrents: vec![saved(1, None), saved(2, Some(true))],
+            rate_limits: None,
+            alt_speed: None,
+        })
+        .await;
+    assert_eq!(shape(manager.entries()), "rq");
+    let choices = |store: &SessionStore| -> Vec<Option<bool>> {
+        saved_session(store)
+            .torrents
+            .iter()
+            .map(|saved| saved.sequential)
+            .collect()
+    };
+    // The queued row shows the saved choice, and the next save keeps it.
+    let queued = stats_of(&client, until_hash(2), |_| true).unwrap();
+    assert!(queued.sequential());
+    assert_eq!(choices(&store), [None, Some(true)]);
+    // A change made while it waits is not undone when it starts.
+    manager
+        .command(Command::ToggleSequential(until_hash(2)))
+        .await;
+    assert_eq!(choices(&store), [None, Some(false)]);
+    assert!(matches!(
+        &manager.entries()[1].state,
+        State::Queued { options, .. } if options.sequential.is_none()
+    ));
+}
+
 /// Runs the fake torrent as a seed: it publishes a row in the seeding state
 /// and runs until it is stopped.
 fn seeding_run(
