@@ -296,32 +296,33 @@ async fn download_loaded(
         info_hash,
         peer_id: session.peer_id,
         port,
+        key: 0,
         uploaded: 0,
         downloaded: 0,
         left,
         event: AnnounceEvent::Started,
     };
     let tiers = session.torrent.tracker_tiers();
-    let started = Announcer::start_reporting(tiers, request, Some(Arc::clone(stats)));
-    let (announcer, peers) = match started.await {
-        Ok((announcer, peers)) => (Some(announcer), peers),
-        // No trackers, or none answered: the DHT may still find peers.
-        Err(e) if session.dht.is_some() => {
-            info!("{e:#}; looking for peers in the DHT only");
-            (None, Vec::new())
-        }
-        Err(e) => return Err(e),
+    // Without trackers there is nothing to announce to. When none answer,
+    // the announcer tries again later, and the DHT may still find peers.
+    let (announcer, peers) = if tiers.iter().all(Vec::is_empty) {
+        (None, Vec::new())
+    } else {
+        let started = Announcer::start_reporting(tiers, request, Some(Arc::clone(stats)));
+        let (announcer, peers) = started.await;
+        (Some(announcer), peers)
     };
     // A seed can wait for peers to connect to it, and the DHT may still find
     // some.
     if peers.is_empty() && left > 0 && session.dht.is_none() {
-        if let Some(announcer) = announcer {
-            announcer.stop(&Transferred::default()).await;
-        }
-        bail!("no tracker returned any peers");
-    }
-    if announcer.is_some() {
-        info!(peers = peers.len(), "tracker announce succeeded");
+        let reason = match announcer {
+            Some(announcer) => {
+                announcer.stop(&Transferred::default()).await;
+                "no tracker returned any peers"
+            }
+            None => "torrent has no trackers",
+        };
+        bail!(reason);
     }
 
     stats.add_source(PeerSource::Tracker, peers.len());

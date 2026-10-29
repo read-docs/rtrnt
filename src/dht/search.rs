@@ -2,11 +2,11 @@
 //! announcer repeats tracker announces.
 
 use super::Dht;
+use crate::periodic::Periodic;
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::task::JoinHandle;
 use tokio::time::Instant;
-use tracing::{Instrument, info, warn};
+use tracing::{info, warn};
 
 /// Time between lookups. Each one announces us again too, well within the
 /// 30 minutes nodes keep an announce.
@@ -19,11 +19,8 @@ pub struct DhtSearch {
     info_hash: [u8; 20],
     /// TCP port to announce, if we accept incoming peers.
     announce_port: Option<u16>,
-    /// When the last lookup started.
-    last: Instant,
-    /// When the next lookup is due.
-    next: Instant,
-    in_flight: Option<JoinHandle<Vec<SocketAddr>>>,
+    /// When lookups start.
+    timer: Periodic<Vec<SocketAddr>>,
 }
 
 impl DhtSearch {
@@ -35,16 +32,14 @@ impl DhtSearch {
             dht,
             info_hash,
             announce_port,
-            last: now,
-            next: now,
-            in_flight: None,
+            timer: Periodic::new(now, now),
         }
     }
 
     /// Brings the next lookup forward, to `MIN_LOOKUP_INTERVAL` after the
     /// last one started, for when we have run out of peers.
     pub fn hurry(&mut self) {
-        self.next = self.next.min(self.last + MIN_LOOKUP_INTERVAL);
+        self.timer.hurry(MIN_LOOKUP_INTERVAL);
     }
 
     /// Waits until the next lookup is due, runs it in the background and
@@ -53,32 +48,21 @@ impl DhtSearch {
     /// Cancel-safe: a lookup already started is kept, and the next call
     /// waits for it.
     pub async fn poll(&mut self) -> Vec<SocketAddr> {
-        if self.in_flight.is_none() {
-            tokio::time::sleep_until(self.next).await;
-            self.last = Instant::now();
-            self.next = self.last + LOOKUP_INTERVAL;
-        }
-        let handle = self.in_flight.get_or_insert_with(|| {
-            let dht = self.dht.clone();
-            let (info_hash, port) = (self.info_hash, self.announce_port);
-            let lookup = async move { dht.get_peers(info_hash, port).await };
-            tokio::spawn(lookup.in_current_span())
-        });
-        let peers = handle.await.unwrap_or_else(|e| {
-            warn!("DHT lookup failed: {e}");
-            Vec::new()
-        });
-        self.in_flight = None;
+        let (dht, info_hash, port) = (&self.dht, self.info_hash, self.announce_port);
+        let start = || {
+            let dht = dht.clone();
+            async move { dht.get_peers(info_hash, port).await }
+        };
+        let peers = self
+            .timer
+            .poll(Some(LOOKUP_INTERVAL), start)
+            .await
+            .unwrap_or_else(|e| {
+                warn!("DHT lookup failed: {e}");
+                Vec::new()
+            });
         info!(peers = peers.len(), "DHT lookup finished");
         peers
-    }
-}
-
-impl Drop for DhtSearch {
-    fn drop(&mut self) {
-        if let Some(handle) = &self.in_flight {
-            handle.abort();
-        }
     }
 }
 
@@ -92,14 +76,14 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dht = Dht::start(socket, Vec::new()).unwrap();
         let mut search = DhtSearch::new(dht, [1; 20], None);
-        assert_eq!(search.next, search.last);
-        let start = search.last;
-        search.next = start + LOOKUP_INTERVAL;
+        assert_eq!(search.timer.next, search.timer.last);
+        let start = search.timer.last;
+        search.timer.next = start + LOOKUP_INTERVAL;
         search.hurry();
-        assert_eq!(search.next, start + MIN_LOOKUP_INTERVAL);
+        assert_eq!(search.timer.next, start + MIN_LOOKUP_INTERVAL);
         // Never pushes a lookup back.
-        search.next = start + Duration::from_secs(1);
+        search.timer.next = start + Duration::from_secs(1);
         search.hurry();
-        assert_eq!(search.next, start + Duration::from_secs(1));
+        assert_eq!(search.timer.next, start + Duration::from_secs(1));
     }
 }

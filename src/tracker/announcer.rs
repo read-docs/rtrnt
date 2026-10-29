@@ -3,15 +3,15 @@
 //! finishes, and `stopped` at the end.
 
 use super::{AnnounceEvent, AnnounceRequest, AnnounceResponse, Tiers};
+use crate::periodic::Periodic;
 use crate::stats::TorrentStats;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::task::JoinHandle;
 use tokio::time::Instant;
-use tracing::{Instrument, debug, info, warn};
+use tracing::{debug, info, warn};
 
 /// Used when the tracker does not say how often to announce.
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -20,6 +20,9 @@ const MIN_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
 /// How long the final `completed` and `stopped` announces may take in total.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to wait before announcing `started` again when no tracker
+/// answered it. It doubles with each failure, up to the interval.
+const START_RETRY: Duration = Duration::from_secs(30);
 
 /// Payload bytes moved this session, as reported to the tracker.
 #[derive(Debug, Default)]
@@ -55,15 +58,16 @@ pub struct Announcer {
     interval: Duration,
     /// Shortest gap between announces the tracker allows.
     min_interval: Duration,
-    /// When the last announce was sent.
-    last: Instant,
-    /// When the next announce is due.
-    next: Instant,
+    /// When announces are sent. Each runs in the background, of the given
+    /// event, on a copy of the tiers that it hands back, reordered to put
+    /// the tracker that answered first.
+    timer: Periodic<(Tiers, AnnounceEvent, Result<AnnounceResponse>)>,
+    /// Whether a tracker has answered `started`. Until one has, that is the
+    /// announce sent, and retried.
+    answered: bool,
+    /// Announces of `started` in a row that no tracker answered.
+    failures: u32,
     completion: Completion,
-    /// A background announce, of the given event. It works on a copy of the
-    /// tiers and hands it back, reordered to put the tracker that answered
-    /// first.
-    in_flight: Option<JoinHandle<(Tiers, AnnounceEvent, Result<AnnounceResponse>)>>,
     /// Told what each tracker answered, and when the next announce is due.
     stats: Option<Arc<TorrentStats>>,
 }
@@ -71,21 +75,27 @@ pub struct Announcer {
 impl Announcer {
     /// Sends `request` as the `started` announce to the tracker `tiers`.
     /// Returns the announcer and the peers the tracker sent back, which may
-    /// be none.
+    /// be none. Fails if no tracker answered.
     pub async fn start(
         tiers: Vec<Vec<String>>,
         request: AnnounceRequest,
     ) -> Result<(Self, Vec<SocketAddr>)> {
-        Self::start_reporting(tiers, request, None).await
+        let (announcer, peers) = Self::start_reporting(tiers, request, None).await;
+        if !announcer.has_answered() {
+            bail!("no tracker answered the started announce");
+        }
+        Ok((announcer, peers))
     }
 
     /// `start`, recording in `stats` what each tracker answers, now and on
-    /// every announce after.
+    /// every announce after. Returns the announcer even when no tracker
+    /// answered, with the peers none: `poll` sends `started` again, after a
+    /// while.
     pub async fn start_reporting(
         tiers: Vec<Vec<String>>,
         request: AnnounceRequest,
         stats: Option<Arc<TorrentStats>>,
-    ) -> Result<(Self, Vec<SocketAddr>)> {
+    ) -> (Self, Vec<SocketAddr>) {
         if let Some(stats) = &stats {
             stats.set_trackers(&tiers);
         }
@@ -93,12 +103,17 @@ impl Announcer {
         announcer.stats = stats;
         let started = announcer.started;
         let stats = announcer.stats.clone();
-        let response = announcer
+        let result = announcer
             .trackers
             .announce_reporting(&started, |url, result| report(&stats, url, result))
-            .await?;
-        announcer.schedule(&response);
-        Ok((announcer, response.peers))
+            .await;
+        let peers = announcer.announced(AnnounceEvent::Started, result);
+        (announcer, peers)
+    }
+
+    /// Whether a tracker has answered the `started` announce.
+    pub fn has_answered(&self) -> bool {
+        self.answered
     }
 
     fn new(trackers: Tiers, request: AnnounceRequest, now: Instant) -> Self {
@@ -106,14 +121,15 @@ impl Announcer {
             trackers,
             started: AnnounceRequest {
                 event: AnnounceEvent::Started,
+                key: rand::random(),
                 ..request
             },
             interval: DEFAULT_INTERVAL,
             min_interval: MIN_INTERVAL,
-            last: now,
-            next: now + DEFAULT_INTERVAL,
+            timer: Periodic::new(now, now + DEFAULT_INTERVAL),
+            answered: false,
+            failures: 0,
             completion: Completion::Downloading,
-            in_flight: None,
             stats: None,
         }
     }
@@ -127,27 +143,51 @@ impl Announcer {
         self.interval = secs(response.interval)
             .unwrap_or(DEFAULT_INTERVAL)
             .clamp(self.min_interval, MAX_INTERVAL);
-        self.next = self.last + self.interval;
-        self.publish_next();
+        self.reschedule();
         debug!(interval = ?self.interval, "next announce scheduled");
+    }
+
+    /// Plans the next announce after the last one was sent: on the interval,
+    /// or sooner while `started` keeps failing, or while `completed` is
+    /// still to be sent, as soon as the tracker allows.
+    fn reschedule(&mut self) {
+        let wait = match self.completion {
+            _ if self.failures > 0 => {
+                let doubled = START_RETRY.saturating_mul(1 << (self.failures - 1).min(16));
+                doubled.min(self.interval)
+            }
+            Completion::Due => self.min_interval,
+            _ => self.interval,
+        };
+        self.timer.next = self.timer.last + wait;
+        self.publish_next();
     }
 
     /// Tells the stats when the next announce is due.
     fn publish_next(&self) {
         if let Some(stats) = &self.stats {
-            stats.set_next_announce(Some(self.next.into_std()));
+            stats.set_next_announce(Some(self.timer.next.into_std()));
         }
     }
 
     /// The request for `event`, reporting the bytes `downloaded` and
     /// `uploaded` since `started`.
-    fn request(&self, event: AnnounceEvent, (downloaded, uploaded): (u64, u64)) -> AnnounceRequest {
+    fn request(&self, event: AnnounceEvent, counts: (u64, u64)) -> AnnounceRequest {
+        Self::request_from(&self.started, event, counts)
+    }
+
+    /// `request`, from the `started` request.
+    fn request_from(
+        started: &AnnounceRequest,
+        event: AnnounceEvent,
+        (downloaded, uploaded): (u64, u64),
+    ) -> AnnounceRequest {
         AnnounceRequest {
             event,
             downloaded,
             uploaded,
-            left: self.started.left.saturating_sub(downloaded),
-            ..self.started
+            left: started.left.saturating_sub(downloaded),
+            ..*started
         }
     }
 
@@ -163,7 +203,7 @@ impl Announcer {
     pub fn complete(&mut self) {
         if self.completion == Completion::Downloading {
             self.completion = Completion::Due;
-            self.next = Instant::now();
+            self.timer.next = Instant::now();
             self.publish_next();
         }
     }
@@ -171,59 +211,71 @@ impl Announcer {
     /// Brings the next announce forward to the earliest the tracker allows,
     /// for when we have run out of peers.
     pub fn hurry(&mut self) {
-        self.next = self.next.min(self.last + self.min_interval);
+        self.timer.hurry(self.min_interval);
         self.publish_next();
     }
 
     /// Waits until the next announce is due, sends it in the background
     /// with the current `transferred` counts, and returns the peers it got
-    /// (none if every tracker failed). It is `completed` if the download has
-    /// finished since the last one, otherwise a regular announce.
+    /// (none if every tracker failed). It is `started` if no tracker has
+    /// answered that yet, else `completed` if the download has finished since
+    /// the last one, otherwise a regular announce.
     ///
     /// Cancel-safe: an announce already sent is kept, and the next call
     /// waits for its answer.
     pub async fn poll(&mut self, transferred: &Transferred) -> Vec<SocketAddr> {
-        if self.in_flight.is_none() {
-            tokio::time::sleep_until(self.next).await;
-            self.last = Instant::now();
-        }
         let event = match self.completion {
+            _ if !self.answered => AnnounceEvent::Started,
             Completion::Due => AnnounceEvent::Completed,
             _ => AnnounceEvent::Regular,
         };
-        let request = self.request(event, transferred.load());
-        let handle = self.in_flight.get_or_insert_with(|| {
-            let mut trackers = self.trackers.clone();
-            let stats = self.stats.clone();
-            let announce = async move {
+        let (started, tiers, stats) = (&self.started, &self.trackers, &self.stats);
+        let send = || {
+            let request = Self::request_from(started, event, transferred.load());
+            let (mut trackers, stats) = (tiers.clone(), stats.clone());
+            async move {
                 let result = trackers
                     .announce_reporting(&request, |url, result| report(&stats, url, result))
                     .await;
-                (trackers, request.event, result)
-            };
-            tokio::spawn(announce.in_current_span())
-        });
-        let (event, result) = match handle.await {
+                (trackers, event, result)
+            }
+        };
+        let (event, result) = match self.timer.poll(None, send).await {
             Ok((trackers, event, result)) => {
                 self.trackers = trackers;
                 (event, result)
             }
             Err(e) => (AnnounceEvent::Regular, Err(e.into())),
         };
-        self.in_flight = None;
+        self.announced(event, result)
+    }
+
+    /// Takes the `result` of the announce of `event`, returning its peers.
+    fn announced(
+        &mut self,
+        event: AnnounceEvent,
+        result: Result<AnnounceResponse>,
+    ) -> Vec<SocketAddr> {
         match result {
             Ok(response) => {
-                if event == AnnounceEvent::Completed {
-                    self.completion = Completion::Sent;
+                match event {
+                    AnnounceEvent::Started => {
+                        self.answered = true;
+                        self.failures = 0;
+                    }
+                    AnnounceEvent::Completed => self.completion = Completion::Sent,
+                    _ => {}
                 }
-                info!(peers = response.peers.len(), ?event, "re-announced");
+                info!(peers = response.peers.len(), ?event, "announced");
                 self.schedule(&response);
                 response.peers
             }
             Err(e) => {
-                warn!("re-announce failed: {e:#}");
-                self.next = self.last + self.interval;
-                self.publish_next();
+                if !self.answered {
+                    self.failures += 1;
+                }
+                warn!(?event, "announce failed: {e:#}");
+                self.reschedule();
                 Vec::new()
             }
         }
@@ -237,11 +289,12 @@ impl Announcer {
         if let Some(stats) = &self.stats {
             stats.set_next_announce(None);
         }
-        if let Some(handle) = self.in_flight.take() {
-            handle.abort();
-        }
+        self.timer.cancel();
         let counts = transferred.load();
-        let events: &[AnnounceEvent] = if self.completion == Completion::Due {
+        let events: &[AnnounceEvent] = if !self.answered {
+            // No tracker knows of us.
+            &[]
+        } else if self.completion == Completion::Due {
             &[AnnounceEvent::Completed, AnnounceEvent::Stopped]
         } else {
             &[AnnounceEvent::Stopped]

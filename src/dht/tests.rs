@@ -87,20 +87,18 @@ fn announce_needs_a_token_from_get_peers() {
     // The token is bound to the IP address, not the port.
     let (body, _) = ask(&mut state, announce(6881, false, &token), addr(5), now);
     response(body);
+    let get_peers = |state: &mut State| {
+        let query = Query::GetPeers {
+            info_hash: INFO_HASH,
+        };
+        response(ask(state, query, addr(1), now).0).values
+    };
+    assert_eq!(get_peers(&mut state), [addr(6881)]);
+    // The same host announcing again, with its source port as `implied_port`
+    // says, replaces its entry.
     let (body, _) = ask(&mut state, announce(0, true, &token), addr(7), now);
     response(body);
-
-    let (body, _) = ask(
-        &mut state,
-        Query::GetPeers {
-            info_hash: INFO_HASH,
-        },
-        addr(1),
-        now,
-    );
-    let mut values = response(body).values;
-    values.sort();
-    assert_eq!(values, [addr(7), addr(6881)]);
+    assert_eq!(get_peers(&mut state), [addr(7)]);
 }
 
 #[test]
@@ -115,4 +113,32 @@ fn unknown_methods_get_error_204() {
             ..
         }
     ));
+}
+
+#[tokio::test]
+async fn a_full_pending_table_does_not_evict_nodes() {
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let dht = Dht::start(socket, Vec::new()).unwrap();
+    let node = &dht.0.node;
+    let known = NodeInfo {
+        id: NodeId([2; 20]),
+        addr: addr(2),
+    };
+    {
+        let mut state = node.lock();
+        state.table.insert(known, Instant::now());
+        for tid in 0..MAX_PENDING as u16 {
+            let (reply, _) = oneshot::channel();
+            state.pending.insert(
+                tid,
+                Pending {
+                    addr: addr(3),
+                    reply,
+                },
+            );
+        }
+    }
+    // The ping cannot even be sent, which says nothing about the node.
+    Arc::clone(node).evict_check(known).await;
+    assert_eq!(node.lock().table.len(), 1);
 }

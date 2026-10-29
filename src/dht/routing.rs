@@ -216,7 +216,10 @@ impl RoutingTable {
             let can_split = index == self.buckets.len() - 1 && self.buckets.len() < ID_BITS;
             let bucket = &mut self.buckets[index];
             if let Some(entry) = bucket.entries.iter_mut().find(|e| e.node.id == node.id) {
-                *entry = Entry::new(node, now);
+                // In place, so that a ping in flight stays marked.
+                entry.node = node;
+                entry.last_seen = now;
+                entry.failures = 0;
                 bucket.last_changed = now;
                 return Insert::Updated;
             }
@@ -268,8 +271,20 @@ impl RoutingTable {
     /// After a questionable node answered our ping: the next questionable
     /// node of the bucket `id` is in, if one should be pinged.
     pub fn ping_next(&mut self, id: &NodeId, now: Instant) -> Option<NodeInfo> {
+        self.stop_pinging(id);
         let index = self.index(id);
         self.buckets[index].questionable_to_ping(now)
+    }
+
+    /// Gives up pinging `id` without evicting it, for a ping that could not
+    /// be sent.
+    pub fn stop_pinging(&mut self, id: &NodeId) {
+        let index = self.index(id);
+        for entry in &mut self.buckets[index].entries {
+            if entry.node.id == *id {
+                entry.pinging = false;
+            }
+        }
     }
 
     /// Drops a node that did not answer a ping, taking a replacement in.

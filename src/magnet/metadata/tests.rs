@@ -115,9 +115,10 @@ fn assembles_pieces_from_several_peers() {
     let size = data.len() as u32;
     let mut assembly = Assembly::new(hash);
     assert_eq!(assembly.claim(peer(1)), None, "size unknown");
-    assembly.join(size).unwrap();
-    assembly.join(size).unwrap();
-    assert!(assembly.join(size + 1).is_err());
+    assembly.join(peer(1), size).unwrap();
+    assembly.join(peer(2), size).unwrap();
+    assembly.join(peer(3), size).unwrap();
+    assert!(assembly.join(peer(4), size + 1).is_err());
 
     // Each peer gets the pieces fewest others were asked for.
     assert_eq!(assembly.claim(peer(1)), Some(0));
@@ -154,9 +155,13 @@ fn rejects_bad_sizes_and_lengths() {
     let (data, hash) = metadata(PIECE_LEN + 10);
     let size = data.len() as u32;
     let mut assembly = Assembly::new(hash);
-    assert!(assembly.join(0).is_err());
-    assert!(assembly.join(MAX_METADATA_SIZE as u32 + 1).is_err());
-    assembly.join(size).unwrap();
+    assert!(assembly.join(peer(1), 0).is_err());
+    assert!(
+        assembly
+            .join(peer(1), MAX_METADATA_SIZE as u32 + 1)
+            .is_err()
+    );
+    assembly.join(peer(1), size).unwrap();
     assert_eq!(assembly.claim(peer(1)), Some(0));
     assert_eq!(assembly.claim(peer(1)), Some(1));
     let err = assembly
@@ -174,7 +179,7 @@ fn bans_the_peer_behind_a_bad_copy() {
     let (data, hash) = metadata(PIECE_LEN * 2);
     let size = data.len() as u32;
     let mut assembly = Assembly::new(hash);
-    assembly.join(size).unwrap();
+    assembly.join(peer(1), size).unwrap();
     assert_eq!(assembly.claim(peer(1)), Some(0));
     assert_eq!(assembly.claim(peer(1)), Some(1));
     let mut bad = piece_of(&data, 1);
@@ -198,7 +203,7 @@ fn bans_the_peer_behind_a_bad_copy() {
         assembly.add(peer(1), 0, None, piece_of(&data, 0)).unwrap(),
         Added::Ignored
     );
-    assembly.join(size).unwrap();
+    assembly.join(peer(2), size).unwrap();
     assert_eq!(assembly.claim(peer(2)), Some(0));
 }
 
@@ -209,7 +214,8 @@ fn goes_one_peer_at_a_time_after_a_mixed_copy_fails() {
     let mut bad = piece_of(&data, 1);
     bad[0] ^= 1;
     let mut assembly = Assembly::new(hash);
-    assembly.join(size).unwrap();
+    assembly.join(peer(1), size).unwrap();
+    assembly.join(peer(2), size).unwrap();
     assert_eq!(assembly.claim(peer(1)), Some(0));
     assert_eq!(assembly.claim(peer(2)), Some(1));
     assembly.add(peer(1), 0, None, piece_of(&data, 0)).unwrap();
@@ -221,7 +227,8 @@ fn goes_one_peer_at_a_time_after_a_mixed_copy_fails() {
     assert!(!assembly.is_banned(peer(1)) && !assembly.is_banned(peer(2)));
 
     // From now on, a whole copy comes from one peer.
-    assembly.join(size).unwrap();
+    assembly.join(peer(1), size).unwrap();
+    assembly.join(peer(2), size).unwrap();
     assert_eq!(assembly.claim(peer(2)), Some(0));
     assert_eq!(assembly.claim(peer(1)), None);
     assert_eq!(assembly.claim(peer(2)), Some(1));
@@ -234,7 +241,8 @@ fn goes_one_peer_at_a_time_after_a_mixed_copy_fails() {
     );
 
     // Peer 1 takes over; when it leaves halfway, peer 3 starts over.
-    assembly.join(size).unwrap();
+    assembly.join(peer(1), size).unwrap();
+    assembly.join(peer(3), size).unwrap();
     assert_eq!(assembly.claim(peer(1)), Some(0));
     assembly.add(peer(1), 0, None, piece_of(&data, 0)).unwrap();
     assembly.leave(peer(1));
@@ -252,7 +260,8 @@ fn goes_one_peer_at_a_time_after_a_mixed_copy_fails() {
 fn a_leaving_peer_frees_its_pieces() {
     let (data, hash) = metadata(PIECE_LEN);
     let mut assembly = Assembly::new(hash);
-    assembly.join(data.len() as u32).unwrap();
+    assembly.join(peer(1), data.len() as u32).unwrap();
+    assembly.join(peer(2), data.len() as u32).unwrap();
     assert_eq!(assembly.claim(peer(1)), Some(0));
     assembly.leave(peer(1));
     assert_eq!(assembly.outstanding(peer(1)), 0);
@@ -266,4 +275,35 @@ fn a_leaving_peer_frees_its_pieces() {
         assembly.add(peer(2), 0, None, data).unwrap(),
         Added::Complete
     );
+}
+
+#[test]
+fn the_fetch_recovers_when_the_only_peer_leaves() {
+    let (data, hash) = metadata(PIECE_LEN + 10);
+    let size = data.len() as u32;
+    let mut assembly = Assembly::new(hash);
+    // Peer 1 gave a wrong size, and nobody else has joined.
+    assembly.join(peer(1), 1).unwrap();
+    assert_eq!(assembly.claim(peer(1)), Some(0));
+    let generation = assembly.generation();
+    assembly.leave(peer(1));
+    assert_ne!(assembly.generation(), generation, "peers must join again");
+
+    // The next peer is not held to the size the first one gave.
+    assembly.join(peer(2), size).unwrap();
+    assert_eq!(assembly.claim(peer(2)), Some(0));
+    assert_eq!(assembly.claim(peer(2)), Some(1));
+    assert_eq!(
+        assembly
+            .add(peer(2), 0, Some(size.into()), piece_of(&data, 0))
+            .unwrap(),
+        Added::Stored
+    );
+    assert_eq!(
+        assembly
+            .add(peer(2), 1, Some(size.into()), piece_of(&data, 1))
+            .unwrap(),
+        Added::Complete
+    );
+    assert_eq!(assembly.metadata(), Some(&data[..]));
 }

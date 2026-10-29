@@ -5,6 +5,7 @@ pub(super) fn request() -> AnnounceRequest {
         info_hash: [0xab; 20],
         peer_id: *b"-RT0100-abcdefghijkl",
         port: 6881,
+        key: 0x0102_0304,
         uploaded: 1,
         downloaded: 2,
         left: 3,

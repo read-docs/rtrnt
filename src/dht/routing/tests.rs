@@ -129,6 +129,29 @@ fn questionable_nodes_are_pinged_before_eviction() {
 }
 
 #[test]
+fn an_update_keeps_the_ping_in_flight() {
+    let start = Instant::now();
+    let mut t = table(start);
+    for n in 0..K as u8 {
+        t.insert(node(id_at(0, n), n.into()), start);
+    }
+    t.split(start);
+    t.insert(node(id_at(0, 50), 50), start);
+
+    let later = start + QUESTIONABLE_AFTER;
+    let Insert::PingFirst(first) = t.insert(node(id_at(0, 51), 51), later) else {
+        panic!("no ping asked for");
+    };
+    // The node answers some other query before its ping ends. That must not
+    // start a second ping in the bucket.
+    assert_eq!(t.insert(first, later), Insert::Updated);
+    assert_eq!(t.insert(node(id_at(0, 52), 52), later), Insert::Full);
+    // Once its ping ends, the next questionable node may be pinged.
+    let second = t.ping_next(&first.id, later).unwrap();
+    assert_ne!(second.id, first.id);
+}
+
+#[test]
 fn bad_nodes_are_replaced() {
     let now = Instant::now();
     let mut t = table(now);

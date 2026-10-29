@@ -132,14 +132,19 @@ impl Client {
             .await
     }
 
-    /// Our DHT node, started on the first call (trying the listening port
-    /// for UDP too), unless the DHT is off. A failure to start it is logged
-    /// once, and the session goes on without it.
+    /// Our DHT node, started on the first call (trying the port the
+    /// listener got for UDP too), unless the DHT is off. A failure to start
+    /// it is logged once, and the session goes on without it.
     pub async fn dht(&self) -> Option<Dht> {
         if !self.config.dht {
             return None;
         }
-        let port = self.config.listen_port;
+        // Not the configured port: with port 0 the listener picks its own.
+        let port = self
+            .listener()
+            .await
+            .port()
+            .unwrap_or(self.config.listen_port);
         let stats = &self.stats;
         let start = async move {
             let dht = Dht::bind(port)

@@ -37,12 +37,14 @@ pub(crate) enum Added {
 /// always one peer's.
 pub(crate) struct Assembly {
     info_hash: [u8; 20],
-    /// Bumped whenever the pieces are thrown away after a failed hash
-    /// check; peers must then `join` again.
+    /// Bumped whenever the pieces are thrown away, after a failed hash
+    /// check or because every peer left; peers must then `join` again.
     generation: u64,
     /// The metadata's length, as the first peer to `join` says.
     size: Option<usize>,
     pieces: Vec<Option<Received>>,
+    /// Peers that have joined since the pieces were last thrown away.
+    joined: HashSet<SocketAddr>,
     /// Pieces each peer has been asked for and not sent yet.
     requested: HashMap<SocketAddr, BTreeSet<u32>>,
     /// Whether every piece must come from the same peer.
@@ -62,6 +64,7 @@ impl Assembly {
             generation: 0,
             size: None,
             pieces: Vec::new(),
+            joined: HashSet::new(),
             requested: HashMap::new(),
             exclusive: false,
             owner: None,
@@ -93,10 +96,10 @@ impl Assembly {
         self.banned.contains(&peer)
     }
 
-    /// Takes on a peer whose extension handshake says the metadata is
+    /// Takes on `peer`, whose extension handshake says the metadata is
     /// `size` bytes long. The first peer to join sets the size; a peer that
     /// disagrees, or names a size over `MAX_METADATA_SIZE`, is not used.
-    pub(crate) fn join(&mut self, size: u32) -> Result<()> {
+    pub(crate) fn join(&mut self, peer: SocketAddr, size: u32) -> Result<()> {
         let size = size as usize;
         if size == 0 || size > MAX_METADATA_SIZE {
             bail!("peer says the metadata is {size} bytes, over the {MAX_METADATA_SIZE} we accept");
@@ -113,6 +116,7 @@ impl Assembly {
                     .collect();
             }
         }
+        self.joined.insert(peer);
         Ok(())
     }
 
@@ -210,20 +214,34 @@ impl Assembly {
                 None
             }
         };
+        self.restart();
+        Ok(Added::Failed { banned })
+    }
+
+    /// Throws away the size and the pieces, so that peers must `join`
+    /// again.
+    fn restart(&mut self) {
         self.generation += 1;
         self.size = None;
         self.pieces.clear();
+        self.joined.clear();
         self.requested.clear();
         self.owner = None;
-        Ok(Added::Failed { banned })
     }
 
     /// Forgets the pieces `peer` was asked for, once it is gone. In
     /// exclusive mode, if it was the peer being asked, the pieces it sent
-    /// are thrown away too, and the next peer starts over.
+    /// are thrown away too, and the next peer starts over. When the last
+    /// peer to have joined leaves with nothing verified, the size it gave
+    /// is forgotten as well, as it may have been wrong.
     pub(crate) fn leave(&mut self, peer: SocketAddr) {
         self.requested.remove(&peer);
-        if self.owner == Some(peer) && self.metadata.is_none() {
+        if self.metadata.is_some() {
+            return;
+        }
+        if self.joined.remove(&peer) && self.joined.is_empty() {
+            self.restart();
+        } else if self.owner == Some(peer) {
             self.owner = None;
             self.pieces.iter_mut().for_each(|piece| *piece = None);
         }

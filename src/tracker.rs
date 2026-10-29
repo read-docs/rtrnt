@@ -16,6 +16,9 @@ pub struct AnnounceRequest {
     pub info_hash: [u8; 20],
     pub peer_id: [u8; 20],
     pub port: u16,
+    /// Identifies us to UDP trackers across announces (BEP 15). Fixed for
+    /// the session: the `Announcer` picks it, whatever the caller sets.
+    pub key: u32,
     pub uploaded: u64,
     pub downloaded: u64,
     pub left: u64,

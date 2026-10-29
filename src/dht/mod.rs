@@ -20,11 +20,12 @@ mod token;
 
 pub use search::DhtSearch;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use krpc::{Body, ERROR_METHOD_UNKNOWN, ERROR_PROTOCOL, Message, Query, Response};
 use lookup::Lookup;
 use routing::{Insert, K, NodeId, NodeInfo, RoutingTable};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -187,7 +188,6 @@ struct State {
     store: PeerStore,
     /// Our queries waiting for an answer, by transaction id.
     pending: HashMap<u16, Pending>,
-    next_tid: u16,
     /// Resolved bootstrap routers. They help lookups but stay out of the
     /// table: they hold no peers and do not want the traffic.
     routers: HashSet<SocketAddrV4>,
@@ -200,7 +200,6 @@ impl State {
             tokens: Tokens::new(now),
             store: PeerStore::default(),
             pending: HashMap::new(),
-            next_tid: rand::random(),
             routers: HashSet::new(),
         }
     }
@@ -209,6 +208,21 @@ impl State {
 struct Pending {
     addr: SocketAddrV4,
     reply: oneshot::Sender<Result<Response>>,
+}
+
+/// Why a query got no response.
+enum QueryError {
+    /// We could not send it, or had no room to. Says nothing about the node.
+    Local(anyhow::Error),
+    /// The node never answered, or answered with an error.
+    Remote(anyhow::Error),
+}
+
+impl fmt::Display for QueryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (Self::Local(e) | Self::Remote(e)) = self;
+        write!(f, "{e:#}")
+    }
 }
 
 /// Forgets a query once nobody waits for its answer any more.
@@ -329,18 +343,21 @@ impl Node {
         let _ = pending.reply.send(reply);
     }
 
-    fn register(&self, addr: SocketAddrV4) -> Result<(u16, oneshot::Receiver<Result<Response>>)> {
+    fn register(
+        &self,
+        addr: SocketAddrV4,
+    ) -> Result<(u16, oneshot::Receiver<Result<Response>>), QueryError> {
         let mut state = self.lock();
         if state.pending.len() >= MAX_PENDING {
-            bail!("too many DHT queries in flight");
+            return Err(QueryError::Local(anyhow!("too many DHT queries in flight")));
         }
         let (reply, receiver) = oneshot::channel();
-        // Fewer than 65536 are pending, so a free id turns up.
-        let mut tid = state.next_tid;
+        // At most `MAX_PENDING` of 65536 ids are taken, so a free one turns
+        // up. Random ids keep an off-path sender from guessing ours.
+        let mut tid: u16 = rand::random();
         while state.pending.contains_key(&tid) {
-            tid = tid.wrapping_add(1);
+            tid = rand::random();
         }
-        state.next_tid = tid.wrapping_add(1);
         state.pending.insert(tid, Pending { addr, reply });
         Ok((tid, receiver))
     }
@@ -348,7 +365,11 @@ impl Node {
     /// Sends `query` to `addr` and waits for the answer, sending it again
     /// if none comes. A node that never answers counts as failed in the
     /// routing table.
-    async fn query(self: &Arc<Self>, addr: SocketAddrV4, query: Query) -> Result<Response> {
+    async fn query(
+        self: &Arc<Self>,
+        addr: SocketAddrV4,
+        query: Query,
+    ) -> Result<Response, QueryError> {
         let (tid, mut reply) = self.register(addr)?;
         let _unregister = Unregister { node: self, tid };
         let message = Message {
@@ -360,15 +381,16 @@ impl Node {
             self.socket
                 .send_to(&packet, addr)
                 .await
-                .context("cannot send DHT query")?;
+                .context("cannot send DHT query")
+                .map_err(QueryError::Local)?;
             match timeout(QUERY_TIMEOUT, &mut reply).await {
-                Ok(Ok(reply)) => return reply,
-                Ok(Err(_)) => bail!("DHT node stopped"),
+                Ok(Ok(reply)) => return reply.map_err(QueryError::Remote),
+                Ok(Err(_)) => return Err(QueryError::Local(anyhow!("DHT node stopped"))),
                 Err(_) => debug!(%addr, attempt, "DHT query timed out"),
             }
         }
         self.lock().table.failed(addr, Instant::now());
-        bail!("no answer from {addr}")
+        Err(QueryError::Remote(anyhow!("no answer from {addr}")))
     }
 
     /// Resolves the bootstrap routers to IPv4 addresses.
@@ -540,11 +562,16 @@ impl Node {
     /// the bucket's next questionable node for as long as they answer.
     async fn evict_check(self: Arc<Self>, mut node: NodeInfo) {
         loop {
-            let answered =
-                matches!(self.query(node.addr, Query::Ping).await, Ok(r) if r.id == node.id);
+            let result = self.query(node.addr, Query::Ping).await;
             let now = Instant::now();
             let mut state = self.lock();
-            if !answered {
+            if let Err(QueryError::Local(e)) = &result {
+                // The ping never went out, so the node stays.
+                debug!(addr = %node.addr, "cannot ping DHT node: {e:#}");
+                state.table.stop_pinging(&node.id);
+                return;
+            }
+            if !matches!(result, Ok(r) if r.id == node.id) {
                 debug!(addr = %node.addr, "evicting DHT node");
                 state.table.evict(&node.id, now);
                 return;

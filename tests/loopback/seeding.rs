@@ -259,6 +259,7 @@ async fn seeds_after_completion_until_the_ratio_is_reached() {
         info_hash,
         peer_id: generate_peer_id(),
         port: 6881,
+        key: 0,
         uploaded: 0,
         downloaded: 0,
         left: total,

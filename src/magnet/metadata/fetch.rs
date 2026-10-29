@@ -442,7 +442,7 @@ async fn fetch_pieces(shared: &Shared, conn: &mut PeerConnection) -> Result<()> 
             let mut requests = Vec::new();
             if let Some(size) = size {
                 if joined != Some(assembly.generation()) {
-                    assembly.join(size)?;
+                    assembly.join(addr, size)?;
                     joined = Some(assembly.generation());
                 }
                 while assembly.outstanding(addr) < PIPELINE {
