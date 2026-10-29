@@ -80,6 +80,28 @@ fn the_watch_directory_flags() {
     assert_eq!(args.watch_dir_delete(), Some(true));
 }
 
+#[test]
+fn the_completion_hook_flag_repeats_once_per_argument() {
+    let args = Args::try_parse_from(["rtrnt", "t.torrent"]).unwrap();
+    assert_eq!(args.settings.completion_hook, None);
+    let args = Args::try_parse_from([
+        "rtrnt",
+        "--completion-hook",
+        "sh",
+        "--completion-hook",
+        "-c",
+        "--completion-hook",
+        "echo $RTRNT_NAME",
+        "t.torrent",
+    ])
+    .unwrap();
+    assert_eq!(
+        args.settings.completion_hook,
+        Some(vec!["sh".into(), "-c".into(), "echo $RTRNT_NAME".into()])
+    );
+    assert_eq!(args.torrents.len(), 1);
+}
+
 /// The defaults are written into the help by hand, since clap does not
 /// know them; this keeps the help in step with `rtrnt::config`.
 #[test]

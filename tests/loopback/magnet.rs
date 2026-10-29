@@ -168,6 +168,7 @@ async fn downloads_a_magnet_link_banning_a_peer_with_bad_metadata() {
         dht: false,
         max_download_rate: 0,
         max_upload_rate: 0,
+        completion_hook: None,
         resume_dir: None,
     };
     let client = client(config);
@@ -348,6 +349,7 @@ async fn downloads_a_magnet_link_from_another_rtrnt() {
         dht: false,
         max_download_rate: 0,
         max_upload_rate: 0,
+        completion_hook: None,
         resume_dir: None,
     };
     let client = client(config);

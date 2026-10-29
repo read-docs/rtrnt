@@ -393,6 +393,7 @@ async fn fetch_and_download(
             }
             dht => dht,
         };
+        let completion = download::completion_for(&torrent, info_hash, config);
         let session = Arc::new(Session {
             torrent,
             info_hash,
@@ -405,6 +406,7 @@ async fn fetch_and_download(
             bars: client.bars().clone(),
             resume,
             stats: Arc::clone(stats),
+            completion,
         });
         let recheck = options.recheck != Recheck::No;
         let have =

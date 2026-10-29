@@ -46,6 +46,7 @@ fn config(output: &Path, resume: &Path) -> DownloadConfig {
         dht: false,
         max_download_rate: 0,
         max_upload_rate: 0,
+        completion_hook: None,
         resume_dir: Some(resume.to_path_buf()),
     }
 }
@@ -72,6 +73,7 @@ fn session(config: &DownloadConfig) -> Arc<Session> {
             "t",
             Path::new("."),
         )),
+        completion: None,
     })
 }
 
