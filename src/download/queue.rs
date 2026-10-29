@@ -105,6 +105,11 @@ impl PieceQueue {
         self
     }
 
+    /// `seeding`, for a torrent whose seed settings changed while it runs.
+    pub(super) fn set_seeding(&self, seed: bool) {
+        self.lock().seed = seed;
+    }
+
     pub(super) fn lock(&self) -> MutexGuard<'_, QueueState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::stats::TorrentState;
+use crate::torrent_limits::TorrentSettings;
 use crate::tui::snapshot::Detail;
 use crossterm::event::KeyEvent;
 use std::path::PathBuf;
@@ -25,6 +26,7 @@ pub(crate) fn torrent(hash: u8, name: &str) -> TorrentSnapshot {
         rate_down: 0.0,
         rate_up: 0.0,
         eta: None,
+        limits: TorrentSettings::default(),
     }
 }
 
@@ -990,6 +992,82 @@ fn o_toggles_sequential_download_of_the_selected_torrent() {
     assert_eq!(
         app.handle_key(key(KeyCode::Char('o')), &Snapshot::default()),
         Action::None
+    );
+}
+
+fn type_text(app: &mut App, snapshot: &Snapshot, text: &str) {
+    for c in text.chars() {
+        app.handle_key(key(KeyCode::Char(c)), snapshot);
+    }
+}
+
+#[test]
+fn capital_keys_set_the_selected_torrents_limits() {
+    let mut snapshot = snapshot(&["a", "b"]);
+    snapshot.torrents[0].limits = TorrentSettings {
+        download: 300,
+        upload: 0,
+        seed_ratio_milli: Some(1500),
+        seed_time: None,
+    };
+    let mut app = App::new(Theme::default());
+    app.ensure_selection(&snapshot);
+    let selected = snapshot.torrents[0].info_hash;
+    let prompt = |app: &App| {
+        let input = app.input.as_ref().unwrap();
+        (input.kind, input.text.clone())
+    };
+
+    app.handle_key(key(KeyCode::Char('D')), &snapshot);
+    assert_eq!(
+        prompt(&app),
+        (InputKind::TorrentDownloadLimit, "300".into())
+    );
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Backspace), &snapshot);
+    }
+    type_text(&mut app, &snapshot, "50");
+    let mut expected = snapshot.torrents[0].limits;
+    expected.download = 50;
+    assert_eq!(
+        app.handle_key(key(KeyCode::Enter), &snapshot),
+        Action::Command(Command::SetTorrentLimits {
+            info_hash: selected,
+            settings: expected,
+        })
+    );
+
+    app.handle_key(key(KeyCode::Char('U')), &snapshot);
+    assert_eq!(prompt(&app), (InputKind::TorrentUploadLimit, "0".into()));
+    app.handle_key(key(KeyCode::Esc), &snapshot);
+
+    // The seed ratio shows as typed, and empty goes back to the session's.
+    app.handle_key(key(KeyCode::Char('R')), &snapshot);
+    assert_eq!(prompt(&app), (InputKind::SeedRatio, "1.5".into()));
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Backspace), &snapshot);
+    }
+    let mut expected = snapshot.torrents[0].limits;
+    expected.seed_ratio_milli = None;
+    assert_eq!(
+        app.handle_key(key(KeyCode::Enter), &snapshot),
+        Action::Command(Command::SetTorrentLimits {
+            info_hash: selected,
+            settings: expected,
+        })
+    );
+
+    app.handle_key(key(KeyCode::Char('T')), &snapshot);
+    assert_eq!(prompt(&app), (InputKind::SeedTime, String::new()));
+    type_text(&mut app, &snapshot, "90");
+    let mut expected = snapshot.torrents[0].limits;
+    expected.seed_time = Some(90);
+    assert_eq!(
+        app.handle_key(key(KeyCode::Enter), &snapshot),
+        Action::Command(Command::SetTorrentLimits {
+            info_hash: selected,
+            settings: expected,
+        })
     );
 }
 

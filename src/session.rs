@@ -15,6 +15,7 @@ use crate::magnet::MagnetLink;
 use crate::source::Source;
 use crate::state::write_atomically;
 use crate::torrent;
+use crate::torrent_limits::TorrentSettings;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
@@ -35,6 +36,8 @@ pub struct SavedTorrent {
     /// Whether it downloads in order, if that was chosen rather than left
     /// to the configured default.
     pub sequential: Option<bool>,
+    /// What the torrent overrides of the session's limits and seed settings.
+    pub limits: TorrentSettings,
 }
 
 /// Download and upload limits in KiB/s, 0 for none.
@@ -135,6 +138,62 @@ struct StoredTorrent {
     /// 1 or 0 if chosen, left out if not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sequential: Option<i64>,
+    /// The torrent's own limits, left out while not set; files from before
+    /// they existed have none.
+    #[serde(default, skip_serializing_if = "StoredLimits::is_default")]
+    limits: StoredLimits,
+}
+
+/// `TorrentSettings` as it is written: each setting left out unless set.
+#[derive(Serialize, Deserialize, Default, PartialEq, Eq)]
+struct StoredLimits {
+    /// KiB/s.
+    #[serde(default, rename = "download limit", skip_serializing_if = "is_zero")]
+    download: u64,
+    #[serde(default, rename = "upload limit", skip_serializing_if = "is_zero")]
+    upload: u64,
+    /// Thousandths.
+    #[serde(
+        default,
+        rename = "seed ratio",
+        skip_serializing_if = "Option::is_none"
+    )]
+    seed_ratio_milli: Option<u32>,
+    /// Minutes.
+    #[serde(default, rename = "seed time", skip_serializing_if = "Option::is_none")]
+    seed_time: Option<u64>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+impl StoredLimits {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl From<TorrentSettings> for StoredLimits {
+    fn from(settings: TorrentSettings) -> Self {
+        Self {
+            download: settings.download,
+            upload: settings.upload,
+            seed_ratio_milli: settings.seed_ratio_milli,
+            seed_time: settings.seed_time,
+        }
+    }
+}
+
+impl From<StoredLimits> for TorrentSettings {
+    fn from(stored: StoredLimits) -> Self {
+        Self {
+            download: stored.download,
+            upload: stored.upload,
+            seed_ratio_milli: stored.seed_ratio_milli,
+            seed_time: stored.seed_time,
+        }
+    }
 }
 
 /// Just the version, read first so that a file of another version is
@@ -167,6 +226,7 @@ impl SavedSession {
                     source,
                     paused: i64::from(torrent.paused),
                     sequential: torrent.sequential.map(i64::from),
+                    limits: torrent.limits.into(),
                 })
             })
             .collect();
@@ -213,6 +273,7 @@ impl SavedSession {
                     source,
                     paused: entry.paused != 0,
                     sequential: entry.sequential.map(|sequential| sequential != 0),
+                    limits: entry.limits.into(),
                 })
             })
             .collect();

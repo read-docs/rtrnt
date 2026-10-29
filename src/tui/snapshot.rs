@@ -8,6 +8,7 @@ use crate::stats::{
     Layout, PeerFlags, PeerSource, PieceSnapshot, SessionStats, TorrentState, TorrentStats,
     TrackerStatus,
 };
+use crate::torrent_limits::TorrentSettings;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -81,6 +82,9 @@ pub struct TorrentSnapshot {
     pub rate_down: f64,
     pub rate_up: f64,
     pub eta: Option<Duration>,
+    /// What the torrent overrides of the session's limits and seed
+    /// settings.
+    pub limits: TorrentSettings,
 }
 
 impl TorrentSnapshot {
@@ -208,7 +212,11 @@ impl Snapshot {
             torrents: torrents
                 .iter()
                 .enumerate()
-                .map(|(order, torrent)| torrent_snapshot(torrent, order, now))
+                .map(|(order, torrent)| {
+                    let mut snapshot = torrent_snapshot(torrent, order, now);
+                    snapshot.limits = stats.torrent_settings(snapshot.info_hash);
+                    snapshot
+                })
                 .collect(),
             detail,
             logs: logs.tail(LOG_LINES),
@@ -257,6 +265,7 @@ fn torrent_snapshot(torrent: &TorrentStats, order: usize, now: Instant) -> Torre
         rate_down: 0.0,
         rate_up: 0.0,
         eta: None,
+        limits: TorrentSettings::default(),
     }
 }
 
@@ -390,6 +399,7 @@ mod tests {
             rate_down: 0.0,
             rate_up: 0.0,
             eta: None,
+            limits: TorrentSettings::default(),
         };
         assert_eq!(torrent.progress(), 0.25);
         assert_eq!(torrent.left(), None);

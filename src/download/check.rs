@@ -30,6 +30,7 @@ pub async fn check_file(torrent_path: &Path, output_dir: &Path) -> Result<()> {
         seed: SeedLimits::default(),
         dht: None,
         rate_limits: Arc::default(),
+        torrent_limits: Arc::default(),
         metadata: None,
         bars: MultiProgress::new(),
         resume: None,

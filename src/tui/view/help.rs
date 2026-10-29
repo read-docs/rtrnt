@@ -31,6 +31,8 @@ const KEYS: &[(&str, &str)] = &[
     ),
     ("a", "add a .torrent file or a magnet link"),
     ("d  u", "set the download or upload limit, in KiB/s"),
+    ("D  U", "the same for the selected torrent alone"),
+    ("R  T", "set its seed ratio or seed time, in minutes"),
     ("t", "alt speed on or off; d u edit the active limits"),
     ("m", "turn the mouse off to select text, and on again"),
     ("?", "this help"),

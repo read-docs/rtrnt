@@ -317,3 +317,93 @@ async fn a_change_wakes_the_waiters() {
         .await
         .expect("not woken");
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_nested_allowance_waits_for_the_slower_limit() {
+    // The torrent's limit is a tenth of the session's.
+    let outer = RateLimiter::new(RATE * 10);
+    let inner = RateLimiter::new(RATE);
+    let mut allowance = inner.allowance_within(&outer);
+    let start = Instant::now();
+    assert!(allowance.try_take(BLOCK, start));
+    assert!(!allowance.try_take(BLOCK, start));
+    // The torrent's bucket is the one in debt: 70 ms, as it is alone.
+    assert_eq!(
+        allowance.ready_at().unwrap() - start,
+        Duration::from_millis(70)
+    );
+    take(&mut allowance, BLOCK).await;
+    // Both paid for both blocks, and the outer one is far from empty.
+    let mut other = outer.allowance();
+    assert!(other.try_take(BLOCK, Instant::now()));
+    assert!(other.try_take(BLOCK, Instant::now()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_nested_allowance_waits_for_the_session_limit_too() {
+    let outer = RateLimiter::new(RATE);
+    let inner = RateLimiter::new(RATE * 10);
+    let mut a = inner.allowance_within(&outer);
+    let mut b = inner.allowance_within(&outer);
+    let start = Instant::now();
+    // The session's burst is one block and 9 KiB.
+    assert!(a.try_take(BLOCK, start));
+    // The torrent has room, the session does not: the block is not taken
+    // from the torrent's bucket until it can move.
+    assert!(!b.try_take(BLOCK, start));
+    assert!(b.is_waiting(start));
+    let ready = b.ready_at().unwrap();
+    assert!(ready > start);
+    assert!(b.try_take(BLOCK, ready));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_nested_allowance_unlimited_inside_is_the_outer_limit() {
+    let outer = RateLimiter::new(RATE);
+    let inner = RateLimiter::unlimited();
+    let mut allowance = inner.allowance_within(&outer);
+    let start = Instant::now();
+    assert!(allowance.try_take(BLOCK, start));
+    assert!(!allowance.try_take(BLOCK, start));
+    assert_eq!(
+        allowance.ready_at().unwrap() - start,
+        Duration::from_millis(70)
+    );
+    // Neither limited: never waits.
+    let free = RateLimiter::unlimited();
+    let mut none = free.allowance_within(&free);
+    assert!(none.try_take(BLOCK, start));
+    assert_eq!(none.ready_at(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn changing_the_inner_limit_applies_live() {
+    let outer = RateLimiter::unlimited();
+    let inner = RateLimiter::new(RATE);
+    let mut allowance = inner.allowance_within(&outer);
+    let start = Instant::now();
+    assert!(allowance.try_take(BLOCK, start));
+    assert!(!allowance.try_take(BLOCK, start));
+    let changed = inner.changed_with(&outer);
+    inner.set_rate(0);
+    changed.await;
+    assert!(allowance.try_take(BLOCK, start));
+    assert_eq!(allowance.ready_at(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn releasing_a_nested_allowance_gives_back_both() {
+    let outer = RateLimiter::new(RATE);
+    let inner = RateLimiter::new(RATE);
+    let start = Instant::now();
+    let mut a = inner.allowance_within(&outer);
+    assert!(a.try_take(BLOCK, start));
+    assert!(!a.try_take(BLOCK, start));
+    a.release();
+    drop(a);
+    // Only the first block is paid for: the burst of 25 KiB covers one
+    // more block once the reservation is returned, 9 KiB short.
+    let mut b = inner.allowance_within(&outer);
+    assert!(!b.try_take(BLOCK, start));
+    assert_eq!(b.ready_at().unwrap() - start, Duration::from_millis(70));
+}

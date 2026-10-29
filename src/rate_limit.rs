@@ -18,6 +18,10 @@
 //! arrival time" of the generic cell rate algorithm), so it needs no timer:
 //! each reservation just works out when its bytes are paid for.
 //!
+//! A torrent can have limits of its own on top of the session's: its peers
+//! then hold an allowance in both buckets (`RateLimiter::allowance_within`),
+//! and a block moves once both have paid for it.
+//!
 //! A limit can change while running (`RateLimiter::set_rate`). Reservations
 //! made before the change are made again at the new rate, and peers waiting
 //! for their turn are woken (`RateLimiter::changed`) to do so.
@@ -120,8 +124,28 @@ impl RateLimiter {
     /// A peer's share of this limit. Every peer gets its own.
     pub fn allowance(&self) -> Allowance<'_> {
         Allowance {
-            limiter: self,
-            reserved: None,
+            own: Share::new(self),
+            outer: None,
+        }
+    }
+
+    /// A peer's share of this limit nested in `outer`: bytes move only when
+    /// both let them, as with a torrent's limit inside the session's.
+    pub fn allowance_within<'a>(&'a self, outer: &'a RateLimiter) -> Allowance<'a> {
+        Allowance {
+            own: Share::new(self),
+            outer: Some(Share::new(outer)),
+        }
+    }
+
+    /// Resolves once this limit or `outer` changes after this call.
+    pub fn changed_with<'a>(&'a self, outer: &'a RateLimiter) -> impl Future<Output = ()> + 'a {
+        let (own, outer) = (self.changed(), outer.changed());
+        async move {
+            tokio::select! {
+                () = own => {}
+                () = outer => {}
+            }
         }
     }
 
@@ -213,29 +237,90 @@ struct Reservation {
     generation: u64,
 }
 
-/// One peer's share of a `RateLimiter` in one direction. It holds at most
-/// one reservation at a time, so peers take turns: one that wants more must
-/// queue up behind the others again.
+/// One peer's share of a `RateLimiter` in one direction, or of two nested
+/// ones (see `RateLimiter::allowance_within`): a torrent's limit inside the
+/// session's. It holds at most one reservation in each, so peers take turns:
+/// one that wants more must queue up behind the others again.
 ///
 /// A reservation that is not used is given back when the allowance is
 /// released or dropped. One made before the limit changed is dropped
 /// instead, as the bucket was reset then, and made again when next asked.
 #[derive(Debug)]
 pub struct Allowance<'a> {
-    limiter: &'a RateLimiter,
-    reserved: Option<Reservation>,
+    own: Share<'a>,
+    /// The limit `own` is inside of, if any: bytes must pass both.
+    outer: Option<Share<'a>>,
 }
 
 impl Allowance<'_> {
     /// Whether `bytes` may move now; if so, they are taken from the limit
-    /// and the caller must send (or request) them. If not, they are
-    /// reserved, and `ready_at` says when to ask again. Always true without
-    /// a limit.
+    /// (from both, if nested) and the caller must send (or request) them. If
+    /// not, they are reserved, and `ready_at` says when to ask again. Always
+    /// true without a limit.
     ///
     /// A reservation made for a different number of bytes (say, a request
     /// cancelled in the meantime, replaced by a short last block) still
     /// counts: the difference is charged or given back.
     pub fn try_take(&mut self, bytes: u64, now: Instant) -> bool {
+        // Both reserve, whatever the other says, so each holds its place in
+        // line while the slower one is waited for.
+        let own = self.own.is_ready(bytes, now);
+        let outer = self
+            .outer
+            .as_mut()
+            .is_none_or(|outer| outer.is_ready(bytes, now));
+        if !(own && outer) {
+            return false;
+        }
+        self.own.settle(bytes, now);
+        if let Some(outer) = &mut self.outer {
+            outer.settle(bytes, now);
+        }
+        true
+    }
+
+    /// When the reserved bytes may move, if any are reserved: when the
+    /// slowest limit lets them. A reservation made before a limit changed
+    /// does not count.
+    pub fn ready_at(&self) -> Option<Instant> {
+        let own = self.own.ready_at();
+        let outer = self.outer.as_ref().and_then(Share::ready_at);
+        own.into_iter().chain(outer).max()
+    }
+
+    /// Whether bytes are reserved that may not move yet.
+    pub fn is_waiting(&self, now: Instant) -> bool {
+        self.own.is_waiting(now) || self.outer.as_ref().is_some_and(|s| s.is_waiting(now))
+    }
+
+    /// Gives back the reservations, if any, for when there is nothing to
+    /// send any more (say, the peer choked us).
+    pub fn release(&mut self) {
+        self.own.release();
+        if let Some(outer) = &mut self.outer {
+            outer.release();
+        }
+    }
+}
+
+/// One peer's reservation in a single `RateLimiter`.
+#[derive(Debug)]
+struct Share<'a> {
+    limiter: &'a RateLimiter,
+    reserved: Option<Reservation>,
+}
+
+impl<'a> Share<'a> {
+    fn new(limiter: &'a RateLimiter) -> Self {
+        Self {
+            limiter,
+            reserved: None,
+        }
+    }
+
+    /// Whether `bytes` may move now, reserving them if there is no
+    /// reservation yet. The reservation stays, for `settle` to take.
+    fn is_ready(&mut self, bytes: u64, now: Instant) -> bool {
         let mut bucket = self.limiter.lock();
         let reserved = self
             .reserved
@@ -249,33 +334,41 @@ impl Allowance<'_> {
             ready: bucket.reserve(bytes, now),
             generation: bucket.generation,
         });
-        if reserved.ready > now {
-            self.reserved = Some(reserved);
-            return false;
-        }
-        if bytes > reserved.bytes {
-            bucket.charge(bytes - reserved.bytes, now);
-        } else if bytes < reserved.bytes {
-            bucket.refund(reserved.bytes - bytes, now);
-        }
-        true
+        self.reserved = Some(reserved);
+        reserved.ready <= now
     }
 
-    /// When the reserved bytes may move, if any are reserved. A reservation
-    /// made before the limit changed does not count.
-    pub fn ready_at(&self) -> Option<Instant> {
+    /// Takes the reservation, which is ready, for `bytes`: the difference
+    /// from what it was made for is charged or given back.
+    fn settle(&mut self, bytes: u64, now: Instant) {
+        let mut bucket = self.limiter.lock();
+        if bucket.rate == 0 {
+            self.reserved = None;
+            return;
+        }
+        match self.reserved.take() {
+            Some(reserved) if reserved.generation == bucket.generation => {
+                if bytes > reserved.bytes {
+                    bucket.charge(bytes - reserved.bytes, now);
+                } else if bytes < reserved.bytes {
+                    bucket.refund(reserved.bytes - bytes, now);
+                }
+            }
+            // The limit changed in between: pay for the bytes afresh.
+            _ => bucket.charge(bytes, now),
+        }
+    }
+
+    fn ready_at(&self) -> Option<Instant> {
         let reserved = self.reserved?;
         (reserved.generation == self.limiter.lock().generation).then_some(reserved.ready)
     }
 
-    /// Whether bytes are reserved that may not move yet.
-    pub fn is_waiting(&self, now: Instant) -> bool {
+    fn is_waiting(&self, now: Instant) -> bool {
         self.ready_at().is_some_and(|ready| ready > now)
     }
 
-    /// Gives back the reservation, if any, for when there is nothing to send
-    /// any more (say, the peer choked us).
-    pub fn release(&mut self) {
+    fn release(&mut self) {
         let Some(reserved) = self.reserved.take() else {
             return;
         };
@@ -286,7 +379,7 @@ impl Allowance<'_> {
     }
 }
 
-impl Drop for Allowance<'_> {
+impl Drop for Share<'_> {
     fn drop(&mut self) {
         self.release();
     }

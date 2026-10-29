@@ -8,6 +8,7 @@ use super::view::Areas;
 use crate::selection::Priority;
 use crate::source::Source;
 use crate::stats::TorrentState;
+use crate::torrent_limits::{TorrentSettings, format_ratio};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 use std::cmp::Ordering;
@@ -129,6 +130,14 @@ pub enum InputKind {
     Filter,
     DownloadLimit,
     UploadLimit,
+    /// The selected torrent's own download limit.
+    TorrentDownloadLimit,
+    /// The selected torrent's own upload limit.
+    TorrentUploadLimit,
+    /// The selected torrent's own seed ratio.
+    SeedRatio,
+    /// The selected torrent's own seed time.
+    SeedTime,
     /// A torrent to add.
     Add,
 }
@@ -140,6 +149,10 @@ impl InputKind {
             InputKind::Filter => "/",
             InputKind::DownloadLimit => "download limit, KiB/s (0: none): ",
             InputKind::UploadLimit => "upload limit, KiB/s (0: none): ",
+            InputKind::TorrentDownloadLimit => "torrent download limit, KiB/s (0: none): ",
+            InputKind::TorrentUploadLimit => "torrent upload limit, KiB/s (0: none): ",
+            InputKind::SeedRatio => "torrent seed ratio (0: none, empty: session's): ",
+            InputKind::SeedTime => "torrent seed time, minutes (0: none, empty: session's): ",
             InputKind::Add => "add: ",
         }
     }
@@ -148,7 +161,13 @@ impl InputKind {
     pub fn placeholder(self) -> Option<&'static str> {
         match self {
             InputKind::Add => Some("path to a .torrent or magnet link"),
-            InputKind::Filter | InputKind::DownloadLimit | InputKind::UploadLimit => None,
+            InputKind::Filter
+            | InputKind::DownloadLimit
+            | InputKind::UploadLimit
+            | InputKind::TorrentDownloadLimit
+            | InputKind::TorrentUploadLimit
+            | InputKind::SeedRatio
+            | InputKind::SeedTime => None,
         }
     }
 }
@@ -328,6 +347,12 @@ impl App {
         snapshot
             .torrent(self.selected?)
             .filter(|torrent| torrent.state != TorrentState::Removing)
+    }
+
+    /// The selected torrent, if `D`, `U`, `R` and `T` can set its limits:
+    /// not while it is being removed.
+    pub fn limitable<'a>(&self, snapshot: &'a Snapshot) -> Option<&'a TorrentSnapshot> {
+        self.removable(snapshot)
     }
 
     /// Selects the torrent with info hash `selected`, its detail panel
@@ -638,6 +663,27 @@ impl App {
             KeyCode::Char('/') => {
                 self.input = Some(Input::new(InputKind::Filter, self.filter.clone()));
             }
+            KeyCode::Char(c @ ('D' | 'U' | 'R' | 'T')) => {
+                if let Some(torrent) = self.limitable(snapshot) {
+                    let limits = torrent.limits;
+                    let (kind, text) = match c {
+                        'D' => (InputKind::TorrentDownloadLimit, limits.download.to_string()),
+                        'U' => (InputKind::TorrentUploadLimit, limits.upload.to_string()),
+                        'R' => (
+                            InputKind::SeedRatio,
+                            limits
+                                .seed_ratio_milli
+                                .map(format_ratio_input)
+                                .unwrap_or_default(),
+                        ),
+                        _ => (
+                            InputKind::SeedTime,
+                            limits.seed_time.map(|t| t.to_string()).unwrap_or_default(),
+                        ),
+                    };
+                    self.input = Some(Input::new(kind, text));
+                }
+            }
             KeyCode::Char('d') => {
                 let limit = snapshot.session.rate_limits.0.to_string();
                 self.input = Some(Input::new(InputKind::DownloadLimit, limit));
@@ -766,7 +812,40 @@ impl App {
         };
         let (down, up) = snapshot.session.rate_limits;
         let limit = || input.text.trim().parse::<u64>();
+        let kib_error = || "enter a whole number of KiB/s, 0 for none".to_string();
+        let current = self
+            .limitable(snapshot)
+            .map(|torrent| (torrent.info_hash, torrent.limits));
+        let own = |change: &dyn Fn(&mut TorrentSettings)| {
+            current.map(|(info_hash, mut settings)| {
+                change(&mut settings);
+                Command::SetTorrentLimits {
+                    info_hash,
+                    settings,
+                }
+            })
+        };
+        let text = input.text.trim().to_string();
         let command = match input.kind {
+            // The torrent may have gone while the line was open.
+            InputKind::TorrentDownloadLimit | InputKind::TorrentUploadLimit
+                if current.is_none() =>
+            {
+                return Action::None;
+            }
+            InputKind::SeedRatio | InputKind::SeedTime if current.is_none() => {
+                return Action::None;
+            }
+            InputKind::TorrentDownloadLimit => limit()
+                .map_err(|_| kib_error())
+                .map(|kib| own(&|s| s.download = kib).expect("checked above")),
+            InputKind::TorrentUploadLimit => limit()
+                .map_err(|_| kib_error())
+                .map(|kib| own(&|s| s.upload = kib).expect("checked above")),
+            InputKind::SeedRatio => parse_ratio(&text)
+                .map(|ratio| own(&|s| s.seed_ratio_milli = ratio).expect("checked above")),
+            InputKind::SeedTime => parse_minutes(&text)
+                .map(|time| own(&|s| s.seed_time = time).expect("checked above")),
             // Applied already, as it was typed.
             InputKind::Filter => return Action::None,
             InputKind::DownloadLimit => limit()
@@ -806,6 +885,39 @@ impl App {
             Action::Command(Command::Stop)
         }
     }
+}
+
+/// A seed ratio in thousandths as the input line shows it.
+fn format_ratio_input(milli: u32) -> String {
+    match milli {
+        0 => "0".to_string(),
+        milli => format_ratio(milli),
+    }
+}
+
+/// A seed ratio typed: nothing for the session's, else a decimal number,
+/// kept to thousandths. Comes in thousandths.
+fn parse_ratio(text: &str) -> Result<Option<u32>, String> {
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let error =
+        || "enter a ratio such as 1.5, 0 for none, or nothing for the session's".to_string();
+    let ratio: f64 = text.parse().map_err(|_| error())?;
+    if !ratio.is_finite() || !(0.0..=1_000_000.0).contains(&ratio) {
+        return Err(error());
+    }
+    Ok(Some((ratio * 1000.0).round() as u32))
+}
+
+/// A seed time typed, in minutes: nothing for the session's.
+fn parse_minutes(text: &str) -> Result<Option<u64>, String> {
+    if text.is_empty() {
+        return Ok(None);
+    }
+    text.parse().map(Some).map_err(|_| {
+        "enter a whole number of minutes, 0 for none, or nothing for the session's".to_string()
+    })
 }
 
 /// What is under `at`, of `areas` and what each is for.

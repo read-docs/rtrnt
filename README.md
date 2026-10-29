@@ -45,6 +45,8 @@ When stdout and stderr are terminals, a run shows a full-screen UI instead of pr
 | `space`, `+`/`-` | on the Files tab with the detail panel focused: skip the file under the cursor or download it again; raise or lower its priority (skip, normal, high) (see below) |
 | `a` | add a torrent: the path of a `.torrent` file (a relative one is taken from the directory rtrnt was started in) or a magnet link. It starts as one given on the command line would, with the same output directory and settings; one the session has already is refused, and so is a file that does not load, with a note at the bottom |
 | `d` / `u` | set the download / upload limit in KiB/s, 0 for none, until the run ends; the header shows the limits next to the rates. While the alternative speed mode is on they set its limits, not the normal ones |
+| `D` / `U` | the same for the selected torrent alone: its own download / upload limit in KiB/s, 0 for none. Its peers must pass both its limit and the session's, so the slower one rules; the Info tab shows them |
+| `R` / `T` | the selected torrent's own seed ratio, and its own seed time in minutes, in place of `--seed-ratio` and `--seed-time` for it: a number, 0 for no limit, or nothing to go by the session again. They apply at once, to a torrent already seeding too (set both to none while it seeds and it stops) |
 | `t` | switch the alternative speed limits ("turtle mode") on or off, until the schedule next changes; the header shows `alt speed` while they apply |
 | `m` | turn the mouse off, so the terminal can select text, or on again |
 | `?` | help |
@@ -78,7 +80,7 @@ Progress is saved in a resume file per torrent, `$XDG_STATE_HOME/rtrnt/resume/<i
 
 ### Session
 
-The terminal UI remembers its torrents between runs. The session file, `$XDG_STATE_HOME/rtrnt/session` (`~/.local/state/rtrnt/session` when that is unset), holds the torrents in the table's order, whether each was paused, and the rate limits once they are set from the UI (`d`, `u`). It is saved after every change and when the run ends; a torrent running when you quit is saved as running, so the next run starts it again, and a paused one comes back paused. A `.torrent` file is copied to `$XDG_STATE_HOME/rtrnt/torrents/<info hash>.torrent` when it is added, so moving or deleting the original does not lose the torrent; removing the torrent deletes the copy. At startup the session's torrents come first, then those on the command line (one the session has already is not added twice, and one it has paused is resumed). The rate limits are taken from the command line, then the session, then the config file, then the default; `--print-config` says `session` where the session's limits apply. A session file that cannot be read (another version, say) is moved to `session.bad` and the run starts empty.
+The terminal UI remembers its torrents between runs. The session file, `$XDG_STATE_HOME/rtrnt/session` (`~/.local/state/rtrnt/session` when that is unset), holds the torrents in the table's order, whether each was paused, the rate limits once they are set from the UI (`d`, `u`), and each torrent's own limits and seed settings (`D`, `U`, `R`, `T`), which a pause or a restart keeps too. Session files written before the per-torrent settings existed load as they were, with none set. It is saved after every change and when the run ends; a torrent running when you quit is saved as running, so the next run starts it again, and a paused one comes back paused. A `.torrent` file is copied to `$XDG_STATE_HOME/rtrnt/torrents/<info hash>.torrent` when it is added, so moving or deleting the original does not lose the torrent; removing the torrent deletes the copy. At startup the session's torrents come first, then those on the command line (one the session has already is not added twice, and one it has paused is resumed). The rate limits are taken from the command line, then the session, then the config file, then the default; `--print-config` says `session` where the session's limits apply. A session file that cannot be read (another version, say) is moved to `session.bad` and the run starts empty.
 
 Without the UI nothing is loaded or saved, so `rtrnt --no-tui x.torrent` still downloads that one torrent and exits. `session = true` in the config file keeps the session there too (the run then also restarts the session's torrents), `session = false` or `--no-session` turns it off in the UI. It is never used with `--check` or `--scrape`.
 
@@ -205,6 +207,7 @@ src/
 ├── storage/
 │   └── verify.rs    # Hash checks of the data on disk
 ├── torrent.rs     # Torrent file parsing and validation
+├── torrent_limits.rs # A torrent's own rate limits and seed settings, live
 ├── tracker.rs     # Tracker announce and scrape
 ├── tracker/
 │   ├── http.rs      # HTTP trackers

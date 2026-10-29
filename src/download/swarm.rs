@@ -94,7 +94,9 @@ pub(crate) async fn download_with(
         bail!("have {} piece flags for {num_pieces} pieces", have.len());
     }
     let Limits { max_peers, slots } = limits;
-    let seed = session.seed;
+    // The torrent's own seed settings count, and may change as it runs.
+    let torrent_limits = &session.torrent_limits;
+    let seed = torrent_limits.seed(session.seed);
     // Private torrents (BEP 27) get their peers from trackers only.
     let (pex, mut pex_peers) = PeerExchange::new(!torrent.is_private());
     let stats = &session.stats;
@@ -195,6 +197,12 @@ pub(crate) async fn download_with(
     let mut saved = 0;
     let mut next_save = Instant::now() + RESUME_SAVE_INTERVAL;
     loop {
+        // Made before the seed settings are read, so that a change meanwhile
+        // is not missed.
+        let mut seed_changed = std::pin::pin!(torrent_limits.seed_changed());
+        seed_changed.as_mut().enable();
+        let seed = torrent_limits.seed(session.seed);
+        queue.set_seeding(seed.enabled());
         if queue.is_done() {
             let since = match seeding_since {
                 Some(since) => since,
@@ -215,6 +223,11 @@ pub(crate) async fn download_with(
                     *seeding_since.insert(Instant::now())
                 }
             };
+            // Seeding limits set to none while seeding end it, as none at
+            // the start would have.
+            if !seed.enabled() {
+                break;
+            }
             let uploaded = progress.transferred.uploaded.load(Ordering::Relaxed);
             progress
                 .bar
@@ -346,6 +359,7 @@ pub(crate) async fn download_with(
                 }
             }
             () = &mut choking => {}
+            () = &mut seed_changed => {}
             () = queue.wait_for(|| queue.is_done()), if seeding_since.is_none() => {}
             () = tokio::time::sleep(SEED_CHECK), if seeding_since.is_some() => {}
             () = tokio::time::sleep_until(next_save), if session.resume.is_some() => {

@@ -135,8 +135,10 @@ pub(super) async fn peer_worker(
     let mut drained = false;
     // This peer's turns at the session's rate limits: for the blocks we ask
     // it for, and for the blocks it asks us for.
-    let mut download_budget = session.rate_limits.download.allowance();
-    let mut upload_budget = session.rate_limits.upload.allowance();
+    // The torrent's own limits come first, inside the session's.
+    let own = session.torrent_limits.rates();
+    let mut download_budget = own.download.allowance_within(&session.rate_limits.download);
+    let mut upload_budget = own.upload.allowance_within(&session.rate_limits.upload);
     // Fast extension: the allowed fast set we gave the peer, decided when it
     // first tells us its pieces (`None` until then, and empty unless it was
     // just starting out). Its requests for these pieces are served even
@@ -158,8 +160,8 @@ pub(super) async fn peer_worker(
         changed.as_mut().enable();
         // Likewise for a change of either rate limit, after which our turn
         // is worked out again at the new rate.
-        let download_changed = session.rate_limits.download.changed();
-        let upload_changed = session.rate_limits.upload.changed();
+        let download_changed = own.download.changed_with(&session.rate_limits.download);
+        let upload_changed = own.upload.changed_with(&session.rate_limits.upload);
         let mut limits_changed = std::pin::pin!(async move {
             tokio::select! {
                 () = download_changed => {}

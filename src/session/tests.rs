@@ -11,6 +11,7 @@ fn saved(byte: u8, paused: bool) -> SavedTorrent {
         source: magnet(byte),
         paused,
         sequential: None,
+        limits: TorrentSettings::default(),
     }
 }
 
@@ -25,12 +26,19 @@ fn a_session_round_trips() {
                 source: Source::parse(link).unwrap(),
                 paused: true,
                 sequential: Some(true),
+                limits: TorrentSettings {
+                    download: 50,
+                    upload: 20,
+                    seed_ratio_milli: Some(1500),
+                    seed_time: Some(0),
+                },
             },
             SavedTorrent {
                 info_hash: [2; 20],
                 source: Source::File("/state/torrents/0202.torrent".into()),
                 paused: false,
                 sequential: Some(false),
+                limits: TorrentSettings::default(),
             },
             saved(3, false),
         ],
@@ -81,18 +89,21 @@ fn an_entry_that_makes_no_sense_is_skipped() {
                 source: "/x.torrent".into(),
                 paused: 0,
                 sequential: None,
+                limits: StoredLimits::default(),
             },
             StoredTorrent {
                 info_hash: ByteBuf::from(vec![2; 20]),
                 source: "magnet:?dn=no-hash".into(),
                 paused: 0,
                 sequential: None,
+                limits: StoredLimits::default(),
             },
             StoredTorrent {
                 info_hash: ByteBuf::from(vec![3; 20]),
                 source: "/x.torrent".into(),
                 paused: 1,
                 sequential: None,
+                limits: StoredLimits::default(),
             },
         ],
         rate_limits: None,
@@ -106,6 +117,7 @@ fn an_entry_that_makes_no_sense_is_skipped() {
             source: Source::File("/x.torrent".into()),
             paused: true,
             sequential: None,
+            limits: TorrentSettings::default(),
         }]
     );
 }
@@ -232,4 +244,59 @@ fn the_alt_speed_state_round_trips_and_is_only_there_once_set() {
     let bytes = none.encode().unwrap();
     assert!(!String::from_utf8_lossy(&bytes).contains("alt speed"));
     assert_eq!(SavedSession::decode(&bytes).unwrap().alt_speed, None);
+}
+
+#[test]
+fn a_file_from_before_per_torrent_limits_loads_with_none() {
+    // The entry as the first version wrote it: no limits.
+    #[derive(Serialize)]
+    struct OldTorrent {
+        #[serde(rename = "info hash")]
+        info_hash: ByteBuf,
+        source: String,
+        paused: i64,
+    }
+    #[derive(Serialize)]
+    struct Old {
+        version: i64,
+        torrents: Vec<OldTorrent>,
+    }
+    let data = serde_bencode::to_bytes(&Old {
+        version: 1,
+        torrents: vec![OldTorrent {
+            info_hash: ByteBuf::from(vec![4; 20]),
+            source: "/x.torrent".into(),
+            paused: 1,
+        }],
+    })
+    .unwrap();
+    let decoded = SavedSession::decode(&data).unwrap();
+    assert_eq!(decoded.torrents.len(), 1);
+    assert!(decoded.torrents[0].paused);
+    assert!(decoded.torrents[0].limits.is_default());
+}
+
+#[test]
+fn unset_limits_are_not_written() {
+    let session = SavedSession {
+        torrents: vec![saved(1, false)],
+        rate_limits: None,
+        alt_speed: None,
+    };
+    let data = session.encode().unwrap();
+    assert!(!data.windows(6).any(|w| w == b"limits"));
+}
+
+#[test]
+fn a_zero_seed_override_is_kept_apart_from_unset() {
+    let mut torrent = saved(1, false);
+    torrent.limits.seed_ratio_milli = Some(0);
+    let session = SavedSession {
+        torrents: vec![torrent],
+        rate_limits: None,
+        alt_speed: None,
+    };
+    let decoded = SavedSession::decode(&session.encode().unwrap()).unwrap();
+    assert_eq!(decoded.torrents[0].limits.seed_ratio_milli, Some(0));
+    assert_eq!(decoded.torrents[0].limits.seed_time, None);
 }

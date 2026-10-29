@@ -8,6 +8,8 @@
 use crate::client::ConnectionSlots;
 use crate::dht::Dht;
 use crate::rate_limit::RateLimits;
+use crate::torrent_limits::{TorrentLimits, TorrentSettings};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -26,6 +28,8 @@ pub use torrent::{
 /// What every torrent of a `Client` shares, and the torrents themselves.
 pub struct SessionStats {
     torrents: Mutex<Vec<Arc<TorrentStats>>>,
+    /// What each torrent overrides of the session's settings, by info hash.
+    limits: Mutex<HashMap<[u8; 20], Arc<TorrentLimits>>>,
     /// Set once the DHT node is started.
     dht: OnceLock<Dht>,
     /// Set once the listening port is open.
@@ -46,6 +50,7 @@ impl SessionStats {
     pub fn new(rate_limits: Arc<RateLimits>, slots: ConnectionSlots) -> Self {
         Self {
             torrents: Mutex::new(Vec::new()),
+            limits: Mutex::new(HashMap::new()),
             dht: OnceLock::new(),
             port: OnceLock::new(),
             watch_dir: OnceLock::new(),
@@ -59,6 +64,26 @@ impl SessionStats {
     /// The torrents of the session, in the order they were added.
     pub fn torrents(&self) -> Vec<Arc<TorrentStats>> {
         lock(&self.torrents).clone()
+    }
+
+    /// The settings of the torrent with `info_hash`, which it keeps through
+    /// pauses and runs; made, with nothing overridden, if it has none yet.
+    pub fn torrent_limits(&self, info_hash: [u8; 20]) -> Arc<TorrentLimits> {
+        Arc::clone(lock(&self.limits).entry(info_hash).or_default())
+    }
+
+    /// The settings of the torrent with `info_hash`, none overridden if it
+    /// has none.
+    pub fn torrent_settings(&self, info_hash: [u8; 20]) -> TorrentSettings {
+        lock(&self.limits)
+            .get(&info_hash)
+            .map(|limits| limits.settings())
+            .unwrap_or_default()
+    }
+
+    /// Drops the settings of a torrent removed from the session.
+    pub fn forget_torrent_limits(&self, info_hash: [u8; 20]) {
+        lock(&self.limits).remove(&info_hash);
     }
 
     /// Adds a torrent called `name` (until its metadata says otherwise),
