@@ -159,6 +159,7 @@ pub fn status(theme: Theme, torrent: &TorrentSnapshot) -> (String, Color) {
     match &torrent.state {
         TorrentState::FetchingMetadata { .. } => ("metadata".into(), theme.metadata()),
         TorrentState::QueuedForChecking => ("queued".into(), theme.dim()),
+        TorrentState::Queued => ("queued".into(), theme.dim()),
         TorrentState::Checking { .. } => ("checking".into(), theme.warn()),
         TorrentState::Downloading => ("downloading".into(), theme.down()),
         TorrentState::Seeding => ("seeding".into(), theme.up()),

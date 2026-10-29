@@ -100,6 +100,20 @@ impl SessionStats {
         }
     }
 
+    /// Puts the torrents in the order of `info_hashes`, which is the
+    /// queue's. One not listed goes after the listed ones, in the order it
+    /// had.
+    pub fn arrange(&self, info_hashes: &[[u8; 20]]) {
+        let mut torrents = lock(&self.torrents);
+        let place = |torrent: &Arc<TorrentStats>| {
+            info_hashes
+                .iter()
+                .position(|hash| *hash == torrent.info_hash())
+                .unwrap_or(usize::MAX)
+        };
+        torrents.sort_by_key(place);
+    }
+
     /// Drops the row of `torrent`, removed from the session.
     pub fn remove_torrent(&self, torrent: &Arc<TorrentStats>) {
         lock(&self.torrents).retain(|kept| !Arc::ptr_eq(kept, torrent));

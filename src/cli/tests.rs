@@ -125,6 +125,14 @@ fn help_shows_the_defaults() {
             "max_upload_rate",
             config::DEFAULT_MAX_UPLOAD_RATE.to_string(),
         ),
+        (
+            "max_active_downloads",
+            config::DEFAULT_MAX_ACTIVE_DOWNLOADS.to_string(),
+        ),
+        (
+            "max_active_seeds",
+            config::DEFAULT_MAX_ACTIVE_SEEDS.to_string(),
+        ),
     ];
     for (id, default) in defaults {
         let help = command

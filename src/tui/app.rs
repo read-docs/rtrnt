@@ -286,8 +286,8 @@ impl App {
         }
     }
 
-    /// What `p` does to the selected torrent: pause it while it runs,
-    /// resume it once paused or ended (which retries one that failed), and
+    /// What `p` does to the selected torrent: pause it while it runs or
+    /// waits in the queue, resume it once paused or ended (which retries one that failed), and
     /// nothing while it is pausing or being removed. Comes with the key
     /// bar's word for it.
     pub fn pause_command(&self, snapshot: &Snapshot) -> Option<(Command, &'static str)> {
@@ -295,6 +295,8 @@ impl App {
         let hash = torrent.info_hash;
         match torrent.state {
             TorrentState::Pausing | TorrentState::Removing => None,
+            // Pausing a queued torrent takes it out of the queue.
+            TorrentState::Queued => Some((Command::Pause(hash), "pause")),
             ref state if state.is_finished() => Some((Command::Resume(hash), "resume")),
             _ => Some((Command::Pause(hash), "pause")),
         }
@@ -583,6 +585,16 @@ impl App {
             KeyCode::Char('p') => {
                 if let Some((command, _)) = self.pause_command(snapshot) {
                     return Action::Command(command);
+                }
+            }
+            KeyCode::Char('K') => {
+                if let Some(torrent) = self.selected {
+                    return Action::Command(Command::MoveUp(torrent));
+                }
+            }
+            KeyCode::Char('J') => {
+                if let Some(torrent) = self.selected {
+                    return Action::Command(Command::MoveDown(torrent));
                 }
             }
             KeyCode::Char('r') => {
