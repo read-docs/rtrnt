@@ -2,6 +2,7 @@
 //! names the torrent it wants, and the connection is handed to that
 //! torrent, which answers it, or dropped if we do not have the torrent.
 
+use crate::blocklist::Blocklist;
 use crate::peer::Incoming;
 use anyhow::{Result, bail};
 use rand::Rng;
@@ -54,8 +55,8 @@ impl Drop for Listener {
 impl Listener {
     /// Listens on `port`, or a free port if it is taken, over IPv4 and IPv6
     /// (see `listen`).
-    pub async fn bind(port: u16) -> Arc<Self> {
-        let listener = Self::start(listen(port).await);
+    pub async fn bind(port: u16, blocklist: Arc<Blocklist>) -> Arc<Self> {
+        let listener = Self::start(listen(port).await, blocklist);
         if let Some(port) = listener.port {
             info!(port, "listening for peers");
         }
@@ -64,14 +65,15 @@ impl Listener {
 
     /// Accepts peers on `listeners`, the first of which gives the port told
     /// to trackers and peers. Without any, no peer can connect to us.
-    pub fn start(listeners: Vec<TcpListener>) -> Arc<Self> {
+    /// Connections from addresses `blocklist` blocks are closed at once.
+    pub fn start(listeners: Vec<TcpListener>, blocklist: Arc<Blocklist>) -> Arc<Self> {
         let port = listeners
             .first()
             .and_then(|listener| listener.local_addr().ok())
             .map(|addr| addr.port());
         let routes = Arc::new(Routes::default());
         let task = (!listeners.is_empty())
-            .then(|| tokio::spawn(route(listeners, Arc::clone(&routes))).abort_handle());
+            .then(|| tokio::spawn(route(listeners, Arc::clone(&routes), blocklist)).abort_handle());
         Arc::new(Self { port, routes, task })
     }
 
@@ -128,12 +130,15 @@ impl Registration {
 
 /// Accepts peers on `listeners` and reads their handshakes, each on a task
 /// of its own so a slow peer holds up nobody, and hands each to the torrent
-/// it asks for in `routes`.
-async fn route(listeners: Vec<TcpListener>, routes: Arc<Routes>) {
+/// it asks for in `routes`, except those `blocklist` blocks.
+async fn route(listeners: Vec<TcpListener>, routes: Arc<Routes>, blocklist: Arc<Blocklist>) {
     let mut handshakes = JoinSet::new();
     loop {
         tokio::select! {
             (socket, addr) = accept(&listeners) => {
+                if blocklist.refuses(addr.ip()) {
+                    continue;
+                }
                 if handshakes.len() >= MAX_HANDSHAKING {
                     debug!(%addr, "turning away incoming peer: too many handshakes");
                     continue;

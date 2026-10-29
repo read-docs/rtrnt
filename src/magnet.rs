@@ -309,7 +309,7 @@ async fn fetch_and_download(
     let mut incoming = client.listener().await.register(info_hash)?;
     let listen_port = incoming.port();
     let tiers = link.tracker_tiers();
-    let mut pool = PeerPool::default();
+    let mut pool = PeerPool::with_blocklist(Arc::clone(client.blocklist()));
     pool.add(link.peers.iter().copied());
     let mut announcer = None;
     if !tiers.is_empty() {

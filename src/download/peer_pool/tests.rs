@@ -1,4 +1,5 @@
 use super::*;
+use crate::blocklist::Blocklist;
 
 fn addr(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
@@ -93,4 +94,16 @@ fn due_retries_queue_behind_fresh_peers_in_due_order() {
     pool.add([addr(3)]);
     let later = now + RETRY_BACKOFF * 2;
     assert_eq!(drain(&mut pool, later), [addr(3), addr(2), addr(1)]);
+}
+
+#[test]
+fn leaves_out_blocklisted_peers() {
+    let (list, _) = Blocklist::parse("10.0.0.0/8\n2001:db8::/32\n");
+    let mut pool = PeerPool::with_blocklist(Arc::new(list));
+    let blocked_v4 = SocketAddr::from(([10, 1, 2, 3], 6881));
+    let blocked_v6: SocketAddr = "[2001:db8::5]:6881".parse().unwrap();
+    pool.add([blocked_v4, addr(1), blocked_v6, addr(2)]);
+    assert_eq!(pool.len(), 2);
+    assert_eq!(drain(&mut pool, Instant::now()), [addr(1), addr(2)]);
+    assert_eq!(pool.blocklist.blocked(), 2);
 }

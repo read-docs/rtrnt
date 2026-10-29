@@ -195,6 +195,12 @@ options! {
     /// of renaming them to `<name>.added`.
     #[arg(skip)]
     watch_dir_delete: bool = Value(DEFAULT_WATCH_DIR_DELETE);
+    /// Refuse the peers listed in this file, whether they connect to us,
+    /// come from a tracker, the DHT or peer exchange. It holds PeerGuardian
+    /// (`name:1.2.3.4-1.2.3.255`) or eMule `ipfilter.dat` lines, CIDR blocks
+    /// or single addresses, IPv4 or IPv6; gzip is not read
+    #[arg(long, value_name = "FILE")]
+    blocklist: PathBuf = Unset("none");
 }
 
 /// Whether `ratio` is a valid seed ratio: a finite number, 0 or more.
@@ -307,6 +313,10 @@ pub fn parse(text: &str, home: Option<&Path>) -> Result<Options> {
     options.watch_dir = options
         .watch_dir
         .map(|dir| expand_tilde(dir, home))
+        .transpose()?;
+    options.blocklist = options
+        .blocklist
+        .map(|path| expand_tilde(path, home))
         .transpose()?;
     Ok(options)
 }

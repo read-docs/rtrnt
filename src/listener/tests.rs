@@ -1,4 +1,5 @@
 use super::*;
+use crate::blocklist::Blocklist;
 use crate::peer::{generate_peer_id, handshake_bytes};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -8,7 +9,7 @@ use tokio::net::TcpStream;
 async fn listener() -> (Arc<Listener>, SocketAddr) {
     let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = socket.local_addr().unwrap();
-    (Listener::start(vec![socket]), addr)
+    (Listener::start(vec![socket], Arc::default()), addr)
 }
 
 /// Connects to `addr` and sends a handshake for `info_hash`.
@@ -73,9 +74,32 @@ async fn a_torrent_is_registered_once() {
 
 #[tokio::test]
 async fn without_sockets_nobody_connects() {
-    let listener = Listener::start(Vec::new());
+    let listener = Listener::start(Vec::new(), Arc::default());
     assert_eq!(listener.port(), None);
     let mut a = listener.register([1; 20]).unwrap();
     let next = tokio::time::timeout(Duration::from_millis(50), a.next()).await;
     assert!(next.is_err());
+}
+
+#[tokio::test]
+async fn closes_connections_from_blocklisted_addresses() {
+    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    let (list, _) = Blocklist::parse("127.0.0.0/8\n");
+    let list = Arc::new(list);
+    let listener = Listener::start(vec![socket], Arc::clone(&list));
+    let mut a = listener.register([1; 20]).unwrap();
+
+    let mut blocked = connect(addr, [1; 20]).await;
+    let mut buf = [0u8; 1];
+    let read = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::io::AsyncReadExt::read(&mut blocked, &mut buf),
+    )
+    .await
+    .expect("connection left open");
+    assert!(matches!(read, Ok(0) | Err(_)), "answered a blocked peer");
+    let handed = tokio::time::timeout(Duration::from_millis(100), a.next()).await;
+    assert!(handed.is_err(), "handed over a blocked peer");
+    assert_eq!(list.blocked(), 1);
 }

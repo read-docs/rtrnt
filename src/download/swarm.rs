@@ -1,5 +1,6 @@
 use super::choker::Choker;
 use super::peer_pool::PeerPool;
+use crate::blocklist::Blocklist;
 use crate::client::{ConnectionSlots, SlotPermit};
 use crate::dht::DhtSearch;
 use crate::listener::Registration;
@@ -53,6 +54,16 @@ pub(crate) struct StartPeers {
     /// link came over, each with whether the peer connected to us and the
     /// connection slot it holds.
     pub(crate) connections: Vec<(PeerConnection, bool, SlotPermit)>,
+}
+
+impl StartPeers {
+    /// No peers yet, in a pool that leaves out those `blocklist` blocks.
+    pub(crate) fn with_blocklist(blocklist: Arc<Blocklist>) -> Self {
+        Self {
+            pool: PeerPool::with_blocklist(blocklist),
+            ..Self::default()
+        }
+    }
 }
 
 /// How many peers a download may be connected to.

@@ -1,8 +1,10 @@
 //! Every peer we know of, and when each may be tried (again).
 
+use crate::blocklist::Blocklist;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -19,6 +21,8 @@ pub(crate) struct PeerPool {
     retrying: Vec<(Instant, SocketAddr)>,
     /// Every peer ever added, so a tracker repeating it does not duplicate it.
     known: HashMap<SocketAddr, PeerState>,
+    /// Peers in these ranges are never added.
+    blocklist: Arc<Blocklist>,
 }
 
 #[derive(Default)]
@@ -29,10 +33,21 @@ struct PeerState {
 }
 
 impl PeerPool {
+    /// An empty pool that leaves out the peers `blocklist` blocks.
+    pub(crate) fn with_blocklist(blocklist: Arc<Blocklist>) -> Self {
+        Self {
+            blocklist,
+            ..Self::default()
+        }
+    }
+
     /// Adds peers not seen before. Known peers, including connected, retrying
-    /// and banned ones, are left alone.
+    /// and banned ones, are left alone, and so are blocklisted ones.
     pub(crate) fn add(&mut self, peers: impl IntoIterator<Item = SocketAddr>) {
         for addr in peers {
+            if self.blocklist.refuses(addr.ip()) {
+                continue;
+            }
             if let Entry::Vacant(entry) = self.known.entry(addr) {
                 entry.insert(PeerState::default());
                 self.ready.push_back(addr);
