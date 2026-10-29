@@ -18,6 +18,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer};
 use std::ffi::OsString;
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -79,6 +80,12 @@ impl ToToml for PathBuf {
 impl ToToml for f64 {
     fn to_toml(&self) -> String {
         toml::Value::from(*self).to_string()
+    }
+}
+
+impl ToToml for SocketAddr {
+    fn to_toml(&self) -> String {
+        toml::Value::from(self.to_string()).to_string()
     }
 }
 
@@ -270,6 +277,11 @@ options! {
     /// `to` before `from` runs past midnight into the next day.
     #[arg(skip)]
     alt_speed_schedule: Schedule = Unset("only by hand");
+    /// Serve Prometheus metrics at `http://ADDR/metrics`, such as
+    /// 127.0.0.1:9100; there is no authentication, so bind it to a loopback
+    /// or private address [default: off]
+    #[arg(long, value_name = "ADDR")]
+    metrics_listen: SocketAddr = Unset("off");
 }
 
 /// Whether `ratio` is a valid seed ratio: a finite number, 0 or more.

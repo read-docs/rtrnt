@@ -366,3 +366,39 @@ fn parses_info_and_create() {
     // And the download options do not go with a subcommand.
     assert!(Args::try_parse_from(["rtrnt", "info", "a.torrent", "--check"]).is_err());
 }
+
+/// --json replaces the UI, even where the terminal would show it, and
+/// goes with neither --tui nor the modes that print something else.
+#[test]
+fn json_replaces_the_ui_and_conflicts_with_the_modes_that_print() {
+    let args = Args::try_parse_from(["rtrnt", "--json", "a.torrent"]).unwrap();
+    assert!(args.json);
+    assert!(!args.use_tui(Some(true), || true));
+    assert!(args.check_torrents(false, false).is_ok());
+    let args = Args::try_parse_from(["rtrnt", "a.torrent"]).unwrap();
+    assert!(!args.json);
+    for other in ["--tui", "--check", "--scrape", "--print-config"] {
+        assert!(
+            Args::try_parse_from(["rtrnt", "--json", other, "a.torrent"]).is_err(),
+            "{other}"
+        );
+    }
+    // Without a torrent there is nothing to report, as without the UI.
+    let args = Args::try_parse_from(["rtrnt", "--json"]).unwrap();
+    assert!(
+        args.check_torrents(args.use_tui(None, || true), false)
+            .is_err()
+    );
+}
+
+#[test]
+fn metrics_listen_takes_an_address() {
+    let args = Args::try_parse_from(["rtrnt", "--metrics-listen", "127.0.0.1:9100", "a"]).unwrap();
+    assert_eq!(
+        args.options().metrics_listen,
+        Some("127.0.0.1:9100".parse().unwrap())
+    );
+    assert!(Args::try_parse_from(["rtrnt", "--metrics-listen", "9100", "a"]).is_err());
+    let args = Args::try_parse_from(["rtrnt", "a"]).unwrap();
+    assert_eq!(args.options().metrics_listen, None);
+}

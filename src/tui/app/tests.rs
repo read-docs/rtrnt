@@ -20,6 +20,7 @@ pub(crate) fn torrent(hash: u8, name: &str) -> TorrentSnapshot {
         downloaded: 0,
         uploaded: 0,
         peers: 0,
+        seeds: 0,
         pool: 0,
         active: Duration::ZERO,
         order: hash as usize,

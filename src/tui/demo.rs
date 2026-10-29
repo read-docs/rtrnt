@@ -441,6 +441,7 @@ impl DemoFeed {
                 downloaded: live.received as u64,
                 uploaded: live.uploaded as u64,
                 peers: live.torrent.peers,
+                seeds: live.torrent.peers / 4,
                 pool: live.torrent.peers * 11,
                 active: Duration::from_secs_f64(9720.0 + t),
                 order: i,

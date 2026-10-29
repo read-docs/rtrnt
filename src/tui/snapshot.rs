@@ -74,6 +74,8 @@ pub struct TorrentSnapshot {
     pub downloaded: u64,
     pub uploaded: u64,
     pub peers: usize,
+    /// Of the connected peers, those that have every piece.
+    pub seeds: usize,
     /// Peers known, connected or not.
     pub pool: usize,
     /// How long the torrent has been running this session, or ran, not
@@ -262,11 +264,21 @@ impl Snapshot {
 }
 
 fn torrent_snapshot(torrent: &TorrentStats, order: usize, now: Instant) -> TorrentSnapshot {
+    let peers = torrent.peers();
+    let layout = torrent.layout().cloned();
+    // A peer with no piece of a torrent whose size is not known yet is not
+    // a seed.
+    let seeds = layout.as_ref().map_or(0, |layout| {
+        peers
+            .iter()
+            .filter(|peer| layout.pieces > 0 && peer.pieces() as usize >= layout.pieces)
+            .count()
+    });
     TorrentSnapshot {
         info_hash: torrent.info_hash(),
         name: torrent.name(),
         state: torrent.state(),
-        layout: torrent.layout().cloned(),
+        layout,
         priorities: torrent.priorities().unwrap_or_default(),
         sequential: torrent.sequential(),
         wanted: torrent.wanted(),
@@ -275,7 +287,8 @@ fn torrent_snapshot(torrent: &TorrentStats, order: usize, now: Instant) -> Torre
         received: torrent.received(),
         downloaded: torrent.downloaded(),
         uploaded: torrent.uploaded(),
-        peers: torrent.peers().len(),
+        peers: peers.len(),
+        seeds,
         pool: torrent.pool(),
         active: torrent.active(now),
         order,
@@ -423,6 +436,7 @@ mod tests {
             downloaded: 0,
             uploaded: 0,
             peers: 0,
+            seeds: 0,
             pool: 0,
             active: Duration::ZERO,
             order: 0,

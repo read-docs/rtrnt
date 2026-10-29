@@ -13,6 +13,7 @@ pub mod info;
 pub mod listener;
 pub mod magnet;
 pub mod manager;
+pub mod metrics;
 pub mod peer;
 mod periodic;
 pub mod portmap;
