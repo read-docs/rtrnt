@@ -76,6 +76,13 @@ macro_rules! to_toml_by_display {
     )*};
 }
 
+/// An argument list is a TOML array of strings.
+impl ToToml for Vec<String> {
+    fn to_toml(&self) -> String {
+        toml::Value::from(self.clone()).to_string()
+    }
+}
+
 to_toml_by_display!(bool, u16, u64, usize);
 
 /// One setting as `describe` sees it.
@@ -201,6 +208,15 @@ options! {
     /// or single addresses, IPv4 or IPv6; gzip is not read
     #[arg(long, value_name = "FILE")]
     blocklist: PathBuf = Unset("none");
+    /// Run a command when a torrent finishes downloading, with the name,
+    /// path and info hash in $RTRNT_NAME, $RTRNT_PATH and
+    /// $RTRNT_INFO_HASH. The command is run directly, not through a shell:
+    /// give the program, then repeat the flag for each argument, as in
+    /// `--completion-hook notify-send --completion-hook Done`. Not run for
+    /// a torrent that was already complete (`completion-hook = ["..."]` in
+    /// the config file) [default: none]
+    #[arg(long, value_name = "ARG", allow_hyphen_values = true)]
+    completion_hook: Vec<String> = Unset("none");
 }
 
 /// Whether `ratio` is a valid seed ratio: a finite number, 0 or more.
@@ -247,6 +263,7 @@ impl Options {
             dht: self.dht.unwrap_or(DEFAULT_DHT),
             max_download_rate: self.max_download_rate.unwrap_or(DEFAULT_MAX_DOWNLOAD_RATE),
             max_upload_rate: self.max_upload_rate.unwrap_or(DEFAULT_MAX_UPLOAD_RATE),
+            completion_hook: self.completion_hook,
             resume_dir: resume::default_dir(
                 std::env::var_os("XDG_STATE_HOME"),
                 std::env::home_dir().as_deref(),

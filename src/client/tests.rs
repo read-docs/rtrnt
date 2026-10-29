@@ -11,6 +11,7 @@ fn client(dht: bool) -> Client {
         dht,
         max_download_rate: 64,
         max_upload_rate: 0,
+        completion_hook: None,
         resume_dir: None,
     };
     Client::new(config, MultiProgress::new())

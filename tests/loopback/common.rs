@@ -307,6 +307,7 @@ pub(crate) fn limited_session(
         bars: MultiProgress::new(),
         resume: None,
         stats: Arc::new(TorrentStats::new(info_hash, "test", Path::new("."))),
+        completion: None,
     })
 }
 
@@ -340,6 +341,7 @@ pub(crate) fn resume_config(out: &Path, state: &Path) -> DownloadConfig {
         dht: false,
         max_download_rate: 0,
         max_upload_rate: 0,
+        completion_hook: None,
         resume_dir: Some(state.to_path_buf()),
     }
 }

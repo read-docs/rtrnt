@@ -6,6 +6,7 @@ pub mod client;
 pub mod config;
 pub mod dht;
 pub mod download;
+pub mod hook;
 pub mod listener;
 pub mod magnet;
 pub mod manager;

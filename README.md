@@ -77,13 +77,15 @@ Without the UI nothing is loaded or saved, so `rtrnt --no-tui x.torrent` still d
 
 `--watch-dir <DIR>` (`watch-dir` in the config file) takes the `.torrent` files, and the `.magnet` files whose first line is a magnet link, that appear in a directory, as rTorrent and Transmission do. The directory is looked at every 2 seconds, and a file is taken once its size and modification time are the same on two looks in a row, so a download a browser has not finished is left alone. A file that does not parse is renamed to `<name>.invalid` and a notice says why. Otherwise the torrent is added as by `a` in the UI, and the file is renamed to `<name>.added`, or deleted with `--watch-dir-delete` (`watch-dir-delete = true`). A `.torrent` is first copied into `$XDG_STATE_HOME/rtrnt/torrents/` (the session's store, which is used for this even when the session is not kept), and the torrent runs from the copy, so the rename or delete does not lose it; if there is no state directory the file is used where it is and left alone. The header shows the directory. With a watch directory the run does not end with the last torrent and none is needed on the command line: without the UI it goes on until Ctrl-C, which stops the watching as well.
 
+`--completion-hook <ARG>` (`completion-hook` in the config file, a list of strings) runs a command when a torrent finishes downloading, as Transmission's `script-torrent-done` does. The first argument is the program and the rest are its arguments, so on the command line the flag is repeated once per argument (`--completion-hook notify-send --completion-hook "download complete"`). The command is run directly, never through a shell, so nothing a torrent contains can change what runs; the torrent's details are passed only as environment variables: `RTRNT_NAME` (the torrent's name), `RTRNT_PATH` (the download directory joined with the name), `RTRNT_DIR` (the download directory) and `RTRNT_INFO_HASH` (lowercase hex). To use them in a script, run it with a shell yourself: `["sh", "-c", "mv \"$RTRNT_PATH\" ~/done/"]`. It runs once, in the background, when the last piece is verified, and not for a torrent that was already complete when it was added or resumed. It has no input or output (the terminal UI owns the terminal), and its exit status or failure to start is logged. rtrnt does not wait for it, but does not stop it either at exit.
+
 ### IP blocklist
 
 `--blocklist <FILE>` (`blocklist` in the config file) refuses the peers whose addresses are in a list file, as Transmission and qBittorrent do. The file may mix PeerGuardian text lines (`name:1.2.3.4-1.2.3.255`), eMule `ipfilter.dat` lines (`1.2.3.4 - 1.2.3.255 , 000 , name`, where an access level of 128 or more means the range is allowed, so it is skipped), CIDR blocks (`10.0.0.0/8`, `2001:db8::/32`), single addresses and bare ranges, over IPv4 and IPv6. Blank lines and lines starting with `#`, `;` or `//` are skipped, and a line that fits no format is skipped and counted in a warning. Gzipped lists are not read: decompress them first. Peers from trackers, the DHT, peer exchange and magnet links are left out of the peer pool, and connections from listed addresses are closed as soon as they are accepted. The number of ranges loaded is logged, and a list that cannot be read stops the start.
 
 ### Config file
 
-Every option except `--check`, `--recheck`, `--select-file`, `--scrape`, `--config` and `--print-config` can also be set in `~/.config/rtrnt/config.toml` (or `$XDG_CONFIG_HOME/rtrnt/config.toml`), or in a file given with `--config <PATH>`. Keys are the long option names, except that `--no-dht` is `dht = false`, `--no-tui` is `tui = false`, `--no-session` is `session = false` and `--watch-dir-delete` is `watch-dir-delete = true`, and every key is optional:
+Every option except `--check`, `--recheck`, `--select-file`, `--scrape`, `--config` and `--print-config` can also be set in `~/.config/rtrnt/config.toml` (or `$XDG_CONFIG_HOME/rtrnt/config.toml`), or in a file given with `--config <PATH>`. Keys are the long option names, except that `--no-dht` is `dht = false`, `--no-tui` is `tui = false`, `--no-session` is `session = false` `--watch-dir-delete` is `watch-dir-delete = true` and `--completion-hook` is a `completion-hook` list, and every key is optional:
 
 ```toml
 output = "~/Downloads"
@@ -99,6 +101,7 @@ tui = false
 watch-dir = "~/torrents"
 watch-dir-delete = false
 blocklist = "~/p2p.txt"
+completion-hook = ["notify-send", "rtrnt", "download complete"]
 ```
 
 A flag on the command line overrides the file, and the file overrides the built-in defaults. `--print-config` shows the effective settings and where each one came from. Unknown keys are errors, so typos don't go unnoticed.

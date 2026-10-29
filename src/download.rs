@@ -1,5 +1,6 @@
 use crate::client::{Claim, Client, ConnectionSlots};
 use crate::dht::Dht;
+use crate::hook::Completion;
 use crate::listener::Listener;
 use crate::manager::{Recheck, StartOptions};
 use crate::rate_limit::RateLimits;
@@ -55,6 +56,9 @@ pub struct DownloadConfig {
     /// Most block data to upload per second, in KiB, across all peers; 0
     /// for no limit.
     pub max_upload_rate: u64,
+    /// Command to run when a torrent finishes downloading: the program and
+    /// its arguments (see `hook`); `None` for none.
+    pub completion_hook: Option<Vec<String>>,
     /// Directory the resume files (see `resume`) are kept in, or `None` to
     /// keep none.
     pub resume_dir: Option<PathBuf>,
@@ -113,6 +117,9 @@ pub struct Session {
     pub resume: Option<Target>,
     /// Where the download publishes its progress and its peers.
     pub stats: Arc<TorrentStats>,
+    /// Run when the download finishes this session (not for one complete
+    /// from the start), if the settings give a command.
+    pub completion: Option<Completion>,
 }
 
 impl Session {
@@ -261,6 +268,7 @@ async fn download_loaded(
     let storage =
         Arc::new(Storage::new_async(&torrent.info, &config.output_dir, &selection).await?);
     let dht = start_dht(&torrent, client).await;
+    let completion = completion_for(&torrent, info_hash, config);
     let session = Arc::new(Session {
         torrent,
         info_hash,
@@ -273,6 +281,7 @@ async fn download_loaded(
         bars: client.bars().clone(),
         resume,
         stats: Arc::clone(stats),
+        completion,
     });
 
     let mut shutdown = std::pin::pin!(shutdown);
@@ -343,6 +352,20 @@ async fn download_loaded(
     .await?;
     info!(output = %config.output_dir.display(), "done");
     Ok(())
+}
+
+/// The completion hook the settings give for `torrent`, if any.
+pub(crate) fn completion_for(
+    torrent: &TorrentFile,
+    info_hash: [u8; 20],
+    config: &DownloadConfig,
+) -> Option<Completion> {
+    Completion::new(
+        config.completion_hook.as_deref()?,
+        &torrent.info.name,
+        &config.output_dir,
+        info_hash,
+    )
 }
 
 /// The client's DHT node, unless disabled or the torrent is private. It

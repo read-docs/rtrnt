@@ -257,7 +257,8 @@ fn describe_names_each_source() {
          # session: only in the terminal UI  # default\n\
          # watch-dir: none  # default\n\
          watch-dir-delete = false  # default\n\
-         # blocklist: none  # default\n"
+         # blocklist: none  # default\n\
+         # completion-hook: none  # default\n"
     );
     // The settings part is valid TOML that parses to the same values.
     let reparsed = parse(&text, None).unwrap();
@@ -400,5 +401,53 @@ fn the_blocklist_comes_from_the_command_line_or_the_file() {
     assert!(
         text.contains("blocklist = \"/home/me/p2p.txt\"  # config file\n"),
         "{text}"
+    );
+}
+
+#[test]
+fn the_completion_hook_is_an_argument_list() {
+    let file = parse(
+        "completion-hook = [\"notify-send\", \"Done\", \"--urgency=low\"]\n",
+        None,
+    )
+    .unwrap();
+    let argv: Vec<String> = ["notify-send", "Done", "--urgency=low"]
+        .map(String::from)
+        .into();
+    assert_eq!(file.completion_hook, Some(argv.clone()));
+    // A single string would be a shell command line, and is refused.
+    assert!(parse("completion-hook = \"notify-send Done\"\n", None).is_err());
+
+    let cli = Options {
+        completion_hook: Some(vec!["other".to_string()]),
+        ..Options::default()
+    };
+    let config = ConfigFile {
+        path: None,
+        options: file.clone(),
+    };
+    let text = describe(&cli, &Options::default(), &config);
+    assert!(
+        text.contains("completion-hook = [\"other\"]  # command line\n"),
+        "{text}"
+    );
+    let text = describe(&Options::default(), &Options::default(), &config);
+    assert!(
+        text.contains(
+            "completion-hook = [\"notify-send\", \"Done\", \"--urgency=low\"]  # config file\n"
+        ),
+        "{text}"
+    );
+    assert_eq!(
+        parse(&text, None).unwrap().completion_hook,
+        Some(argv.clone())
+    );
+    assert_eq!(
+        resolve(Options::default(), file).completion_hook,
+        Some(argv)
+    );
+    assert_eq!(
+        resolve(Options::default(), Options::default()).completion_hook,
+        None
     );
 }

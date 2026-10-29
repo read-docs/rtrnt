@@ -197,8 +197,13 @@ pub(crate) async fn download_with(
             let since = match seeding_since {
                 Some(since) => since,
                 None => {
-                    if let Some(announcer) = announcer.as_mut().filter(|_| downloading) {
-                        announcer.complete();
+                    if downloading {
+                        if let Some(announcer) = announcer.as_mut() {
+                            announcer.complete();
+                        }
+                        if let Some(completion) = &session.completion {
+                            completion.fire();
+                        }
                     }
                     if !seed.enabled() {
                         break;

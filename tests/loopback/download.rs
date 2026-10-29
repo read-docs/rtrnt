@@ -701,3 +701,72 @@ async fn downloads_from_peers_that_connect_over_ipv4_and_ipv6() {
     .expect("download failed");
     assert_files_match(out.path(), &data);
 }
+
+/// The completion hook runs once the download finishes, with the torrent's
+/// details in its environment, and not for a torrent that was complete
+/// already.
+#[tokio::test]
+async fn runs_the_completion_hook_once_the_download_finishes() {
+    init_tracing();
+    let data = test_data();
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+    let name = torrent.info.name.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seeder_addr = listener.local_addr().unwrap();
+    tokio::spawn(seeder(listener, Arc::new(data), info_hash, num_pieces));
+
+    let out = tempfile::tempdir().unwrap();
+    let marks = tempfile::tempdir().unwrap();
+    let mark = marks.path().join("mark");
+    let script = r#"echo "$RTRNT_NAME $RTRNT_INFO_HASH" >> "$1""#;
+    let argv: Vec<String> = ["sh", "-c", script, "sh", mark.to_str().unwrap()]
+        .map(String::from)
+        .into();
+    let hooked = |torrent, out: &std::path::Path| {
+        let mut session = session(torrent, info_hash, out);
+        Arc::get_mut(&mut session).unwrap().completion =
+            rtrnt::hook::Completion::new(&argv, &name, out, info_hash);
+        session
+    };
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        download_from_peers(
+            hooked(torrent.clone(), out.path()),
+            &vec![false; num_pieces],
+            &[seeder_addr],
+            10,
+            Vec::new(),
+            None,
+            pending(),
+        ),
+    )
+    .await
+    .expect("download timed out")
+    .expect("download failed");
+
+    let hex: String = info_hash.iter().map(|b| format!("{b:02x}")).collect();
+    let expected = format!("{name} {hex}\n");
+    for _ in 0..100 {
+        if std::fs::read_to_string(&mark).is_ok_and(|s| s == expected) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(std::fs::read_to_string(&mark).unwrap(), expected);
+
+    // Complete from the start: nothing to announce, nothing to run.
+    download_from_peers(
+        hooked(torrent, out.path()),
+        &vec![true; num_pieces],
+        &[],
+        10,
+        Vec::new(),
+        None,
+        pending(),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(std::fs::read_to_string(&mark).unwrap(), expected);
+}
