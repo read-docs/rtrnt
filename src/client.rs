@@ -2,6 +2,7 @@
 //! listening port, the DHT node, the rate limits, the connection slots, the
 //! hashing queue, the files the torrents write and the progress bars.
 
+use crate::blocklist::Blocklist;
 use crate::dht::Dht;
 use crate::download::DownloadConfig;
 use crate::listener::Listener;
@@ -42,6 +43,8 @@ pub struct Client {
     /// gives them, with the info hash and name of the torrent that owns each.
     files: Mutex<HashMap<PathBuf, FileOwner>>,
     stats: Arc<SessionStats>,
+    /// Peers in these ranges are neither connected to nor accepted.
+    blocklist: Arc<Blocklist>,
 }
 
 impl Client {
@@ -73,7 +76,19 @@ impl Client {
             torrents: Mutex::new(HashSet::new()),
             files: Mutex::new(HashMap::new()),
             stats: Arc::new(stats),
+            blocklist: Arc::default(),
         }
+    }
+
+    /// Refuses the peers `blocklist` blocks, from the first torrent on.
+    pub fn with_blocklist(mut self, blocklist: Arc<Blocklist>) -> Self {
+        self.blocklist = blocklist;
+        self
+    }
+
+    /// The ranges of addresses we refuse peers from.
+    pub fn blocklist(&self) -> &Arc<Blocklist> {
+        &self.blocklist
     }
 
     /// Live numbers about the session and its torrents.
@@ -123,7 +138,8 @@ impl Client {
     /// `Listener::bind`) from the first call on.
     pub async fn listener(&self) -> &Arc<Listener> {
         let bind = async {
-            let listener = Listener::bind(self.config.listen_port).await;
+            let listener =
+                Listener::bind(self.config.listen_port, Arc::clone(&self.blocklist)).await;
             self.stats.set_port(listener.port());
             listener
         };

@@ -326,7 +326,7 @@ async fn download_loaded(
     }
 
     stats.add_source(PeerSource::Tracker, peers.len());
-    let mut start = StartPeers::default();
+    let mut start = StartPeers::with_blocklist(Arc::clone(client.blocklist()));
     start.pool.add(peers);
     download_with(
         session,
@@ -406,7 +406,7 @@ pub async fn download_from_peers(
 ) -> Result<()> {
     let mut start = StartPeers::default();
     start.pool.add(peers.iter().copied());
-    let incoming = Listener::start(listeners).register(session.info_hash)?;
+    let incoming = Listener::start(listeners, Arc::default()).register(session.info_hash)?;
     // Slots of its own, as many as the peers it may have.
     let limits = Limits {
         max_peers,

@@ -7,6 +7,7 @@ use clap::Parser;
 use cli::Args;
 use indicatif::{MultiProgress, ProgressDrawTarget};
 use log_line::LogLine;
+use rtrnt::blocklist::Blocklist;
 use rtrnt::client::Client;
 use rtrnt::download::{self, DownloadConfig};
 use rtrnt::magnet;
@@ -113,6 +114,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     if let Some(path) = &file.path {
         info!(path = %path.display(), "loaded config file");
     }
+    let blocklist_path = cli.blocklist.clone().or(file.options.blocklist.clone());
     let watch_dir = cli.watch_dir.clone().or(file.options.watch_dir.clone());
     let watch_delete = cli
         .watch_dir_delete
@@ -130,7 +132,13 @@ async fn main() -> anyhow::Result<ExitCode> {
         })
         .await;
     }
-    let client = Arc::new(Client::new(config, bars));
+    // A list that cannot be read stops the start: running unfiltered would
+    // be worse than not running.
+    let blocklist = match blocklist_path {
+        Some(path) => Blocklist::load(&path)?,
+        None => Blocklist::default(),
+    };
+    let client = Arc::new(Client::new(config, bars).with_blocklist(Arc::new(blocklist)));
     let shutdown = Shutdown::new();
     // Every torrent runs at once until it is done, and Ctrl-C stops them all.
     let mut manager = Manager::new(Arc::clone(&client), {

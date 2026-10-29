@@ -256,7 +256,8 @@ fn describe_names_each_source() {
          # tui: when stdout and stderr are terminals  # default\n\
          # session: only in the terminal UI  # default\n\
          # watch-dir: none  # default\n\
-         watch-dir-delete = false  # default\n"
+         watch-dir-delete = false  # default\n\
+         # blocklist: none  # default\n"
     );
     // The settings part is valid TOML that parses to the same values.
     let reparsed = parse(&text, None).unwrap();
@@ -375,5 +376,29 @@ fn the_watch_directory_comes_from_the_command_line_or_the_file() {
     assert_eq!(
         parse(&text, None).unwrap().watch_dir,
         Some(PathBuf::from("/home/me/incoming"))
+    );
+}
+
+#[test]
+fn the_blocklist_comes_from_the_command_line_or_the_file() {
+    let file = parse("blocklist = \"~/p2p.txt\"\n", Some(Path::new("/home/me"))).unwrap();
+    assert_eq!(file.blocklist, Some(PathBuf::from("/home/me/p2p.txt")));
+    let cli = Options {
+        blocklist: Some(PathBuf::from("/etc/list")),
+        ..Options::default()
+    };
+    let config = ConfigFile {
+        path: None,
+        options: file,
+    };
+    let text = describe(&cli, &Options::default(), &config);
+    assert!(
+        text.contains("blocklist = \"/etc/list\"  # command line\n"),
+        "{text}"
+    );
+    let text = describe(&Options::default(), &Options::default(), &config);
+    assert!(
+        text.contains("blocklist = \"/home/me/p2p.txt\"  # config file\n"),
+        "{text}"
     );
 }
