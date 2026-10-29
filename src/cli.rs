@@ -54,6 +54,14 @@ pub(crate) struct Args {
     /// says `dht = false`
     #[arg(long, overrides_with = "no_dht")]
     dht: bool,
+    /// Do not ask the router to forward the listening port with PCP,
+    /// NAT-PMP or UPnP (`portmap = false` in the config file)
+    #[arg(long, overrides_with = "portmap")]
+    no_portmap: bool,
+    /// Ask the router to forward the listening port, as by default, even
+    /// if the config file says `portmap = false`
+    #[arg(long, overrides_with = "no_portmap")]
+    portmap: bool,
     /// Show the full-screen terminal UI, never with --check, --scrape or
     /// --print-config [default: when stdout and stderr are terminals]
     #[arg(long, overrides_with = "no_tui")]
@@ -88,6 +96,7 @@ impl Args {
     pub(crate) fn options(&self) -> config::Options {
         config::Options {
             dht: self.dht(),
+            portmap: self.portmap(),
             tui: self.tui(),
             session: self.session(),
             watch_dir_delete: self.watch_dir_delete(),
@@ -106,6 +115,12 @@ impl Args {
     /// line, as for `dht`.
     pub(crate) fn sequential(&self) -> Option<bool> {
         tri(self.sequential, self.no_sequential)
+    }
+
+    /// Whether port mapping was turned on or off on the command line, as for
+    /// `dht`.
+    pub(crate) fn portmap(&self) -> Option<bool> {
+        tri(self.portmap, self.no_portmap)
     }
 
     /// Whether the terminal UI was turned on or off on the command line, as

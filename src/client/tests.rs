@@ -10,6 +10,7 @@ fn client(dht: bool) -> Client {
         seed: SeedLimits::default(),
         dht,
         sequential: false,
+        portmap: false,
         max_download_rate: 64,
         max_upload_rate: 0,
         completion_hook: None,

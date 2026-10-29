@@ -13,6 +13,7 @@ pub mod magnet;
 pub mod manager;
 pub mod peer;
 mod periodic;
+pub mod portmap;
 pub mod queue;
 pub mod rate_limit;
 pub mod resume;

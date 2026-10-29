@@ -34,6 +34,8 @@ pub const DEFAULT_SEED_RATIO: f64 = 0.0;
 pub const DEFAULT_SEED_TIME: u64 = 0;
 /// Whether to look for peers in the DHT unless told otherwise.
 pub const DEFAULT_DHT: bool = true;
+/// Whether to map the listening port on the router unless told otherwise.
+pub const DEFAULT_PORTMAP: bool = true;
 /// Whether to delete the files taken from the watch directory: they are
 /// renamed instead.
 pub const DEFAULT_WATCH_DIR_DELETE: bool = false;
@@ -195,6 +197,10 @@ options! {
     /// `dht = false`).
     #[arg(skip)]
     dht: bool = Value(DEFAULT_DHT);
+    /// Whether to ask the router to forward the listening port, by PCP,
+    /// NAT-PMP or UPnP (`--no-portmap` is `portmap = false`).
+    #[arg(skip)]
+    portmap: bool = Value(DEFAULT_PORTMAP);
     /// Most piece data to download per second in KiB, across all peers of
     /// all torrents (0: unlimited) [default: 0]
     #[arg(long, value_name = "KIB/S")]
@@ -333,6 +339,7 @@ impl Options {
             },
             dht: self.dht.unwrap_or(DEFAULT_DHT),
             sequential: self.sequential.unwrap_or(DEFAULT_SEQUENTIAL),
+            portmap: self.portmap.unwrap_or(DEFAULT_PORTMAP),
             max_download_rate: self.max_download_rate.unwrap_or(DEFAULT_MAX_DOWNLOAD_RATE),
             max_upload_rate: self.max_upload_rate.unwrap_or(DEFAULT_MAX_UPLOAD_RATE),
             completion_hook: self.completion_hook,

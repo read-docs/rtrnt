@@ -540,6 +540,7 @@ fn the_header_marks_the_alt_speed_limits() {
 #[test]
 fn the_header_names_the_watch_directory() {
     let mut snapshot = demo::fixture();
+    snapshot.session.portmap = crate::portmap::Status::Off;
     let app = app(&snapshot);
     let header = |snapshot: &Snapshot| {
         text(&render(140, 32, snapshot, &app), Rect::new(0, 0, 140, 1))[0].clone()
@@ -549,6 +550,35 @@ fn the_header_names_the_watch_directory() {
     let line = header(&snapshot);
     assert!(
         line.contains("port 6881  watching /home/me/incoming"),
+        "{line}"
+    );
+}
+
+#[test]
+fn the_header_says_how_the_port_mapping_went() {
+    use crate::portmap::Status;
+    let mut snapshot = demo::fixture();
+    let app = app(&snapshot);
+    let mut header = |status| {
+        snapshot.session.portmap = status;
+        text(&render(140, 32, &snapshot, &app), Rect::new(0, 0, 140, 1))[0].clone()
+    };
+    let line = header(Status::Off);
+    assert!(
+        !line.contains("mapp") && !line.contains("not mapped"),
+        "{line}"
+    );
+    let line = header(Status::Searching);
+    assert!(line.contains("port 6881  mapping port..."), "{line}");
+    let line = header(Status::Failed("no answer".into()));
+    assert!(line.contains("port 6881  port not mapped"), "{line}");
+    let line = header(Status::Mapped {
+        via: "UPnP",
+        external_ip: Some("203.0.113.7".parse().unwrap()),
+        external_port: 6881,
+    });
+    assert!(
+        line.contains("port 6881  mapped 203.0.113.7:6881 (UPnP)"),
         "{line}"
     );
 }

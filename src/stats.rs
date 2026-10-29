@@ -7,6 +7,7 @@
 
 use crate::client::ConnectionSlots;
 use crate::dht::Dht;
+use crate::portmap::{Portmapper, Status as PortmapStatus};
 use crate::rate_limit::RateLimits;
 use crate::torrent_limits::{TorrentLimits, TorrentSettings};
 use std::collections::HashMap;
@@ -32,6 +33,8 @@ pub struct SessionStats {
     limits: Mutex<HashMap<[u8; 20], Arc<TorrentLimits>>>,
     /// Set once the DHT node is started.
     dht: OnceLock<Dht>,
+    /// Set once the client has one.
+    portmap: OnceLock<Portmapper>,
     /// Set once the listening port is open.
     port: OnceLock<Option<u16>>,
     /// The directory watched for torrents, if there is one.
@@ -52,6 +55,7 @@ impl SessionStats {
             torrents: Mutex::new(Vec::new()),
             limits: Mutex::new(HashMap::new()),
             dht: OnceLock::new(),
+            portmap: OnceLock::new(),
             port: OnceLock::new(),
             watch_dir: OnceLock::new(),
             rate_limits,
@@ -148,6 +152,10 @@ impl SessionStats {
         let _ = self.dht.set(dht);
     }
 
+    pub(crate) fn set_portmap(&self, portmap: Portmapper) {
+        let _ = self.portmap.set(portmap);
+    }
+
     pub(crate) fn set_port(&self, port: Option<u16>) {
         let _ = self.port.set(port);
     }
@@ -165,6 +173,14 @@ impl SessionStats {
     /// Nodes in the DHT routing table, or `None` while no node runs.
     pub fn dht_nodes(&self) -> Option<usize> {
         self.dht.get().map(Dht::node_count)
+    }
+
+    /// How mapping the listening port on the router is going.
+    pub fn portmap(&self) -> PortmapStatus {
+        self.portmap
+            .get()
+            .map(Portmapper::status)
+            .unwrap_or_default()
     }
 
     /// Where we accept peers, once known.

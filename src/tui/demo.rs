@@ -7,6 +7,7 @@ use super::snapshot::{
     Detail, NOTICE_SHOWN, PeerSnapshot, SessionSnapshot, Snapshot, Sources, TorrentSnapshot,
 };
 use super::{Command, Feed};
+use crate::portmap::Status as PortmapStatus;
 use crate::stats::{Layout, PeerFlags, PieceSnapshot, TorrentState, TrackerResult, TrackerStatus};
 use crate::torrent_limits::TorrentSettings;
 use rand::rngs::StdRng;
@@ -468,6 +469,11 @@ impl DemoFeed {
             session: SessionSnapshot {
                 dht_nodes: Some(312),
                 port: Some(6881),
+                portmap: PortmapStatus::Mapped {
+                    via: "UPnP",
+                    external_ip: Some(std::net::Ipv4Addr::new(203, 0, 113, 7)),
+                    external_port: 6881,
+                },
                 connections: 71,
                 max_connections: 200,
                 rate_limits: self.rate_limits,

@@ -94,9 +94,13 @@ Without the UI nothing is loaded or saved, so `rtrnt --no-tui x.torrent` still d
 
 `--blocklist <FILE>` (`blocklist` in the config file) refuses the peers whose addresses are in a list file, as Transmission and qBittorrent do. The file may mix PeerGuardian text lines (`name:1.2.3.4-1.2.3.255`), eMule `ipfilter.dat` lines (`1.2.3.4 - 1.2.3.255 , 000 , name`, where an access level of 128 or more means the range is allowed, so it is skipped), CIDR blocks (`10.0.0.0/8`, `2001:db8::/32`), single addresses and bare ranges, over IPv4 and IPv6. Blank lines and lines starting with `#`, `;` or `//` are skipped, and a line that fits no format is skipped and counted in a warning. Gzipped lists are not read: decompress them first. Peers from trackers, the DHT, peer exchange and magnet links are left out of the peer pool, and connections from listed addresses are closed as soon as they are accepted. The number of ranges loaded is logged, and a list that cannot be read stops the start.
 
+### Port mapping
+
+Behind a home router, nobody outside can connect to us unless the router forwards the listening port. Unless told not to (`--no-portmap`, or `portmap = false` in the config file; `--portmap` overrides the file), rtrnt asks the router in the background, so startup is never delayed and a failure is only logged and shown. When the listening port opens, the TCP port is mapped, and so is the DHT's UDP port once the DHT starts. The router is asked with PCP (RFC 6887) and NAT-PMP (RFC 6886) at the default gateway, UDP port 5351, then with UPnP IGD: an SSDP search, the device description, and SOAP calls (`AddPortMapping`, `DeletePortMapping`, `GetExternalIPAddress`) to its `WANIPConnection` or `WANPPPConnection` service. The first to answer is used. Leases are an hour, renewed at half the lease; if the router stops answering it is looked for again. On a normal exit the mappings are removed, waiting up to 3 seconds. The header shows `mapped <external address>:<port> (<protocol>)`, `mapping port...` while looking, or `port not mapped` (the log says why). The default gateway is read from `/proc/net/route` on Linux and from `route -n get default` elsewhere.
+
 ### Config file
 
-Every option except `--check`, `--recheck`, `--select-file`, `--scrape`, `--config` and `--print-config` can also be set in `~/.config/rtrnt/config.toml` (or `$XDG_CONFIG_HOME/rtrnt/config.toml`), or in a file given with `--config <PATH>`. Keys are the long option names, except that `--no-dht` is `dht = false`, `--no-tui` is `tui = false`, `--no-session` is `session = false`, `--no-sequential` is `sequential = false`, `--watch-dir-delete` is `watch-dir-delete = true` and `--completion-hook` is a `completion-hook` list; `alt-speed-schedule` is only in the file; and every key is optional:
+Every option except `--check`, `--recheck`, `--select-file`, `--scrape`, `--config` and `--print-config` can also be set in `~/.config/rtrnt/config.toml` (or `$XDG_CONFIG_HOME/rtrnt/config.toml`), or in a file given with `--config <PATH>`. Keys are the long option names, except that `--no-dht` is `dht = false`, `--no-tui` is `tui = false`, `--no-session` is `session = false`, `--no-sequential` is `sequential = false`, `--no-portmap` is `portmap = false`, `--watch-dir-delete` is `watch-dir-delete = true` and `--completion-hook` is a `completion-hook` list. `alt-speed-schedule` can only be set in the file, and every key is optional:
 
 ```toml
 output = "~/Downloads"
@@ -106,6 +110,7 @@ port = 51413
 seed-ratio = 1.5
 seed-time = 120
 dht = false
+portmap = true
 max-download-rate = 2048
 max-upload-rate = 256
 max-active-downloads = 3
@@ -167,6 +172,8 @@ src/
 │   ├── token.rs     # get_peers tokens with rotating secrets
 │   ├── store.rs     # Peers announced to us
 │   └── search.rs    # Periodic lookups for the torrent being downloaded
+├── portmap.rs     # Router port mapping: background task, renewal, removal on exit
+├── portmap/       # PCP, NAT-PMP, UPnP IGD and default gateway lookup
 ├── download.rs    # Download config, Session and the entry points
 ├── download/
 │   ├── swarm.rs     # A torrent's main loop: starts, replaces and bans peer workers

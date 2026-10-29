@@ -3,6 +3,7 @@
 
 use super::log_buffer::{LogBuffer, LogLine};
 use super::view::LOG_LINES;
+use crate::portmap::Status as PortmapStatus;
 use crate::selection::Priority;
 use crate::stats::{
     Layout, PeerFlags, PeerSource, PieceSnapshot, SessionStats, TorrentState, TorrentStats,
@@ -37,6 +38,8 @@ pub struct Snapshot {
 pub struct SessionSnapshot {
     pub dht_nodes: Option<usize>,
     pub port: Option<u16>,
+    /// How mapping the port on the router is going.
+    pub portmap: PortmapStatus,
     pub connections: usize,
     pub max_connections: usize,
     /// Download and upload limits in KiB/s, 0 for none.
@@ -203,6 +206,7 @@ impl Snapshot {
             session: SessionSnapshot {
                 dht_nodes: stats.dht_nodes(),
                 port: stats.port(),
+                portmap: stats.portmap(),
                 connections: stats.connections(),
                 max_connections: stats.max_connections(),
                 rate_limits: stats.rate_limits(),

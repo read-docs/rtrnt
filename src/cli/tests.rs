@@ -282,3 +282,18 @@ fn sequential_flags_fall_back_to_the_file() {
     );
     assert_eq!(sequential(&["--no-sequential", "--sequential"]), Some(true));
 }
+
+/// Like `--dht` and `--no-dht`, the last of `--portmap` and `--no-portmap`
+/// wins, and with neither the config file decides.
+#[test]
+fn portmap_flags_fall_back_to_the_file() {
+    let portmap = |flags: &[&str]| {
+        let args = ["rtrnt", "x.torrent"].iter().chain(flags);
+        Args::try_parse_from(args).unwrap().portmap()
+    };
+    assert_eq!(portmap(&[]), None);
+    assert_eq!(portmap(&["--no-portmap"]), Some(false));
+    assert_eq!(portmap(&["--portmap"]), Some(true));
+    assert_eq!(portmap(&["--no-portmap", "--portmap"]), Some(true));
+    assert_eq!(portmap(&["--portmap", "--no-portmap"]), Some(false));
+}

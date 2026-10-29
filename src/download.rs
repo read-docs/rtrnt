@@ -54,6 +54,9 @@ pub struct DownloadConfig {
     /// Whether a torrent that has not been told otherwise downloads its
     /// pieces in order (see `PieceQueue`) rather than the rarest first.
     pub sequential: bool,
+    /// Whether to ask the router to forward the listening port (see
+    /// `portmap`).
+    pub portmap: bool,
     /// Most block data to download per second, in KiB, across all peers;
     /// 0 for no limit.
     pub max_download_rate: u64,
