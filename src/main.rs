@@ -190,7 +190,9 @@ async fn main() -> anyhow::Result<ExitCode> {
         // Only the watcher, if there is one, sends commands: without it the
         // run ends with the last torrent.
         drop(commands);
-        return manager.run(commands_rx).await;
+        let exit = manager.run(commands_rx).await;
+        client.close_port_mappings().await;
+        return exit;
     }
     let finished = manager.idle();
     let run = manager.run(commands_rx);
@@ -221,13 +223,18 @@ async fn with_tui(
     }
     match exit {
         Ok(tui::Exit::Quit) => {}
-        Ok(tui::Exit::Now) => std::process::exit(EXIT_INTERRUPTED.into()),
+        Ok(tui::Exit::Now) => {
+            client.close_port_mappings().await;
+            std::process::exit(EXIT_INTERRUPTED.into())
+        }
         Err(e) => {
             eprintln!("cannot run the terminal UI: {e}; carrying on without it");
             logs.echo_to_stderr();
         }
     }
-    downloads.await?
+    let exit = downloads.await?;
+    client.close_port_mappings().await;
+    exit
 }
 
 /// Runs `run` on each torrent in turn. With several, each one's output is

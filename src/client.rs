@@ -6,6 +6,7 @@ use crate::dht::Dht;
 use crate::download::DownloadConfig;
 use crate::listener::Listener;
 use crate::peer;
+use crate::portmap::{Portmapper, Protocol};
 use crate::rate_limit::RateLimits;
 use crate::stats::SessionStats;
 use anyhow::{Result, bail};
@@ -34,6 +35,8 @@ pub struct Client {
     hashing: Semaphore,
     bars: MultiProgress,
     listener: OnceCell<Arc<Listener>>,
+    /// Keeps the listening ports mapped on the router.
+    portmap: Portmapper,
     /// `None` if the DHT is off or could not be started.
     dht: OnceCell<Option<Dht>>,
     /// Info hashes of the torrents running, so none runs twice.
@@ -61,6 +64,8 @@ impl Client {
         ));
         let slots = ConnectionSlots::new(config.max_connections);
         let stats = SessionStats::new(Arc::clone(&rate_limits), slots.clone());
+        let portmap = Portmapper::new(config.portmap);
+        stats.set_portmap(portmap.clone());
         Self {
             config,
             peer_id: peer::generate_peer_id(),
@@ -69,6 +74,7 @@ impl Client {
             hashing: Semaphore::new(1),
             bars,
             listener: OnceCell::new(),
+            portmap,
             dht: OnceCell::new(),
             torrents: Mutex::new(HashSet::new()),
             files: Mutex::new(HashMap::new()),
@@ -125,6 +131,9 @@ impl Client {
         let bind = async {
             let listener = Listener::bind(self.config.listen_port).await;
             self.stats.set_port(listener.port());
+            if let Some(port) = listener.port() {
+                self.portmap.map(Protocol::Tcp, port);
+            }
             listener
         };
         self.listener
@@ -146,6 +155,7 @@ impl Client {
             .port()
             .unwrap_or(self.config.listen_port);
         let stats = &self.stats;
+        let portmap = &self.portmap;
         let start = async move {
             let dht = Dht::bind(port)
                 .await
@@ -153,6 +163,7 @@ impl Client {
                 .ok();
             if let Some(dht) = &dht {
                 stats.set_dht(dht.clone());
+                portmap.map(Protocol::Udp, dht.port());
             }
             dht
         };
@@ -160,6 +171,12 @@ impl Client {
             .get_or_init(|| start.instrument(session_span()))
             .await
             .clone()
+    }
+
+    /// Removes the router's port mappings, if it made any, waiting a few
+    /// seconds at most. Called as the session ends.
+    pub async fn close_port_mappings(&self) {
+        self.portmap.shutdown().await;
     }
 
     /// Marks the torrent with `info_hash` as running until the returned

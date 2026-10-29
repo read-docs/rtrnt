@@ -44,6 +44,7 @@ fn config(output: &Path, resume: &Path) -> DownloadConfig {
         listen_port: 0,
         seed: Default::default(),
         dht: false,
+        portmap: false,
         max_download_rate: 0,
         max_upload_rate: 0,
         resume_dir: Some(resume.to_path_buf()),

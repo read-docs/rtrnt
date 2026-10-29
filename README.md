@@ -77,9 +77,13 @@ Without the UI nothing is loaded or saved, so `rtrnt --no-tui x.torrent` still d
 
 `--watch-dir <DIR>` (`watch-dir` in the config file) takes the `.torrent` files, and the `.magnet` files whose first line is a magnet link, that appear in a directory, as rTorrent and Transmission do. The directory is looked at every 2 seconds, and a file is taken once its size and modification time are the same on two looks in a row, so a download a browser has not finished is left alone. A file that does not parse is renamed to `<name>.invalid` and a notice says why. Otherwise the torrent is added as by `a` in the UI, and the file is renamed to `<name>.added`, or deleted with `--watch-dir-delete` (`watch-dir-delete = true`). A `.torrent` is first copied into `$XDG_STATE_HOME/rtrnt/torrents/` (the session's store, which is used for this even when the session is not kept), and the torrent runs from the copy, so the rename or delete does not lose it; if there is no state directory the file is used where it is and left alone. The header shows the directory. With a watch directory the run does not end with the last torrent and none is needed on the command line: without the UI it goes on until Ctrl-C, which stops the watching as well.
 
+### Port mapping
+
+Behind a home router, nobody outside can connect to us unless the router forwards the listening port. Unless told not to (`--no-portmap`, or `portmap = false` in the config file; `--portmap` overrides the file), rtrnt asks the router in the background, so startup is never delayed and a failure is only logged and shown. When the listening port opens, the TCP port is mapped, and so is the DHT's UDP port once the DHT starts. The router is asked with PCP (RFC 6887) and NAT-PMP (RFC 6886) at the default gateway, UDP port 5351, then with UPnP IGD: an SSDP search, the device description, and SOAP calls (`AddPortMapping`, `DeletePortMapping`, `GetExternalIPAddress`) to its `WANIPConnection` or `WANPPPConnection` service. The first to answer is used. Leases are an hour, renewed at half the lease; if the router stops answering it is looked for again. On a normal exit the mappings are removed, waiting up to 3 seconds. The header shows `mapped <external address>:<port> (<protocol>)`, `mapping port...` while looking, or `port not mapped` (the log says why). The default gateway is read from `/proc/net/route` on Linux and from `route -n get default` elsewhere.
+
 ### Config file
 
-Every option except `--check`, `--recheck`, `--select-file`, `--scrape`, `--config` and `--print-config` can also be set in `~/.config/rtrnt/config.toml` (or `$XDG_CONFIG_HOME/rtrnt/config.toml`), or in a file given with `--config <PATH>`. Keys are the long option names, except that `--no-dht` is `dht = false`, `--no-tui` is `tui = false`, `--no-session` is `session = false` and `--watch-dir-delete` is `watch-dir-delete = true`, and every key is optional:
+Every option except `--check`, `--recheck`, `--select-file`, `--scrape`, `--config` and `--print-config` can also be set in `~/.config/rtrnt/config.toml` (or `$XDG_CONFIG_HOME/rtrnt/config.toml`), or in a file given with `--config <PATH>`. Keys are the long option names, except that `--no-dht` is `dht = false`, `--no-tui` is `tui = false`, `--no-session` is `session = false` and `--watch-dir-delete` is `watch-dir-delete = true` and `--no-portmap` is `portmap = false`, and every key is optional:
 
 ```toml
 output = "~/Downloads"
@@ -89,6 +93,7 @@ port = 51413
 seed-ratio = 1.5
 seed-time = 120
 dht = false
+portmap = true
 max-download-rate = 2048
 max-upload-rate = 256
 tui = false
@@ -136,6 +141,8 @@ src/
 │   ├── token.rs     # get_peers tokens with rotating secrets
 │   ├── store.rs     # Peers announced to us
 │   └── search.rs    # Periodic lookups for the torrent being downloaded
+├── portmap.rs     # Router port mapping: background task, renewal, removal on exit
+├── portmap/       # PCP, NAT-PMP, UPnP IGD and default gateway lookup
 ├── download.rs    # Download config, Session and the entry points
 ├── download/
 │   ├── swarm.rs     # A torrent's main loop: starts, replaces and bans peer workers

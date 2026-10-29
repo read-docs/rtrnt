@@ -49,6 +49,9 @@ pub struct DownloadConfig {
     pub seed: SeedLimits,
     /// Whether to look for peers in the DHT too (never for private torrents).
     pub dht: bool,
+    /// Whether to ask the router to forward the listening port (see
+    /// `portmap`).
+    pub portmap: bool,
     /// Most block data to download per second, in KiB, across all peers;
     /// 0 for no limit.
     pub max_download_rate: u64,

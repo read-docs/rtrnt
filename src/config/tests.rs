@@ -251,6 +251,7 @@ fn describe_names_each_source() {
          seed-ratio = 1.5  # config file\n\
          seed-time = 0  # default\n\
          dht = false  # command line\n\
+         portmap = true  # default\n\
          max-download-rate = 0  # default\n\
          max-upload-rate = 64  # command line\n\
          # tui: when stdout and stderr are terminals  # default\n\
@@ -267,6 +268,7 @@ fn describe_names_each_source() {
             seed_ratio: Some(1.5),
             seed_time: Some(0),
             dht: Some(false),
+            portmap: Some(true),
             max_download_rate: Some(0),
             max_upload_rate: Some(64),
             watch_dir_delete: Some(false),

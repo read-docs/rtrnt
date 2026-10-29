@@ -1,6 +1,7 @@
 //! The top line: session rates and limits, counts, and the time.
 
 use super::{bold, human_rate};
+use crate::portmap::Status as PortmapStatus;
 use crate::tui::app::App;
 use crate::tui::snapshot::Snapshot;
 use ratatui::Frame;
@@ -26,6 +27,9 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
     });
     if let Some(port) = session.port {
         facts.push(format!("port {port}"));
+    }
+    if session.portmap != PortmapStatus::Off {
+        facts.push(session.portmap.to_string());
     }
     if let Some(dir) = &session.watch_dir {
         facts.push(format!("watching {}", dir.display()));
