@@ -7,7 +7,7 @@ use crate::portmap::Status as PortmapStatus;
 use crate::selection::Priority;
 use crate::stats::{
     Layout, PeerFlags, PeerSource, PieceSnapshot, SessionStats, TorrentState, TorrentStats,
-    TrackerStatus,
+    TrackerStatus, WebSeedState,
 };
 use crate::torrent_limits::TorrentSettings;
 use std::net::SocketAddr;
@@ -141,11 +141,24 @@ pub struct PeerSnapshot {
     pub rate_up: f64,
 }
 
+/// One web seed of the selected torrent.
+#[derive(Debug, Clone)]
+pub struct WebSeedSnapshot {
+    pub url: String,
+    pub http_seed: bool,
+    pub state: WebSeedState,
+    pub failures: u32,
+    pub downloaded: u64,
+    /// Filled in from the rate history.
+    pub rate_down: f64,
+}
+
 /// The selected torrent's insides.
 #[derive(Debug, Clone, Default)]
 pub struct Detail {
     pub info_hash: [u8; 20],
     pub peers: Vec<PeerSnapshot>,
+    pub web_seeds: Vec<WebSeedSnapshot>,
     pub pieces: Option<PieceSnapshot>,
     pub trackers: Vec<TrackerStatus>,
     /// Time until the trackers are next announced to.
@@ -289,9 +302,22 @@ fn detail(torrent: &TorrentStats, now: Instant) -> Detail {
             rate_up: 0.0,
         })
         .collect();
+    let web_seeds = torrent
+        .web_seeds()
+        .iter()
+        .map(|seed| WebSeedSnapshot {
+            url: seed.url.clone(),
+            http_seed: seed.http_seed,
+            state: seed.state(),
+            failures: seed.failures(),
+            downloaded: seed.downloaded(),
+            rate_down: 0.0,
+        })
+        .collect();
     Detail {
         info_hash: torrent.info_hash(),
         peers,
+        web_seeds,
         pieces: torrent.pieces(),
         trackers: torrent.trackers(),
         next_announce: torrent

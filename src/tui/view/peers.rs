@@ -4,8 +4,9 @@
 
 use super::{Rows, bar, bold, fit, human_rate, scroll_to, selected_style, sparkline};
 use crate::stats::PeerFlags;
+use crate::stats::WebSeedState;
 use crate::tui::app::{App, Focus};
-use crate::tui::snapshot::{Detail, PeerSnapshot, TorrentSnapshot};
+use crate::tui::snapshot::{Detail, PeerSnapshot, TorrentSnapshot, WebSeedSnapshot};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -196,7 +197,11 @@ pub fn draw(
             line
         });
     }
-    if detail.peers.is_empty() {
+    let shown_peers = peers.len().saturating_sub(offset).min(rows);
+    for seed in detail.web_seeds.iter().take(rows - shown_peers) {
+        lines.push(web_seed_line(seed, theme, address, client, pieces > 0));
+    }
+    if detail.peers.is_empty() && detail.web_seeds.is_empty() {
         lines.push(Line::from(Span::styled(
             " no peers connected",
             theme.dim_style(),
@@ -209,7 +214,7 @@ pub fn draw(
     frame.render_widget(Paragraph::new(lines), table);
 
     let count = detail.peers.len();
-    let shown = if count > rows {
+    let mut shown = if count > rows {
         format!(
             "{}-{} of {count} peers",
             offset + 1,
@@ -218,6 +223,13 @@ pub fn draw(
     } else {
         format!("{count} peer{}", if count == 1 { "" } else { "s" })
     };
+    let web = detail.web_seeds.len();
+    if web > 0 {
+        shown.push_str(&format!(
+            ", {web} web seed{}",
+            if web == 1 { "" } else { "s" }
+        ));
+    }
     let legend =
         format!(" {shown}  ·  D/d down unchoked/interested  U/u up  I incoming  F fast  X pex");
     let mut footer_lines = vec![Line::from(Span::styled(legend, theme.dim_style()))];
@@ -263,6 +275,68 @@ pub fn draw(
         ..area
     };
     frame.render_widget(Paragraph::new(footer_lines), footer_area);
+}
+
+/// How a web seed's state reads in the flags column.
+pub fn web_seed_state(seed: &WebSeedSnapshot) -> String {
+    match seed.state {
+        WebSeedState::Idle => "idle".to_string(),
+        WebSeedState::Downloading => "down".to_string(),
+        WebSeedState::Backoff => format!("retry {}", seed.failures),
+        WebSeedState::GaveUp => "gave up".to_string(),
+    }
+}
+
+/// The row of a web seed: its URL where a peer has its address, and its
+/// kind where a peer has its client. It has every piece.
+fn web_seed_line(
+    seed: &WebSeedSnapshot,
+    theme: crate::tui::theme::Theme,
+    address: usize,
+    client: usize,
+    has_pieces: bool,
+) -> Line<'static> {
+    let mut spans = vec![Span::raw(" "), Span::raw(fit(&seed.url, address, false))];
+    if client > 0 {
+        let kind = if seed.http_seed {
+            "http seed"
+        } else {
+            "web seed"
+        };
+        spans.push(Span::styled(
+            format!(" {}", fit(kind, client, false)),
+            theme.dim_style(),
+        ));
+    }
+    let failed = matches!(seed.state, WebSeedState::Backoff | WebSeedState::GaveUp);
+    let state_style = if failed {
+        Style::new().fg(theme.warn())
+    } else {
+        theme.dim_style()
+    };
+    spans.push(Span::styled(
+        format!(" {}", fit(&web_seed_state(seed), FLAGS, false)),
+        state_style,
+    ));
+    let rate_style = if seed.rate_down >= 1.0 {
+        Style::new().fg(theme.down())
+    } else {
+        theme.dim_style()
+    };
+    spans.push(Span::styled(
+        format!(" {}", fit(&human_rate(seed.rate_down), RATE, true)),
+        rate_style,
+    ));
+    spans.push(Span::styled(
+        format!(" {}", fit("-", RATE, true)),
+        theme.dim_style(),
+    ));
+    spans.push(Span::raw("  "));
+    if has_pieces {
+        spans.extend(bar(theme, BAR, 1.0, theme.up()));
+        spans.push(Span::styled(" seed", theme.dim_style()));
+    }
+    Line::from(spans)
 }
 
 #[cfg(test)]

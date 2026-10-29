@@ -12,6 +12,7 @@ use crate::torrent::{self, TorrentFile};
 use crate::torrent_limits::TorrentLimits;
 use crate::tracker::announcer::{Announcer, Transferred};
 use crate::tracker::{AnnounceEvent, AnnounceRequest};
+use crate::webseed::WebSeed;
 use anyhow::{Result, bail};
 use indicatif::MultiProgress;
 use std::net::SocketAddr;
@@ -29,6 +30,7 @@ mod queue;
 mod requests;
 mod swarm;
 mod upload;
+mod web;
 mod worker;
 
 pub use check::check_file;
@@ -349,7 +351,8 @@ async fn download_loaded(
     };
     // A seed can wait for peers to connect to it, and the DHT may still find
     // some.
-    if peers.is_empty() && left > 0 && session.dht.is_none() {
+    let web_seeds = !WebSeed::of(&session.torrent).is_empty();
+    if peers.is_empty() && left > 0 && session.dht.is_none() && !web_seeds {
         let reason = match announcer {
             Some(announcer) => {
                 announcer.stop(&Transferred::default()).await;

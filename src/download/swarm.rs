@@ -7,9 +7,10 @@ use crate::listener::Registration;
 use crate::peer::pex::PeerExchange;
 use crate::peer::{self, Incoming, PeerConnection};
 use crate::selection;
-use crate::stats::{PeerSource, PieceSnapshot, PieceSource, TorrentState};
+use crate::stats::{PeerSource, PieceSnapshot, PieceSource, TorrentState, WebSeedStats};
 use crate::storage::StorageError;
 use crate::tracker::announcer::{Announcer, Transferred};
+use crate::webseed::WebSeed;
 use anyhow::{Result, bail};
 use indicatif::HumanBytes;
 use std::collections::HashSet;
@@ -23,6 +24,7 @@ use tracing::{Instrument, debug, info, warn};
 
 use super::progress::Progress;
 use super::queue::PieceQueue;
+use super::web::web_seed_worker;
 use super::worker::peer_worker;
 use super::{Interrupted, Misbehaved, Session};
 
@@ -171,6 +173,28 @@ pub(crate) async fn download_with(
             permit,
         );
     }
+    // Web seeds take pieces next to the peers, for as long as they work.
+    let mut web_workers: JoinSet<Result<()>> = JoinSet::new();
+    if !queue.is_done() {
+        let seeds = WebSeed::of(torrent);
+        let shown: Vec<Arc<WebSeedStats>> = seeds
+            .iter()
+            .map(|seed| {
+                let http_seed = seed.kind == crate::webseed::WebSeedKind::Http;
+                Arc::new(WebSeedStats::new(&seed.url, http_seed))
+            })
+            .collect();
+        stats.set_web_seeds(shown.clone());
+        for (seed, seed_stats) in seeds.into_iter().zip(shown) {
+            info!(url = %seed.url, "using web seed");
+            let session = Arc::clone(&session);
+            let swarm = Arc::clone(&swarm);
+            web_workers.spawn(
+                async move { web_seed_worker(&session, &swarm, seed, seed_stats).await }
+                    .in_current_span(),
+            );
+        }
+    }
     let mut dht = session
         .dht
         .clone()
@@ -283,6 +307,8 @@ pub(crate) async fn download_with(
                     });
                 }
                 Some(asked) if asked.tracker || asked.dht_lookups > 0 => {}
+                // A web seed may still deliver the rest.
+                _ if !web_workers.is_empty() => {}
                 _ => break,
             }
         }
@@ -320,6 +346,18 @@ pub(crate) async fn download_with(
                             pool.failed(addr, pieces > 0, Instant::now());
                         }
                     }
+                }
+            }
+            Some(joined) = web_workers.join_next() => {
+                match joined {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) if e.is::<StorageError>() => {
+                        warn!("stopping: {e:#}");
+                        disk_error = Some(e);
+                        break;
+                    }
+                    Ok(Err(e)) => warn!("web seed failed: {e:#}"),
+                    Err(e) => warn!("web seed task failed: {e}"),
                 }
             }
             peer = incoming.next() => {
@@ -381,10 +419,15 @@ pub(crate) async fn download_with(
     // blocking pool. New peers are refused meanwhile.
     drop(incoming);
     queue.close();
-    let drain = async { while workers.join_next().await.is_some() {} };
+    let drain = async {
+        while workers.join_next().await.is_some() {}
+        while web_workers.join_next().await.is_some() {}
+    };
     if tokio::time::timeout(SHUTDOWN_GRACE, drain).await.is_err() {
         workers.shutdown().await;
+        web_workers.shutdown().await;
     }
+    stats.set_web_seeds(Vec::new());
 
     // Every finished write is in the files now.
     save_resume(&session, queue, &mut saved).await;

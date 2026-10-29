@@ -55,6 +55,8 @@ fn torrent_bytes(name: &str) -> (Vec<u8>, [u8; 20]) {
     let torrent = TorrentFile {
         announce: None,
         announce_list: None,
+        url_list: Vec::new(),
+        httpseeds: Vec::new(),
         info: Info {
             name: name.to_string(),
             piece_length: 16 * 1024,

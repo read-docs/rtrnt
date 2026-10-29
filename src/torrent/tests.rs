@@ -5,6 +5,8 @@ fn single_file(length: u64, piece_length: u64) -> TorrentFile {
     TorrentFile {
         announce: None,
         announce_list: None,
+        url_list: Vec::new(),
+        httpseeds: Vec::new(),
         info: Info {
             name: "file".into(),
             piece_length,

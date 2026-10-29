@@ -53,6 +53,8 @@ pub(crate) fn make_named_torrent(data: &[u8], name: &str) -> (TorrentFile, [u8; 
     let torrent = TorrentFile {
         announce: None,
         announce_list: None,
+        url_list: Vec::new(),
+        httpseeds: Vec::new(),
         info,
     };
     (torrent, info_hash)

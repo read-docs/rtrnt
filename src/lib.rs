@@ -28,3 +28,4 @@ pub mod torrent_limits;
 pub mod tracker;
 pub mod tui;
 pub mod watch;
+pub mod webseed;
