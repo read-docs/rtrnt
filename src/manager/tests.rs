@@ -758,6 +758,8 @@ fn torrent_file(dir: &std::path::Path, name: &str) -> (std::path::PathBuf, [u8; 
     let torrent = crate::torrent::TorrentFile {
         announce: None,
         announce_list: None,
+        url_list: Vec::new(),
+        httpseeds: Vec::new(),
         info: Info {
             name: name.to_string(),
             piece_length: 16 * 1024,
@@ -1033,6 +1035,8 @@ fn two_files() -> crate::torrent::TorrentFile {
     crate::torrent::TorrentFile {
         announce: None,
         announce_list: None,
+        url_list: Vec::new(),
+        httpseeds: Vec::new(),
         info: Info {
             name: "two".to_string(),
             piece_length: 16 * 1024,

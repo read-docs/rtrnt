@@ -91,7 +91,7 @@ pub enum Recheck {
 /// A torrent ready to start: the metainfo of a file, loaded already, or a
 /// magnet link.
 pub enum Torrent {
-    File(Metainfo),
+    File(Box<Metainfo>),
     Magnet(Box<MagnetLink>),
 }
 
@@ -1034,7 +1034,7 @@ fn run_torrent(
     Box::pin(async move {
         match torrent {
             Torrent::File(metainfo) => {
-                download::download_metainfo(metainfo, &options, &client, stop).await
+                download::download_metainfo(*metainfo, &options, &client, stop).await
             }
             Torrent::Magnet(link) => magnet::download_magnet(&link, &options, &client, stop).await,
         }
@@ -1045,11 +1045,11 @@ fn run_torrent(
 /// under `span`.
 async fn load(source: &Source, span: &Span) -> Result<Torrent> {
     Ok(match source {
-        Source::File(path) => Torrent::File(
+        Source::File(path) => Torrent::File(Box::new(
             torrent::load_metainfo(path)
                 .instrument(span.clone())
                 .await?,
-        ),
+        )),
         Source::Magnet(link) => Torrent::Magnet(link.clone()),
     })
 }

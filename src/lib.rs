@@ -24,3 +24,4 @@ pub mod torrent;
 pub mod tracker;
 pub mod tui;
 pub mod watch;
+pub mod webseed;

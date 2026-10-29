@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use super::{PeerStats, lock};
+use super::{PeerStats, WebSeedStats, lock};
 
 /// Where a torrent is in its life.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +179,8 @@ pub struct TorrentStats {
     pool: AtomicUsize,
     pieces: Mutex<Pieces>,
     peers: Mutex<Vec<Weak<PeerStats>>>,
+    /// Web seeds of the running download, up to date as it runs.
+    web_seeds: Mutex<Vec<Arc<WebSeedStats>>>,
     trackers: Mutex<Vec<TrackerStatus>>,
     next_announce: Mutex<Option<Instant>>,
     /// Peers learned of from each `PeerSource`, in its order.
@@ -217,6 +219,7 @@ impl TorrentStats {
             pool: AtomicUsize::new(0),
             pieces: Mutex::new(Pieces::Unknown),
             peers: Mutex::new(Vec::new()),
+            web_seeds: Mutex::new(Vec::new()),
             trackers: Mutex::new(Vec::new()),
             next_announce: Mutex::new(None),
             sources: Default::default(),
@@ -445,6 +448,16 @@ impl TorrentStats {
         let mut peers = lock(&self.peers);
         peers.retain(|peer| peer.strong_count() > 0);
         peers.iter().filter_map(Weak::upgrade).collect()
+    }
+
+    /// Shows `seeds` as the download's web seeds, replacing earlier ones.
+    pub(crate) fn set_web_seeds(&self, seeds: Vec<Arc<WebSeedStats>>) {
+        *lock(&self.web_seeds) = seeds;
+    }
+
+    /// The web seeds the download uses.
+    pub fn web_seeds(&self) -> Vec<Arc<WebSeedStats>> {
+        lock(&self.web_seeds).clone()
     }
 
     /// Lists the trackers in `tiers`, none contacted yet.

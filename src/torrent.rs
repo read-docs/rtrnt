@@ -19,7 +19,61 @@ pub struct TorrentFile {
         skip_serializing_if = "Option::is_none"
     )]
     pub announce_list: Option<Vec<Vec<String>>>,
+    /// Web seeds (BEP 19), a single URL or a list of them.
+    #[serde(
+        rename = "url-list",
+        default,
+        deserialize_with = "string_or_list",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub url_list: Vec<String>,
+    /// HTTP seeds (BEP 17).
+    #[serde(
+        default,
+        deserialize_with = "string_or_list",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub httpseeds: Vec<String>,
     pub info: Info,
+}
+
+/// Reads a list of strings, or a lone string as a list of one. Entries that
+/// are empty or not UTF-8 are dropped, as many torrents carry an empty
+/// `url-list`.
+fn string_or_list<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error> {
+    use serde::de::{SeqAccess, Visitor};
+    struct Strings;
+    fn keep(bytes: &[u8]) -> Vec<String> {
+        match std::str::from_utf8(bytes) {
+            Ok(url) if !url.is_empty() => vec![url.to_string()],
+            _ => Vec::new(),
+        }
+    }
+    impl<'de> Visitor<'de> for Strings {
+        type Value = Vec<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string or a list of strings")
+        }
+        fn visit_str<E>(self, v: &str) -> std::result::Result<Vec<String>, E> {
+            Ok(keep(v.as_bytes()))
+        }
+        fn visit_bytes<E>(self, v: &[u8]) -> std::result::Result<Vec<String>, E> {
+            Ok(keep(v))
+        }
+        fn visit_seq<A: SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Vec<String>, A::Error> {
+            let mut urls = Vec::new();
+            while let Some(item) = seq.next_element::<ByteBuf>()? {
+                urls.extend(keep(&item));
+            }
+            Ok(urls)
+        }
+    }
+    deserializer.deserialize_any(Strings)
 }
 
 #[derive(Deserialize, Clone, Serialize, Debug)]
@@ -116,6 +170,18 @@ impl TorrentFile {
             .collect()
     }
 
+    /// The `http` and `https` URLs of the torrent's web seeds (BEP 19), each
+    /// once, in the order listed.
+    pub fn web_seeds(&self) -> Vec<String> {
+        http_urls(&self.url_list)
+    }
+
+    /// The `http` and `https` URLs of the torrent's HTTP seeds (BEP 17),
+    /// each once, in the order listed.
+    pub fn http_seeds(&self) -> Vec<String> {
+        http_urls(&self.httpseeds)
+    }
+
     fn validate(&self) -> Result<()> {
         let info = &self.info;
         if info.piece_length == 0 || info.piece_length > MAX_PIECE_LENGTH {
@@ -144,6 +210,19 @@ impl TorrentFile {
         }
         Ok(())
     }
+}
+
+fn http_urls(urls: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    urls.iter()
+        .filter(|url| {
+            let scheme = url.split_once(':').map(|(scheme, _)| scheme);
+            scheme
+                .is_some_and(|s| s.eq_ignore_ascii_case("http") || s.eq_ignore_ascii_case("https"))
+        })
+        .filter(|url| seen.insert(url.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// A parsed torrent with its info hash and the exact bytes of its info
@@ -208,6 +287,8 @@ pub fn from_info(info_bytes: &[u8], tiers: &[Vec<String>]) -> Result<TorrentFile
     let torrent = TorrentFile {
         announce: tiers.iter().flatten().next().cloned(),
         announce_list: (!tiers.is_empty()).then(|| tiers.to_vec()),
+        url_list: Vec::new(),
+        httpseeds: Vec::new(),
         info,
     };
     torrent.validate()?;

@@ -140,6 +140,81 @@ impl PeerStats {
     }
 }
 
+/// What a web seed is doing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WebSeedState {
+    /// Waiting for a piece to fetch.
+    #[default]
+    Idle,
+    /// Fetching a piece.
+    Downloading,
+    /// Waiting out a delay after a failure.
+    Backoff,
+    /// Failed too often, and not tried again.
+    GaveUp,
+}
+
+impl WebSeedState {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Downloading,
+            2 => Self::Backoff,
+            3 => Self::GaveUp,
+            _ => Self::Idle,
+        }
+    }
+}
+
+/// One web seed (BEP 17 or 19) of a download, kept up to date by its
+/// worker.
+pub struct WebSeedStats {
+    /// Where the web seed is.
+    pub url: String,
+    /// Whether it is a BEP 17 seed rather than a BEP 19 one.
+    pub http_seed: bool,
+    downloaded: AtomicU64,
+    failures: AtomicU32,
+    state: AtomicU8,
+}
+
+impl WebSeedStats {
+    pub fn new(url: &str, http_seed: bool) -> Self {
+        Self {
+            url: url.to_string(),
+            http_seed,
+            downloaded: AtomicU64::new(0),
+            failures: AtomicU32::new(0),
+            state: AtomicU8::new(WebSeedState::Idle as u8),
+        }
+    }
+
+    /// Data received from the web seed, verified or not.
+    pub fn downloaded(&self) -> u64 {
+        self.downloaded.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn add_downloaded(&self, bytes: u64) {
+        self.downloaded.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Failures since the last piece that came through.
+    pub fn failures(&self) -> u32 {
+        self.failures.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_failures(&self, failures: u32) {
+        self.failures.store(failures, Ordering::Relaxed);
+    }
+
+    pub fn state(&self) -> WebSeedState {
+        WebSeedState::from_u8(self.state.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn set_state(&self, state: WebSeedState) {
+        self.state.store(state as u8, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

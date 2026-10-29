@@ -513,6 +513,7 @@ impl DemoFeed {
         Detail {
             info_hash: info_hash(index),
             peers,
+            web_seeds: Vec::new(),
             pieces: live.layout().map(|_| PieceSnapshot {
                 have: live.have.clone(),
                 in_flight: live.in_flight.clone(),

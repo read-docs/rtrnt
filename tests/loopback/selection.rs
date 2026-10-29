@@ -47,6 +47,8 @@ fn three_files() -> (Vec<u8>, Metainfo) {
     let torrent = TorrentFile {
         announce: None,
         announce_list: None,
+        url_list: Vec::new(),
+        httpseeds: Vec::new(),
         info,
     };
     (

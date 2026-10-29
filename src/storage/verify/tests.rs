@@ -15,6 +15,8 @@ fn torrent(data: &[u8]) -> TorrentFile {
     TorrentFile {
         announce: None,
         announce_list: None,
+        url_list: Vec::new(),
+        httpseeds: Vec::new(),
         info: Info {
             name: "root".into(),
             piece_length: PIECE_LENGTH as u64,

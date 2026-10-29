@@ -868,6 +868,7 @@ fn rates(from: &Sample, to: &Sample) -> (f64, f64) {
 pub struct Rates {
     torrents: HashMap<[u8; 20], History>,
     peers: HashMap<([u8; 20], SocketAddr), History>,
+    web_seeds: HashMap<([u8; 20], String), History>,
 }
 
 impl Rates {
@@ -888,8 +889,22 @@ impl Rates {
         }
         let Some(detail) = &snapshot.detail else {
             self.peers.clear();
+            self.web_seeds.clear();
             return;
         };
+        self.web_seeds.retain(|(hash, url), _| {
+            *hash == detail.info_hash && detail.web_seeds.iter().any(|seed| seed.url == *url)
+        });
+        for seed in &detail.web_seeds {
+            self.web_seeds
+                .entry((detail.info_hash, seed.url.clone()))
+                .or_default()
+                .record(Sample {
+                    at,
+                    down: seed.downloaded,
+                    up: 0,
+                });
+        }
         self.peers.retain(|(hash, addr), _| {
             *hash == detail.info_hash && detail.peers.iter().any(|peer| peer.addr == *addr)
         });
@@ -931,6 +946,11 @@ impl Rates {
         for peer in &mut detail.peers {
             if let Some(history) = self.peers.get(&(detail.info_hash, peer.addr)) {
                 (peer.rate_down, peer.rate_up) = history.current();
+            }
+        }
+        for seed in &mut detail.web_seeds {
+            if let Some(history) = self.web_seeds.get(&(detail.info_hash, seed.url.clone())) {
+                seed.rate_down = history.current().0;
             }
         }
         self.apply_peer(detail, peer);

@@ -15,7 +15,7 @@ use std::time::Instant;
 mod peer;
 mod torrent;
 
-pub use peer::{PeerFlags, PeerStats};
+pub use peer::{PeerFlags, PeerStats, WebSeedState, WebSeedStats};
 pub(crate) use torrent::PieceSource;
 pub use torrent::{
     Layout, PeerSource, PieceSnapshot, Previous, TorrentState, TorrentStats, TrackerResult,
