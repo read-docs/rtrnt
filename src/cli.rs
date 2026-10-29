@@ -14,24 +14,10 @@ pub(crate) struct Args {
     /// and add them
     #[arg(value_parser = parse_source, value_name = "TORRENT")]
     pub(crate) torrents: Vec<Source>,
-    // Settings that the config file can also set have no clap default, so
-    // an unset flag falls back to the file. The defaults live in
-    // `rtrnt::config` and are spelled out in the help (checked by a test).
-    /// Directory to save the downloaded files in [default: .]
-    #[arg(short, long)]
-    pub(crate) output: Option<PathBuf>,
-    /// Maximum number of peers to download from at once, for each torrent
-    /// [default: 30]
-    #[arg(long)]
-    pub(crate) max_peers: Option<usize>,
-    /// Maximum number of peer connections open at once, across all
-    /// torrents [default: 200]
-    #[arg(long)]
-    pub(crate) max_connections: Option<usize>,
-    /// Port to listen on for incoming peers (0 picks a free one; so does a
-    /// port that is taken) [default: 6881]
-    #[arg(short, long)]
-    pub(crate) port: Option<u16>,
+    /// The settings the config file can also set, but for the on and off
+    /// flags below; see `options`.
+    #[command(flatten)]
+    pub(crate) settings: config::Options,
     /// Verify existing downloads against their torrents instead of
     /// downloading; exits with an error unless every piece is intact
     #[arg(long)]
@@ -60,15 +46,6 @@ pub(crate) struct Args {
     /// answers for each torrent
     #[arg(long, conflicts_with = "check")]
     pub(crate) scrape: bool,
-    /// Once the download is complete, keep seeding until we have uploaded
-    /// this many times the torrent's size (0: no ratio limit) [default: 0]
-    #[arg(long, value_name = "RATIO", value_parser = parse_ratio)]
-    pub(crate) seed_ratio: Option<f64>,
-    /// Once the download is complete, keep seeding for this many minutes
-    /// (0: no time limit). Seeding stops at whichever limit comes first, or
-    /// on Ctrl-C; with neither, the run ends at completion [default: 0]
-    #[arg(long, value_name = "MINUTES")]
-    pub(crate) seed_time: Option<u64>,
     /// Do not look for peers in the DHT, only ask the trackers (`dht =
     /// false` in the config file)
     #[arg(long, overrides_with = "dht")]
@@ -77,14 +54,6 @@ pub(crate) struct Args {
     /// says `dht = false`
     #[arg(long, overrides_with = "no_dht")]
     dht: bool,
-    /// Most piece data to download per second in KiB, across all peers of
-    /// all torrents (0: unlimited) [default: 0]
-    #[arg(long, value_name = "KIB/S")]
-    pub(crate) max_download_rate: Option<u64>,
-    /// Most piece data to upload per second in KiB, across all peers of all
-    /// torrents (0: unlimited) [default: 0]
-    #[arg(long, value_name = "KIB/S")]
-    pub(crate) max_upload_rate: Option<u64>,
     /// Show the full-screen terminal UI, never with --check, --scrape or
     /// --print-config [default: when stdout and stderr are terminals]
     #[arg(long, overrides_with = "no_tui")]
@@ -98,12 +67,6 @@ pub(crate) struct Args {
     /// loaded or saved anyway, unless the config file says `session = true`
     #[arg(long)]
     no_session: bool,
-    /// Add the .torrent files, and the .magnet files holding a magnet link,
-    /// that appear in this directory, checked every 2 seconds; each is
-    /// renamed to <name>.added once taken, or <name>.invalid if it does not
-    /// parse. With it the run goes on with no torrent left, until Ctrl-C
-    #[arg(long, value_name = "DIR")]
-    pub(crate) watch_dir: Option<PathBuf>,
     /// Delete the files taken from the watch directory instead of renaming
     /// them to <name>.added (`watch-dir-delete = true` in the config file)
     #[arg(long)]
@@ -111,6 +74,17 @@ pub(crate) struct Args {
 }
 
 impl Args {
+    /// The settings given on the command line.
+    pub(crate) fn options(&self) -> config::Options {
+        config::Options {
+            dht: self.dht(),
+            tui: self.tui(),
+            session: self.session(),
+            watch_dir_delete: self.watch_dir_delete(),
+            ..self.settings.clone()
+        }
+    }
+
     /// Whether the DHT was turned on or off on the command line: by the last
     /// of `--dht` and `--no-dht`, if either is given.
     pub(crate) fn dht(&self) -> Option<bool> {
@@ -181,14 +155,6 @@ fn tri(on: bool, off: bool) -> Option<bool> {
 /// Parses a torrent argument (see `Source::parse`).
 fn parse_source(arg: &str) -> Result<Source, String> {
     Source::parse(arg).map_err(|e| format!("{e:#}"))
-}
-
-/// Parses `--seed-ratio`, which must be a finite number, 0 or more.
-fn parse_ratio(arg: &str) -> Result<f64, String> {
-    match arg.parse::<f64>() {
-        Ok(ratio) if config::is_valid_ratio(ratio) => Ok(ratio),
-        _ => Err(format!("{arg:?} is not a ratio of 0 or more")),
-    }
 }
 
 #[cfg(test)]

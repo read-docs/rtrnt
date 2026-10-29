@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         .as_ref()
         .is_ok_and(|file| file.options.watch_dir.is_some());
     let use_tui = args.use_tui(file_tui, terminals);
-    let watching = args.watch_dir.is_some() || file_watches;
+    let watching = args.settings.watch_dir.is_some() || file_watches;
     if let Err(e) = args.check_torrents(use_tui, watching) {
         e.exit();
     }
@@ -72,8 +72,6 @@ async fn main() -> anyhow::Result<ExitCode> {
     };
 
     let file = file?;
-    let cli_session = args.session();
-    let cli_watch_delete = args.watch_dir_delete();
     // The session is kept by the terminal UI unless the settings say
     // otherwise; --print-config says what a run in the UI would load.
     let ui_would_run = if args.print_config {
@@ -82,21 +80,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         use_tui
     };
     let use_session = args.use_session(file.options.session, ui_would_run);
-    let cli = config::Options {
-        dht: args.dht(),
-        tui: args.tui(),
-        output: args.output,
-        max_peers: args.max_peers,
-        max_connections: args.max_connections,
-        port: args.port,
-        seed_ratio: args.seed_ratio,
-        seed_time: args.seed_time,
-        max_download_rate: args.max_download_rate,
-        max_upload_rate: args.max_upload_rate,
-        session: cli_session,
-        watch_dir: args.watch_dir,
-        watch_dir_delete: cli_watch_delete,
-    };
+    let cli = args.options();
     let store = if use_session {
         let store = SessionStore::in_state_dir();
         if store.is_none() {

@@ -73,7 +73,7 @@ fn no_torrent_is_accepted_only_with_the_ui() {
 #[test]
 fn the_watch_directory_flags() {
     let args = Args::try_parse_from(["rtrnt", "--watch-dir", "/drop"]).unwrap();
-    assert_eq!(args.watch_dir, Some(PathBuf::from("/drop")));
+    assert_eq!(args.settings.watch_dir, Some(PathBuf::from("/drop")));
     assert_eq!(args.watch_dir_delete(), None);
     let args =
         Args::try_parse_from(["rtrnt", "--watch-dir", "/drop", "--watch-dir-delete"]).unwrap();
@@ -178,10 +178,10 @@ fn recheck_is_off_unless_asked_for() {
 #[test]
 fn seed_and_rate_flags_are_optional() {
     let args = Args::try_parse_from(["rtrnt", "x.torrent"]).unwrap();
-    assert_eq!(args.seed_ratio, None);
-    assert_eq!(args.seed_time, None);
-    assert_eq!(args.max_download_rate, None);
-    assert_eq!(args.max_upload_rate, None);
+    assert_eq!(args.settings.seed_ratio, None);
+    assert_eq!(args.settings.seed_time, None);
+    assert_eq!(args.settings.max_download_rate, None);
+    assert_eq!(args.settings.max_upload_rate, None);
     let args = Args::try_parse_from([
         "rtrnt",
         "x.torrent",
@@ -192,8 +192,8 @@ fn seed_and_rate_flags_are_optional() {
     ])
     .unwrap();
     // An explicit 0 is a setting, which beats the config file.
-    assert_eq!(args.seed_ratio, Some(0.0));
-    assert_eq!(args.max_upload_rate, Some(0));
+    assert_eq!(args.settings.seed_ratio, Some(0.0));
+    assert_eq!(args.settings.max_upload_rate, Some(0));
     assert!(Args::try_parse_from(["rtrnt", "x.torrent", "--seed-ratio", "-1"]).is_err());
 }
 

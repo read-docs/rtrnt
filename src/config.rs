@@ -40,51 +40,175 @@ pub const DEFAULT_MAX_DOWNLOAD_RATE: u64 = 0;
 /// Upload limit in KiB/s: none.
 pub const DEFAULT_MAX_UPLOAD_RATE: u64 = 0;
 
-/// Settings that can come from the command line or the config file. A
-/// field left `None` is not set there and falls back to the next source.
-#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct Options {
-    /// Directory to save the downloaded files in.
-    pub output: Option<PathBuf>,
-    /// Maximum number of peers to download from at once, for each torrent.
-    pub max_peers: Option<usize>,
-    /// Maximum number of peer connections open at once, across every
-    /// torrent.
-    pub max_connections: Option<usize>,
-    /// Port to listen on for incoming peers; 0 picks a free one.
-    pub port: Option<u16>,
+/// What a setting is when nothing sets it.
+enum Fallback<T> {
+    /// This built-in default.
+    Value(T),
+    /// None: the code that reads it decides, as this says.
+    Unset(&'static str),
+}
+
+/// A setting's value written as TOML.
+trait ToToml {
+    fn to_toml(&self) -> String;
+}
+
+impl ToToml for PathBuf {
+    fn to_toml(&self) -> String {
+        toml::Value::from(self.display().to_string()).to_string()
+    }
+}
+
+/// A whole ratio is written `1.0`, so it reads back as a float.
+impl ToToml for f64 {
+    fn to_toml(&self) -> String {
+        toml::Value::from(*self).to_string()
+    }
+}
+
+macro_rules! to_toml_by_display {
+    ($($ty:ty),*) => {$(
+        impl ToToml for $ty {
+            fn to_toml(&self) -> String {
+                self.to_string()
+            }
+        }
+    )*};
+}
+
+to_toml_by_display!(bool, u16, u64, usize);
+
+/// One setting as `describe` sees it.
+struct Setting {
+    /// Its key in the config file.
+    key: String,
+    /// Its value as TOML, if set.
+    value: Option<String>,
+    /// What it is when unset, as TOML.
+    fallback: Fallback<String>,
+}
+
+/// Declares `Options`, which both the command line (through clap) and the
+/// config file (through serde) read, from one list of settings, each
+/// followed by `= ` and its [`Fallback`]; and with it the code that goes
+/// over every setting, so a new one is added in this list only.
+macro_rules! options {
+    ($(
+        $(#[$attr:meta])*
+        $field:ident: $ty:ty = $fallback:expr;
+    )*) => {
+        /// Settings that can come from the command line or the config
+        /// file. A field left `None` is not set there and falls back to the
+        /// next source. The doc comments are the command line's help.
+        #[derive(Debug, Default, Clone, PartialEq, Deserialize, clap::Args)]
+        #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+        pub struct Options {
+            $($(#[$attr])* pub $field: Option<$ty>,)*
+        }
+
+        impl Options {
+            /// Takes each setting from `self`, or from `fallback` where
+            /// `self` leaves it unset.
+            pub fn or(self, fallback: Options) -> Options {
+                Options {
+                    $($field: self.$field.or(fallback.$field),)*
+                }
+            }
+
+            /// Each setting, in the order of the list.
+            fn settings(&self) -> Vec<Setting> {
+                use Fallback::{Unset, Value};
+                vec![$({
+                    let fallback: Fallback<$ty> = $fallback;
+                    Setting {
+                        key: stringify!($field).replace('_', "-"),
+                        value: self.$field.as_ref().map(ToToml::to_toml),
+                        fallback: match fallback {
+                            Value(value) => Value(value.to_toml()),
+                            Unset(text) => Unset(text),
+                        },
+                    }
+                },)*]
+            }
+        }
+    };
+}
+
+// Settings that the config file can also set have no clap default, so an
+// unset flag falls back to the file. The defaults are spelled out in the
+// help (checked by a test). The on and off flags of the settings marked
+// `skip` are in `Args`, which fills them in.
+options! {
+    /// Directory to save the downloaded files in [default: .]
+    #[arg(short, long)]
+    output: PathBuf = Value(PathBuf::from(DEFAULT_OUTPUT_DIR));
+    /// Maximum number of peers to download from at once, for each torrent
+    /// [default: 30]
+    #[arg(long)]
+    max_peers: usize = Value(DEFAULT_MAX_PEERS);
+    /// Maximum number of peer connections open at once, across all
+    /// torrents [default: 200]
+    #[arg(long)]
+    max_connections: usize = Value(DEFAULT_MAX_CONNECTIONS);
+    /// Port to listen on for incoming peers (0 picks a free one; so does a
+    /// port that is taken) [default: 6881]
+    #[arg(short, long)]
+    port: u16 = Value(peer::DEFAULT_LISTEN_PORT);
     /// Once the download is complete, keep seeding until we have uploaded
-    /// this many times the torrent's size; 0 for no ratio limit.
+    /// this many times the torrent's size (0: no ratio limit) [default: 0]
+    #[arg(long, value_name = "RATIO", value_parser = parse_ratio)]
     #[serde(default, deserialize_with = "deserialize_ratio")]
-    pub seed_ratio: Option<f64>,
-    /// Once the download is complete, keep seeding for this many minutes; 0
-    /// for no time limit.
-    pub seed_time: Option<u64>,
+    seed_ratio: f64 = Value(DEFAULT_SEED_RATIO);
+    /// Once the download is complete, keep seeding for this many minutes
+    /// (0: no time limit). Seeding stops at whichever limit comes first, or
+    /// on Ctrl-C; with neither, the run ends at completion [default: 0]
+    #[arg(long, value_name = "MINUTES")]
+    seed_time: u64 = Value(DEFAULT_SEED_TIME);
     /// Whether to look for peers in the DHT too (`--no-dht` is
     /// `dht = false`).
-    pub dht: Option<bool>,
-    /// Most block data to download per second, in KiB; 0 for no limit.
-    pub max_download_rate: Option<u64>,
-    /// Most block data to upload per second, in KiB; 0 for no limit.
-    pub max_upload_rate: Option<u64>,
+    #[arg(skip)]
+    dht: bool = Value(DEFAULT_DHT);
+    /// Most piece data to download per second in KiB, across all peers of
+    /// all torrents (0: unlimited) [default: 0]
+    #[arg(long, value_name = "KIB/S")]
+    max_download_rate: u64 = Value(DEFAULT_MAX_DOWNLOAD_RATE);
+    /// Most piece data to upload per second in KiB, across all peers of all
+    /// torrents (0: unlimited) [default: 0]
+    #[arg(long, value_name = "KIB/S")]
+    max_upload_rate: u64 = Value(DEFAULT_MAX_UPLOAD_RATE);
     /// Whether to show the terminal UI; unset, it shows when stdout and
     /// stderr are terminals.
-    pub tui: Option<bool>,
-    /// Whether to remember the torrents and rate limits across runs (`--no-session`
-    /// is `session = false`); unset, the terminal UI does and the rest does not.
-    pub session: Option<bool>,
-    /// A directory to take `.torrent` and `.magnet` files from (see
-    /// `watch`).
-    pub watch_dir: Option<PathBuf>,
+    #[arg(skip)]
+    tui: bool = Unset("when stdout and stderr are terminals");
+    /// Whether to remember the torrents and rate limits across runs
+    /// (`--no-session` is `session = false`); unset, the terminal UI does
+    /// and the rest does not.
+    #[arg(skip)]
+    session: bool = Unset("only in the terminal UI");
+    /// Add the .torrent files, and the .magnet files holding a magnet link,
+    /// that appear in this directory, checked every 2 seconds; each is
+    /// renamed to <name>.added once taken, or <name>.invalid if it does not
+    /// parse. With it the run goes on with no torrent left, until Ctrl-C
+    #[arg(long, value_name = "DIR")]
+    watch_dir: PathBuf = Unset("none");
     /// Whether to delete the files taken from the watch directory instead
     /// of renaming them to `<name>.added`.
-    pub watch_dir_delete: Option<bool>,
+    #[arg(skip)]
+    watch_dir_delete: bool = Value(DEFAULT_WATCH_DIR_DELETE);
 }
 
 /// Whether `ratio` is a valid seed ratio: a finite number, 0 or more.
 pub fn is_valid_ratio(ratio: f64) -> bool {
     ratio.is_finite() && ratio >= 0.0
+}
+
+/// Parses `--seed-ratio`, which must be a valid ratio (see
+/// `is_valid_ratio`).
+fn parse_ratio(arg: &str) -> Result<f64, String> {
+    match arg.parse::<f64>() {
+        Ok(ratio) if is_valid_ratio(ratio) => Ok(ratio),
+        _ => Err(format!("{arg:?} is not a ratio of 0 or more")),
+    }
 }
 
 /// Reads `seed-ratio`, which must be a valid ratio (see `is_valid_ratio`).
@@ -100,26 +224,6 @@ fn deserialize_ratio<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Optio
 }
 
 impl Options {
-    /// Takes each setting from `self`, or from `fallback` where `self`
-    /// leaves it unset.
-    pub fn or(self, fallback: Options) -> Options {
-        Options {
-            output: self.output.or(fallback.output),
-            max_peers: self.max_peers.or(fallback.max_peers),
-            max_connections: self.max_connections.or(fallback.max_connections),
-            port: self.port.or(fallback.port),
-            seed_ratio: self.seed_ratio.or(fallback.seed_ratio),
-            seed_time: self.seed_time.or(fallback.seed_time),
-            dht: self.dht.or(fallback.dht),
-            max_download_rate: self.max_download_rate.or(fallback.max_download_rate),
-            max_upload_rate: self.max_upload_rate.or(fallback.max_upload_rate),
-            tui: self.tui.or(fallback.tui),
-            session: self.session.or(fallback.session),
-            watch_dir: self.watch_dir.or(fallback.watch_dir),
-            watch_dir_delete: self.watch_dir_delete.or(fallback.watch_dir_delete),
-        }
-    }
-
     /// The download config these settings give, with the built-in default
     /// for each one left unset.
     pub fn into_download_config(self) -> DownloadConfig {
@@ -242,122 +346,31 @@ fn expand_tilde(path: PathBuf, home: Option<&Path>) -> Result<PathBuf> {
 /// session file has, which rank between the command line and the config
 /// file.
 pub fn describe(cli: &Options, session: &Options, file: &ConfigFile) -> String {
-    let source = |in_cli: bool, in_file: bool| match (in_cli, in_file) {
-        (true, _) => "command line",
-        (false, true) => "config file",
-        (false, false) => "default",
-    };
-    let rate_source = |in_cli: bool, in_session: bool, in_file: bool| {
-        if !in_cli && in_session {
-            "session"
-        } else {
-            source(in_cli, in_file)
-        }
-    };
-    let config = resolve(cli.clone().or(session.clone()), file.options.clone());
-    let output = toml::Value::from(config.output_dir.display().to_string());
-    let lines = [
-        (
-            "output",
-            output.to_string(),
-            source(cli.output.is_some(), file.options.output.is_some()),
-        ),
-        (
-            "max-peers",
-            config.max_peers.to_string(),
-            source(cli.max_peers.is_some(), file.options.max_peers.is_some()),
-        ),
-        (
-            "max-connections",
-            config.max_connections.to_string(),
-            source(
-                cli.max_connections.is_some(),
-                file.options.max_connections.is_some(),
-            ),
-        ),
-        (
-            "port",
-            config.listen_port.to_string(),
-            source(cli.port.is_some(), file.options.port.is_some()),
-        ),
-        (
-            "seed-ratio",
-            toml::Value::from(config.seed.ratio).to_string(),
-            source(cli.seed_ratio.is_some(), file.options.seed_ratio.is_some()),
-        ),
-        (
-            "seed-time",
-            (config.seed.time.as_secs() / 60).to_string(),
-            source(cli.seed_time.is_some(), file.options.seed_time.is_some()),
-        ),
-        (
-            "dht",
-            config.dht.to_string(),
-            source(cli.dht.is_some(), file.options.dht.is_some()),
-        ),
-        (
-            "max-download-rate",
-            config.max_download_rate.to_string(),
-            rate_source(
-                cli.max_download_rate.is_some(),
-                session.max_download_rate.is_some(),
-                file.options.max_download_rate.is_some(),
-            ),
-        ),
-        (
-            "max-upload-rate",
-            config.max_upload_rate.to_string(),
-            rate_source(
-                cli.max_upload_rate.is_some(),
-                session.max_upload_rate.is_some(),
-                file.options.max_upload_rate.is_some(),
-            ),
-        ),
-    ];
-
     let header = match &file.path {
         Some(path) => format!("# config file: {}\n", path.display()),
         None => "# no config file\n".to_string(),
     };
-    let settings = lines
+    let lines = cli
+        .settings()
         .into_iter()
-        .map(|(key, value, source)| format!("{key} = {value}  # {source}\n"));
-    let tui = match cli.tui.or(file.options.tui) {
-        Some(tui) => format!(
-            "tui = {tui}  # {}\n",
-            source(cli.tui.is_some(), file.options.tui.is_some())
-        ),
-        None => "# tui: when stdout and stderr are terminals  # default\n".to_string(),
-    };
-    let session_line = match cli.session.or(file.options.session) {
-        Some(on) => format!(
-            "session = {on}  # {}\n",
-            source(cli.session.is_some(), file.options.session.is_some())
-        ),
-        None => "# session: only in the terminal UI  # default\n".to_string(),
-    };
-    let watch_dir = match cli.watch_dir.as_ref().or(file.options.watch_dir.as_ref()) {
-        Some(dir) => format!(
-            "watch-dir = {}  # {}\n",
-            toml::Value::from(dir.display().to_string()),
-            source(cli.watch_dir.is_some(), file.options.watch_dir.is_some())
-        ),
-        None => "# watch-dir: none  # default\n".to_string(),
-    };
-    let watch_dir_delete = format!(
-        "watch-dir-delete = {}  # {}\n",
-        cli.watch_dir_delete
-            .or(file.options.watch_dir_delete)
-            .unwrap_or(DEFAULT_WATCH_DIR_DELETE),
-        source(
-            cli.watch_dir_delete.is_some(),
-            file.options.watch_dir_delete.is_some()
-        )
-    );
-    std::iter::once(header)
-        .chain(settings)
-        .chain([tui, session_line, watch_dir, watch_dir_delete])
-        .collect()
+        .zip(session.settings())
+        .zip(file.options.settings())
+        .map(|((cli, session), file)| {
+            let set = [
+                (cli.value, "command line"),
+                (session.value, "session"),
+                (file.value, "config file"),
+            ]
+            .into_iter()
+            .find_map(|(value, source)| Some((value?, source)));
+            let key = cli.key;
+            match (set, cli.fallback) {
+                (Some((value, source)), _) => format!("{key} = {value}  # {source}\n"),
+                (None, Fallback::Value(value)) => format!("{key} = {value}  # default\n"),
+                (None, Fallback::Unset(text)) => format!("# {key}: {text}  # default\n"),
+            }
+        });
+    std::iter::once(header).chain(lines).collect()
 }
 
 #[cfg(test)]
