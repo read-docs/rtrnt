@@ -18,6 +18,10 @@ const KEYS: &[(&str, &str)] = &[
     ("p  x", "pause or resume the selected torrent; remove it"),
     ("r", "hash the selected torrent's files again"),
     (
+        "o",
+        "download the selected torrent in order, first and last pieces first",
+    ),
+    (
         "space + -",
         "on the Files tab: skip a file, raise or lower it",
     ),

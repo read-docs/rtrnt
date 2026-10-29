@@ -87,6 +87,17 @@ pub fn draw(
         )),
     }
     facts.push((
+        "order",
+        vec![value(
+            if torrent.sequential {
+                "in order, first and last pieces of each file first"
+            } else {
+                "rarest first"
+            }
+            .to_string(),
+        )],
+    ));
+    facts.push((
         "save path",
         vec![value(torrent.save_path.display().to_string())],
     ));

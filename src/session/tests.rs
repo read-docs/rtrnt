@@ -10,6 +10,7 @@ fn saved(byte: u8, paused: bool) -> SavedTorrent {
         info_hash: [byte; 20],
         source: magnet(byte),
         paused,
+        sequential: None,
     }
 }
 
@@ -23,12 +24,15 @@ fn a_session_round_trips() {
                 info_hash: [1; 20],
                 source: Source::parse(link).unwrap(),
                 paused: true,
+                sequential: Some(true),
             },
             SavedTorrent {
                 info_hash: [2; 20],
                 source: Source::File("/state/torrents/0202.torrent".into()),
                 paused: false,
+                sequential: Some(false),
             },
+            saved(3, false),
         ],
         rate_limits: Some(SavedLimits {
             download: 100,
@@ -74,16 +78,19 @@ fn an_entry_that_makes_no_sense_is_skipped() {
                 info_hash: ByteBuf::from(vec![1; 3]),
                 source: "/x.torrent".into(),
                 paused: 0,
+                sequential: None,
             },
             StoredTorrent {
                 info_hash: ByteBuf::from(vec![2; 20]),
                 source: "magnet:?dn=no-hash".into(),
                 paused: 0,
+                sequential: None,
             },
             StoredTorrent {
                 info_hash: ByteBuf::from(vec![3; 20]),
                 source: "/x.torrent".into(),
                 paused: 1,
+                sequential: None,
             },
         ],
         rate_limits: None,
@@ -95,6 +102,7 @@ fn an_entry_that_makes_no_sense_is_skipped() {
             info_hash: [3; 20],
             source: Source::File("/x.torrent".into()),
             paused: true,
+            sequential: None,
         }]
     );
 }

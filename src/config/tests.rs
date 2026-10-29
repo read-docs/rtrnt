@@ -258,7 +258,8 @@ fn describe_names_each_source() {
          # watch-dir: none  # default\n\
          watch-dir-delete = false  # default\n\
          # blocklist: none  # default\n\
-         # completion-hook: none  # default\n"
+         # completion-hook: none  # default\n\
+         sequential = false  # default\n"
     );
     // The settings part is valid TOML that parses to the same values.
     let reparsed = parse(&text, None).unwrap();
@@ -272,6 +273,7 @@ fn describe_names_each_source() {
             max_download_rate: Some(0),
             max_upload_rate: Some(64),
             watch_dir_delete: Some(false),
+            sequential: Some(false),
             ..options(Some("/data"), Some(5), Some(6881))
         }
     );
@@ -449,5 +451,32 @@ fn the_completion_hook_is_an_argument_list() {
     assert_eq!(
         resolve(Options::default(), Options::default()).completion_hook,
         None
+    );
+}
+
+#[test]
+fn sequential_comes_from_the_command_line_then_the_file() {
+    assert!(!resolve(Options::default(), Options::default()).sequential);
+    let file = parse("sequential = true\n", None).unwrap();
+    assert_eq!(file.sequential, Some(true));
+    assert!(resolve(Options::default(), file.clone()).sequential);
+    let cli = Options {
+        sequential: Some(false),
+        ..Options::default()
+    };
+    assert!(!resolve(cli.clone(), file.clone()).sequential);
+    let config = ConfigFile {
+        path: None,
+        options: file,
+    };
+    let text = describe(&cli, &Options::default(), &config);
+    assert!(
+        text.contains("sequential = false  # command line\n"),
+        "{text}"
+    );
+    let text = describe(&Options::default(), &Options::default(), &config);
+    assert!(
+        text.contains("sequential = true  # config file\n"),
+        "{text}"
     );
 }

@@ -5,7 +5,7 @@ use crate::torrent::TorrentFile;
 use crate::tracker::AnnounceResponse;
 use crate::tracker::announcer::Transferred;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -166,6 +166,12 @@ pub struct TorrentStats {
     name: Mutex<String>,
     layout: OnceLock<Layout>,
     selection: Mutex<Option<Selected>>,
+    /// Whether the download takes its pieces in order, shared with its
+    /// queue so that it can change while the download runs.
+    sequential: Arc<AtomicBool>,
+    /// Whether `sequential` has been set, by the user or the session, so
+    /// that the default no longer applies.
+    sequential_chosen: AtomicBool,
     state: Mutex<TorrentState>,
     /// When the task ended.
     finished: OnceLock<Instant>,
@@ -209,6 +215,8 @@ impl TorrentStats {
             name: Mutex::new(name.to_string()),
             layout: OnceLock::new(),
             selection: Mutex::new(None),
+            sequential: Arc::default(),
+            sequential_chosen: AtomicBool::new(false),
             state: Mutex::new(TorrentState::QueuedForChecking),
             finished: OnceLock::new(),
             transferred: Arc::default(),
@@ -310,6 +318,56 @@ impl TorrentStats {
         lock(&self.selection)
             .as_ref()
             .map(|selected| selected.wanted)
+    }
+
+    /// Whether the download takes its pieces in order, the first and last
+    /// of each file first, rather than the rarest first.
+    pub fn sequential(&self) -> bool {
+        self.sequential.load(Ordering::Relaxed)
+    }
+
+    /// Whether the download is sequential, if that was chosen rather than
+    /// left to the default.
+    pub fn sequential_choice(&self) -> Option<bool> {
+        self.sequential_chosen
+            .load(Ordering::Relaxed)
+            .then(|| self.sequential())
+    }
+
+    /// The flag behind `sequential`, which the download's queue reads.
+    pub(crate) fn sequential_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.sequential)
+    }
+
+    /// Chooses whether the download is sequential, now and until it is
+    /// chosen again, even by a later run of the torrent.
+    pub fn set_sequential(&self, on: bool) {
+        self.sequential.store(on, Ordering::Relaxed);
+        self.sequential_chosen.store(true, Ordering::Relaxed);
+    }
+
+    /// Turns sequential download on or off, as `set_sequential` does, and
+    /// returns what it is now.
+    pub fn toggle_sequential(&self) -> bool {
+        let on = !self.sequential.fetch_xor(true, Ordering::Relaxed);
+        self.sequential_chosen.store(true, Ordering::Relaxed);
+        on
+    }
+
+    /// Makes the download sequential or not by default, unless that was
+    /// chosen already, by the user, the session, or an earlier run.
+    pub(crate) fn default_sequential(&self, on: bool) {
+        if !self.sequential_chosen.swap(true, Ordering::Relaxed) {
+            self.sequential.store(on, Ordering::Relaxed);
+        }
+    }
+
+    /// Takes the choice of sequential download `earlier` run of the same
+    /// torrent had made, if it made one.
+    pub(crate) fn inherit_sequential(&self, earlier: &TorrentStats) {
+        if earlier.sequential_chosen.load(Ordering::Relaxed) {
+            self.set_sequential(earlier.sequential());
+        }
     }
 
     pub fn state(&self) -> TorrentState {
@@ -510,6 +568,47 @@ impl TorrentStats {
 mod tests {
     use super::*;
     use std::net::SocketAddr;
+
+    #[test]
+    fn the_default_applies_until_sequential_is_chosen() {
+        let torrent = TorrentStats::new([1; 20], "t", Path::new("."));
+        assert_eq!(torrent.sequential_choice(), None);
+        torrent.default_sequential(true);
+        assert!(torrent.sequential());
+        // A default is a choice too: the first one stands.
+        torrent.default_sequential(false);
+        assert!(torrent.sequential());
+        let torrent = TorrentStats::new([1; 20], "t", Path::new("."));
+        assert!(torrent.toggle_sequential());
+        assert_eq!(torrent.sequential_choice(), Some(true));
+        torrent.default_sequential(false);
+        assert!(torrent.sequential());
+        assert!(!torrent.toggle_sequential());
+        assert_eq!(torrent.sequential_choice(), Some(false));
+    }
+
+    #[test]
+    fn the_flag_the_queue_reads_follows_the_choice() {
+        let torrent = TorrentStats::new([1; 20], "t", Path::new("."));
+        let flag = torrent.sequential_flag();
+        torrent.set_sequential(true);
+        assert!(flag.load(Ordering::Relaxed));
+        torrent.toggle_sequential();
+        assert!(!flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_later_run_inherits_a_choice_but_not_a_default() {
+        let earlier = TorrentStats::new([1; 20], "t", Path::new("."));
+        let later = TorrentStats::new([1; 20], "t", Path::new("."));
+        earlier.default_sequential(true);
+        later.inherit_sequential(&earlier);
+        assert_eq!(later.sequential_choice(), Some(true));
+        let earlier = TorrentStats::new([1; 20], "t", Path::new("."));
+        let later = TorrentStats::new([1; 20], "t", Path::new("."));
+        later.inherit_sequential(&earlier);
+        assert_eq!(later.sequential_choice(), None);
+    }
 
     #[test]
     fn dropped_peers_leave_the_list() {

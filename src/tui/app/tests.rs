@@ -11,6 +11,7 @@ pub(crate) fn torrent(hash: u8, name: &str) -> TorrentSnapshot {
         state: TorrentState::Downloading,
         layout: None,
         priorities: Vec::new(),
+        sequential: false,
         wanted: None,
         save_path: PathBuf::new(),
         verified: 0,
@@ -941,4 +942,36 @@ fn the_trackers_scroll_stops_where_the_view_does() {
     };
     app.fit_detail(&areas, &snapshot);
     assert_eq!(app.detail_scroll, 2);
+}
+
+#[test]
+fn o_toggles_sequential_download_of_the_selected_torrent() {
+    let mut snapshot = snapshot(&["a"]);
+    let mut app = App::new(Theme::default());
+    app.ensure_selection(&snapshot);
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('o')), &snapshot),
+        Action::Command(Command::ToggleSequential([0; 20]))
+    );
+    // Whatever it is doing, except being removed.
+    for state in [
+        TorrentState::Paused,
+        TorrentState::Done,
+        TorrentState::Pausing,
+    ] {
+        snapshot.torrents[0].state = state;
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('o')), &snapshot),
+            Action::Command(Command::ToggleSequential([0; 20]))
+        );
+    }
+    snapshot.torrents[0].state = TorrentState::Removing;
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('o')), &snapshot),
+        Action::None
+    );
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('o')), &Snapshot::default()),
+        Action::None
+    );
 }

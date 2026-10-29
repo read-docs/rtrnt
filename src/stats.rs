@@ -84,6 +84,7 @@ impl SessionStats {
                     earlier.added(),
                     previous,
                 ));
+                torrent.inherit_sequential(earlier);
                 *earlier = Arc::clone(&torrent);
                 torrent
             }

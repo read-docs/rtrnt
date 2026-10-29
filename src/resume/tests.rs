@@ -44,6 +44,7 @@ fn config(output: &Path, resume: &Path) -> DownloadConfig {
         listen_port: 0,
         seed: Default::default(),
         dht: false,
+        sequential: false,
         max_download_rate: 0,
         max_upload_rate: 0,
         completion_hook: None,

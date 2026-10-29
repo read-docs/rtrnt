@@ -71,6 +71,16 @@ pub(crate) struct Args {
     /// them to <name>.added (`watch-dir-delete = true` in the config file)
     #[arg(long)]
     watch_dir_delete: bool,
+    /// Download the pieces in order, the first and last of each file before
+    /// the rest, so that media can play while it downloads (`sequential =
+    /// true` in the config file); the terminal UI's `o` turns it on or off
+    /// for one torrent
+    #[arg(long, overrides_with = "no_sequential")]
+    sequential: bool,
+    /// Download the rarest pieces first, as by default, even if the config
+    /// file says `sequential = true`
+    #[arg(long, overrides_with = "sequential")]
+    no_sequential: bool,
 }
 
 impl Args {
@@ -81,6 +91,7 @@ impl Args {
             tui: self.tui(),
             session: self.session(),
             watch_dir_delete: self.watch_dir_delete(),
+            sequential: self.sequential(),
             ..self.settings.clone()
         }
     }
@@ -89,6 +100,12 @@ impl Args {
     /// of `--dht` and `--no-dht`, if either is given.
     pub(crate) fn dht(&self) -> Option<bool> {
         tri(self.dht, self.no_dht)
+    }
+
+    /// Whether sequential download was turned on or off on the command
+    /// line, as for `dht`.
+    pub(crate) fn sequential(&self) -> Option<bool> {
+        tri(self.sequential, self.no_sequential)
     }
 
     /// Whether the terminal UI was turned on or off on the command line, as

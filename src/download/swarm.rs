@@ -100,7 +100,9 @@ pub(crate) async fn download_with(
     let stats = &session.stats;
     let priorities = session.piece_priorities();
     let swarm = Arc::new(Swarm {
-        queue: PieceQueue::new(have, &priorities).seeding(seed.enabled()),
+        queue: PieceQueue::new(have, &priorities)
+            .seeding(seed.enabled())
+            .sequential(stats.sequential_flag(), session.piece_ranks()),
         progress: Progress::new(
             &session.bars,
             &torrent.info.name,

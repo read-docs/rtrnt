@@ -3,6 +3,8 @@ use crate::peer;
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 fn peer<'a>(queue: &'a PieceQueue, has: &[bool]) -> PeerPieces<'a> {
@@ -405,4 +407,71 @@ fn a_peer_with_only_skipped_pieces_is_not_wanted() {
     let queue = PieceQueue::new(&[false; 3], &[NORMAL, SKIP, SKIP]);
     assert!(!queue.wants(&peer(&queue, &[false, true, true])));
     assert!(queue.wants(&peer(&queue, &[true, false, false])));
+}
+
+/// Claims every piece the peer has, in the order the queue hands them out.
+fn claim_order(queue: &PieceQueue, seed: &PeerPieces<'_>) -> Vec<usize> {
+    let mut claims = Vec::new();
+    while let Some(claim) = queue.claim(seed, &[]) {
+        claims.push(claim);
+        // Endgame would duplicate a piece once none is pending.
+        if queue.lock().pending.is_empty() {
+            break;
+        }
+    }
+    claims.iter().map(|claim| claim.index).collect()
+}
+
+#[test]
+fn a_sequential_queue_takes_pieces_by_rank_whatever_their_rarity() {
+    let flag = Arc::new(AtomicBool::new(true));
+    // Rank 0 is piece 3, then 0, then the rest by index.
+    let queue = PieceQueue::all_wanted(&[false; 5]).sequential(flag, vec![1, 2, 3, 0, 4]);
+    // Piece 3 is the most common one.
+    let _a = peer(&queue, &[false, false, false, true, false]);
+    let _b = peer(&queue, &[false, false, false, true, false]);
+    let seed = peer(&queue, &[true; 5]);
+    assert_eq!(claim_order(&queue, &seed), [3, 0, 1, 2, 4]);
+}
+
+#[test]
+fn a_sequential_queue_without_ranks_goes_by_index() {
+    let flag = Arc::new(AtomicBool::new(true));
+    let queue = PieceQueue::all_wanted(&[false; 4]).sequential(flag, Vec::new());
+    let seed = peer(&queue, &[true; 4]);
+    assert_eq!(claim_order(&queue, &seed), [0, 1, 2, 3]);
+}
+
+#[test]
+fn sequential_can_be_switched_while_the_queue_runs() {
+    let flag = Arc::new(AtomicBool::new(false));
+    let queue = PieceQueue::all_wanted(&[false; 3]).sequential(Arc::clone(&flag), Vec::new());
+    // Pieces 0 and 1 are common, so the rarest first takes 2.
+    let _a = peer(&queue, &[true, true, false]);
+    let seed = peer(&queue, &[true; 3]);
+    assert_eq!(queue.claim(&seed, &[]).unwrap().index, 2);
+    flag.store(true, Ordering::Relaxed);
+    assert_eq!(queue.claim(&seed, &[]).unwrap().index, 0);
+    flag.store(false, Ordering::Relaxed);
+    assert_eq!(queue.claim(&seed, &[]).unwrap().index, 2);
+}
+
+#[test]
+fn a_sequential_queue_still_goes_by_priority_first() {
+    let flag = Arc::new(AtomicBool::new(true));
+    let queue = PieceQueue::new(&[false; 3], &[NORMAL, NORMAL, HIGH]).sequential(flag, Vec::new());
+    let seed = peer(&queue, &[true; 3]);
+    assert_eq!(claim_order(&queue, &seed), [2, 0, 1]);
+}
+
+#[test]
+fn a_sequential_queue_never_claims_skipped_or_owned_pieces() {
+    let flag = Arc::new(AtomicBool::new(true));
+    let queue = PieceQueue::new(
+        &[true, false, false, false],
+        &[NORMAL, SKIP, NORMAL, NORMAL],
+    )
+    .sequential(flag, Vec::new());
+    let seed = peer(&queue, &[true; 4]);
+    assert_eq!(claim_order(&queue, &seed), [2, 3]);
 }

@@ -256,3 +256,21 @@ fn select_file_takes_numbers_and_ranges() {
         );
     }
 }
+
+/// Without `--sequential` or `--no-sequential` the config file decides;
+/// with both, the last one wins.
+#[test]
+fn sequential_flags_fall_back_to_the_file() {
+    let sequential = |flags: &[&str]| {
+        let args = ["rtrnt", "x.torrent"].iter().chain(flags);
+        Args::try_parse_from(args).unwrap().options().sequential
+    };
+    assert_eq!(sequential(&[]), None);
+    assert_eq!(sequential(&["--sequential"]), Some(true));
+    assert_eq!(sequential(&["--no-sequential"]), Some(false));
+    assert_eq!(
+        sequential(&["--sequential", "--no-sequential"]),
+        Some(false)
+    );
+    assert_eq!(sequential(&["--no-sequential", "--sequential"]), Some(true));
+}

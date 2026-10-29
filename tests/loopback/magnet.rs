@@ -166,6 +166,7 @@ async fn downloads_a_magnet_link_banning_a_peer_with_bad_metadata() {
         seed: SeedLimits::default(),
         // Tests stay off the real internet.
         dht: false,
+        sequential: false,
         max_download_rate: 0,
         max_upload_rate: 0,
         completion_hook: None,
@@ -347,6 +348,7 @@ async fn downloads_a_magnet_link_from_another_rtrnt() {
         listen_port: 0,
         seed: SeedLimits::default(),
         dht: false,
+        sequential: false,
         max_download_rate: 0,
         max_upload_rate: 0,
         completion_hook: None,

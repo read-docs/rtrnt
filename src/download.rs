@@ -50,6 +50,9 @@ pub struct DownloadConfig {
     pub seed: SeedLimits,
     /// Whether to look for peers in the DHT too (never for private torrents).
     pub dht: bool,
+    /// Whether a torrent that has not been told otherwise downloads its
+    /// pieces in order (see `PieceQueue`) rather than the rarest first.
+    pub sequential: bool,
     /// Most block data to download per second, in KiB, across all peers;
     /// 0 for no limit.
     pub max_download_rate: u64,
@@ -129,6 +132,17 @@ impl Session {
         selection::piece_priorities(
             &self.torrent,
             self.storage.files(),
+            self.storage.selection(),
+        )
+    }
+
+    /// The place of each piece in a sequential download, by the selection
+    /// the storage was opened with.
+    pub fn piece_ranks(&self) -> Vec<usize> {
+        selection::sequential_ranks(
+            self.storage.files(),
+            self.torrent.info.piece_length,
+            self.torrent.num_pieces(),
             self.storage.selection(),
         )
     }
@@ -257,6 +271,10 @@ async fn download_loaded(
         &Storage::paths_async(&torrent.info, &config.output_dir).await?,
     )?;
 
+    match options.sequential {
+        Some(on) => stats.set_sequential(on),
+        None => stats.default_sequential(config.sequential),
+    }
     // Before announcing, so a bad output directory does not leave the
     // tracker without a `stopped`.
     let resume = Target::new(config, info_hash);
