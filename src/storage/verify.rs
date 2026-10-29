@@ -12,7 +12,7 @@ use tracing::warn;
 
 /// Most threads hashing at once. Reading from disk is usually the limit, and
 /// each thread holds a whole piece in memory.
-const MAX_THREADS: usize = 4;
+pub(crate) const MAX_THREADS: usize = 4;
 
 /// What `verify` does when a piece cannot be read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

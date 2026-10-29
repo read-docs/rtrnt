@@ -1,14 +1,21 @@
 use clap::error::ErrorKind;
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, Parser, Subcommand};
 use rtrnt::config;
+use rtrnt::create::parse_piece_length;
 use rtrnt::selection::FilePicks;
 use rtrnt::source::Source;
 use std::path::PathBuf;
 
 /// Download torrents from the terminal.
+///
+/// Without a subcommand, the arguments are the torrents to download. A
+/// file named `create` or `info` is taken for the subcommand: write
+/// `./info` for the file.
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about, args_conflicts_with_subcommands = true)]
 pub(crate) struct Args {
+    #[command(subcommand)]
+    pub(crate) command: Option<Subcommands>,
     /// Path to a .torrent file, or a magnet link (magnet:?xt=urn:btih:...);
     /// several are downloaded at once. The terminal UI can start with none,
     /// and add them
@@ -108,6 +115,53 @@ pub(crate) struct Args {
     /// them to <name>.added (`watch-dir-delete = true` in the config file)
     #[arg(long)]
     watch_dir_delete: bool,
+}
+
+/// What to do instead of downloading.
+#[derive(Subcommand)]
+pub(crate) enum Subcommands {
+    /// Print what a .torrent file says: its name, info hash, size, pieces,
+    /// trackers, web seeds, files and magnet link
+    Info {
+        /// The .torrent file to read
+        file: PathBuf,
+    },
+    /// Make a .torrent file of a file or a directory, and print its info
+    /// hash and magnet link
+    Create(CreateArgs),
+}
+
+/// The options of `rtrnt create`.
+#[derive(clap::Args)]
+pub(crate) struct CreateArgs {
+    /// The file, or the directory of files, to make a torrent of. Files
+    /// are listed in sorted order; symbolic links are left out, and
+    /// listed as they are
+    pub(crate) path: PathBuf,
+    /// Where to write the torrent [default: <name>.torrent]
+    #[arg(short, long, value_name = "FILE")]
+    pub(crate) output: Option<PathBuf>,
+    /// A tracker to announce to; repeat for more, each in a tier of its own
+    #[arg(short, long = "tracker", value_name = "URL")]
+    pub(crate) trackers: Vec<String>,
+    /// A web seed (BEP 19) that serves the files over HTTP; repeat for more
+    #[arg(short, long = "web-seed", value_name = "URL")]
+    pub(crate) web_seeds: Vec<String>,
+    /// Bytes in each piece: a power of two from 16k to 64m, written as
+    /// 262144, 256k or 4m [default: for 1000 to 2000 pieces, within 16k to
+    /// 16m]
+    #[arg(long, value_name = "SIZE", value_parser = parse_piece_length)]
+    pub(crate) piece_length: Option<u64>,
+    /// Mark the torrent private: its peers come from its trackers only
+    #[arg(long)]
+    pub(crate) private: bool,
+    /// A comment to put in the torrent
+    #[arg(long)]
+    pub(crate) comment: Option<String>,
+    /// A tag to put in the torrent's info dictionary, as some private
+    /// trackers ask for; it changes the info hash
+    #[arg(long)]
+    pub(crate) source: Option<String>,
 }
 
 impl Args {

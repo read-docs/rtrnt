@@ -3,8 +3,10 @@
 pub mod bencode;
 pub mod client;
 pub mod config;
+pub mod create;
 pub mod dht;
 pub mod download;
+pub mod info;
 pub mod listener;
 pub mod magnet;
 pub mod manager;

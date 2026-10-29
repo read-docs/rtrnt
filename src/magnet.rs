@@ -204,7 +204,8 @@ fn parse_base32(text: &str) -> Option<[u8; 20]> {
     (filled == 20 && bits == 0).then_some(hash)
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// `bytes` as lowercase hex digits.
+pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

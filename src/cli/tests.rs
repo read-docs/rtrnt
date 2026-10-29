@@ -234,3 +234,72 @@ fn select_file_takes_numbers_and_ranges() {
         );
     }
 }
+
+#[test]
+fn subcommands_leave_plain_invocations_alone() {
+    // Downloading, with torrents and options in any order.
+    for argv in [
+        &["rtrnt"][..],
+        &["rtrnt", "a.torrent"],
+        &["rtrnt", "-o", "out", "a.torrent", "b.torrent"],
+        &["rtrnt", "--check", "a.torrent", "-o", "out"],
+        &["rtrnt", "./create", "./info"],
+    ] {
+        let args = Args::try_parse_from(argv).unwrap();
+        assert!(args.command.is_none(), "{argv:?}");
+    }
+    let args = Args::try_parse_from(["rtrnt", "./create", "./info"]).unwrap();
+    assert_eq!(args.torrents.len(), 2);
+}
+
+#[test]
+fn parses_info_and_create() {
+    let args = Args::try_parse_from(["rtrnt", "info", "a.torrent"]).unwrap();
+    assert!(
+        matches!(args.command, Some(Subcommands::Info { file }) if file == Path::new("a.torrent"))
+    );
+    assert!(args.torrents.is_empty());
+
+    let args = Args::try_parse_from([
+        "rtrnt",
+        "create",
+        "dir",
+        "-o",
+        "out.torrent",
+        "--tracker",
+        "udp://a:1",
+        "-t",
+        "http://b/announce",
+        "--web-seed",
+        "https://w/",
+        "--piece-length",
+        "256k",
+        "--private",
+        "--comment",
+        "hi",
+        "--source",
+        "SRC",
+    ])
+    .unwrap();
+    let Some(Subcommands::Create(create)) = args.command else {
+        panic!("not parsed as create");
+    };
+    assert_eq!(create.path, Path::new("dir"));
+    assert_eq!(create.output.as_deref(), Some(Path::new("out.torrent")));
+    assert_eq!(create.trackers, ["udp://a:1", "http://b/announce"]);
+    assert_eq!(create.web_seeds, ["https://w/"]);
+    assert_eq!(create.piece_length, Some(256 * 1024));
+    assert!(create.private);
+    assert_eq!(create.comment.as_deref(), Some("hi"));
+    assert_eq!(create.source.as_deref(), Some("SRC"));
+
+    assert!(Args::try_parse_from(["rtrnt", "create"]).is_err());
+    assert!(Args::try_parse_from(["rtrnt", "create", "d", "--piece-length", "20000"]).is_err());
+    // A subcommand is only the first argument; after an option the word is
+    // a torrent, as it was before there were subcommands.
+    let args = Args::try_parse_from(["rtrnt", "--check", "info", "a.torrent"]).unwrap();
+    assert!(args.command.is_none());
+    assert_eq!(args.torrents.len(), 2);
+    // And the download options do not go with a subcommand.
+    assert!(Args::try_parse_from(["rtrnt", "info", "a.torrent", "--check"]).is_err());
+}
