@@ -12,9 +12,10 @@ use crate::tui::log_buffer::LogBuffer;
 use crate::tui::snapshot::{Snapshot, TorrentSnapshot};
 use serde_json::{Value, json};
 use std::fmt::Write as _;
-use std::io;
+use std::future::Future;
+use std::io::{self, Write};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -80,6 +81,37 @@ pub fn sample_every(stats: Arc<SessionStats>, period: Duration) -> watch::Receiv
         }
     });
     receiver
+}
+
+/// How often `--json` prints the state of the session.
+pub const JSON_PERIOD: Duration = Duration::from_secs(1);
+
+/// Writes a line of JSON (see `json_line`) for the session to `out` now and
+/// then every `period`, and once more when `stop` resolves, which is when
+/// the torrents have ended and their last state is in. Fails, without a
+/// last line, if `out` cannot be written to, such as a closed pipe.
+pub async fn report_json(
+    mut sampler: Sampler,
+    period: Duration,
+    mut out: impl Write,
+    stop: impl Future<Output = ()>,
+) -> io::Result<()> {
+    let mut line = |snapshot: &Snapshot| -> io::Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        writeln!(out, "{}", json_line(snapshot, now))?;
+        out.flush()
+    };
+    let mut tick = tokio::time::interval(period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tokio::pin!(stop);
+    loop {
+        tokio::select! {
+            _ = tick.tick() => line(&sampler.sample())?,
+            () = &mut stop => return line(&sampler.sample()),
+        }
+    }
 }
 
 /// What a torrent's state is called in the output: the words the terminal

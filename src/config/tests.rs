@@ -265,7 +265,8 @@ fn describe_names_each_source() {
          sequential = false  # default\n\
          alt-speed-download = 50  # default\n\
          alt-speed-upload = 50  # default\n\
-         # alt-speed-schedule: only by hand  # default\n"
+         # alt-speed-schedule: only by hand  # default\n\
+         # metrics-listen: off  # default\n"
     );
     // The settings part is valid TOML that parses to the same values.
     let reparsed = parse(&text, None).unwrap();
@@ -564,4 +565,43 @@ fn queue_limits_come_from_the_command_line_then_the_file_and_default_to_none() {
         }
     );
     assert!(parse("max-active-seeds = -1\n", None).is_err());
+}
+
+#[test]
+fn metrics_listen_is_off_unless_an_address_is_set() {
+    let file = parse("metrics-listen = \"127.0.0.1:9100\"\n", None).unwrap();
+    assert_eq!(file.metrics_listen, Some("127.0.0.1:9100".parse().unwrap()));
+    assert!(parse("metrics-listen = \"nonsense\"\n", None).is_err());
+    assert!(parse("metrics-listen = 9100\n", None).is_err());
+    let cli = Options {
+        metrics_listen: Some("[::1]:9200".parse().unwrap()),
+        ..Options::default()
+    };
+    let file = ConfigFile {
+        path: None,
+        options: file,
+    };
+    let text = describe(&cli, &Options::default(), &file);
+    assert!(
+        text.contains("metrics-listen = \"[::1]:9200\"  # command line\n"),
+        "{text}"
+    );
+    assert_eq!(
+        parse(&text, None).unwrap().metrics_listen,
+        cli.metrics_listen
+    );
+    let text = describe(&Options::default(), &Options::default(), &file);
+    assert!(
+        text.contains("metrics-listen = \"127.0.0.1:9100\"  # config file\n"),
+        "{text}"
+    );
+    let text = describe(
+        &Options::default(),
+        &Options::default(),
+        &ConfigFile::default(),
+    );
+    assert!(
+        text.contains("# metrics-listen: off  # default\n"),
+        "{text}"
+    );
 }

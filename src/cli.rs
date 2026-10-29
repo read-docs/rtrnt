@@ -46,6 +46,11 @@ pub(crate) struct Args {
     /// answers for each torrent
     #[arg(long, conflicts_with = "check")]
     pub(crate) scrape: bool,
+    /// Print the state of the session as one JSON object per line, every
+    /// second and once more at the end, instead of progress bars and the
+    /// terminal UI; log lines still go to stderr
+    #[arg(long, conflicts_with_all = ["tui", "check", "scrape", "print_config"])]
+    pub(crate) json: bool,
     /// Do not look for peers in the DHT, only ask the trackers (`dht =
     /// false` in the config file)
     #[arg(long, overrides_with = "dht")]
@@ -62,8 +67,9 @@ pub(crate) struct Args {
     /// if the config file says `portmap = false`
     #[arg(long, overrides_with = "no_portmap")]
     portmap: bool,
-    /// Show the full-screen terminal UI, never with --check, --scrape or
-    /// --print-config [default: when stdout and stderr are terminals]
+    /// Show the full-screen terminal UI, never with --check, --scrape,
+    /// --json or --print-config [default: when stdout and stderr are
+    /// terminals]
     #[arg(long, overrides_with = "no_tui")]
     tui: bool,
     /// Print progress bars and log lines instead of the terminal UI (`tui =
@@ -148,12 +154,12 @@ impl Args {
         !(self.check || self.scrape) && self.session().or(file_session).unwrap_or(tui)
     }
 
-    /// Whether to show the terminal UI: never with --check, --scrape or
-    /// --print-config, and otherwise as the command line says, or else the
+    /// Whether to show the terminal UI: never with --check, --scrape,
+    /// --print-config or --json, and otherwise as the command line says, or else the
     /// config file (`file_tui`), or else when `terminals` says stdout and
     /// stderr both are.
     pub(crate) fn use_tui(&self, file_tui: Option<bool>, terminals: impl FnOnce() -> bool) -> bool {
-        !(self.check || self.scrape || self.print_config)
+        !(self.check || self.scrape || self.print_config || self.json)
             && self.tui().or(file_tui).unwrap_or_else(terminals)
     }
 

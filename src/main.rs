@@ -2,7 +2,7 @@ mod cli;
 mod log_line;
 mod shutdown;
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use clap::Parser;
 use cli::Args;
 use indicatif::{MultiProgress, ProgressDrawTarget};
@@ -12,6 +12,7 @@ use rtrnt::client::Client;
 use rtrnt::download::{self, DownloadConfig};
 use rtrnt::magnet;
 use rtrnt::manager::{Command, EXIT_INTERRUPTED, Manager, Recheck, StartOptions};
+use rtrnt::metrics;
 use rtrnt::session::{self, SavedSession, SessionStore};
 use rtrnt::source::Source;
 use rtrnt::tui::log_buffer::LogBuffer;
@@ -24,7 +25,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::sync::{mpsc, watch};
+use tokio::net::TcpListener;
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -63,7 +65,13 @@ async fn main() -> anyhow::Result<ExitCode> {
         // The bars keep counting, but nothing draws them.
         MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
     } else {
-        let bars = MultiProgress::new();
+        // --json leaves stdout to the JSON lines, and the bars have no place
+        // beside them.
+        let bars = if args.json {
+            MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
+        } else {
+            MultiProgress::new()
+        };
         let log_bars = bars.clone();
         tracing_subscriber::fmt()
             .with_env_filter(filter)
@@ -131,6 +139,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     let effective = cli.or(from_session).or(file.options);
     let (alt_limits, alt_schedule) = effective.alt_speed();
     let queue_limits = effective.queue_limits();
+    let metrics_listen = effective.metrics_listen;
     let config = effective.into_download_config();
     if args.check || args.scrape {
         let (config, check_mode) = (&config, args.check);
@@ -150,6 +159,15 @@ async fn main() -> anyhow::Result<ExitCode> {
         None => Blocklist::default(),
     };
     let client = Arc::new(Client::new(config, bars).with_blocklist(Arc::new(blocklist)));
+    if let Some(addr) = metrics_listen {
+        // Bound before anything starts, so a taken address is an error.
+        let listener = TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("cannot listen for metrics on {addr}"))?;
+        info!(addr = %listener.local_addr()?, "serving metrics at /metrics");
+        let snapshots = metrics::sample_every(Arc::clone(client.stats()), metrics::SAMPLE_PERIOD);
+        tokio::spawn(metrics::serve(listener, snapshots));
+    }
     let shutdown = Shutdown::new();
     // Every torrent runs at once until it is done, and Ctrl-C stops them all.
     let mut manager = Manager::new(Arc::clone(&client), {
@@ -212,7 +230,24 @@ async fn main() -> anyhow::Result<ExitCode> {
         // Only the watcher, if there is one, sends commands: without it the
         // run ends with the last torrent.
         drop(commands);
+        let report = args.json.then(|| {
+            let (done, stop) = oneshot::channel::<()>();
+            let sampler = metrics::Sampler::new(Arc::clone(client.stats()));
+            let stop = async move {
+                // The run ends by dropping `done`.
+                let _ = stop.await;
+            };
+            let report =
+                metrics::report_json(sampler, metrics::JSON_PERIOD, std::io::stdout(), stop);
+            (done, tokio::spawn(report))
+        });
         let exit = manager.run(commands_rx).await;
+        if let Some((done, report)) = report {
+            drop(done);
+            if let Ok(Err(e)) = report.await {
+                warn!("cannot write the JSON lines: {e}");
+            }
+        }
         client.close_port_mappings().await;
         return exit;
     }

@@ -330,12 +330,7 @@ fn the_ratio_needs_something_downloaded() {
 
 #[tokio::test]
 async fn the_sampler_follows_a_session() {
-    use crate::client::ConnectionSlots;
-    use crate::rate_limit::RateLimits;
-    let stats = Arc::new(SessionStats::new(
-        Arc::new(RateLimits::default()),
-        ConnectionSlots::new(5),
-    ));
+    let stats = empty_session();
     stats.add_torrent([7; 20], "t", std::path::Path::new("/tmp"));
     let mut sampler = Sampler::new(Arc::clone(&stats));
     let first = sampler.sample();
@@ -352,4 +347,52 @@ async fn the_sampler_follows_a_session() {
     .await
     .unwrap()
     .unwrap();
+}
+
+fn empty_session() -> Arc<SessionStats> {
+    use crate::client::ConnectionSlots;
+    use crate::rate_limit::RateLimits;
+    Arc::new(SessionStats::new(
+        Arc::new(RateLimits::default()),
+        ConnectionSlots::new(5),
+    ))
+}
+
+#[tokio::test(start_paused = true)]
+async fn json_lines_come_every_period_and_once_more_at_the_end() {
+    let stats = empty_session();
+    stats.add_torrent([7; 20], "t", std::path::Path::new("/tmp"));
+    let mut out = Vec::new();
+    let stop = tokio::time::sleep(Duration::from_millis(2500));
+    report_json(Sampler::new(stats), Duration::from_secs(1), &mut out, stop)
+        .await
+        .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    // At 0, 1 and 2 seconds, and at the end.
+    assert_eq!(text.lines().count(), 4, "{text}");
+    for line in text.lines() {
+        assert_eq!(parse(line)["torrents"][0]["name"], "t");
+    }
+}
+
+#[tokio::test]
+async fn json_reporting_stops_when_the_output_closes() {
+    struct Closed;
+    impl Write for Closed {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let err = report_json(
+        Sampler::new(empty_session()),
+        Duration::from_secs(60),
+        Closed,
+        std::future::pending(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
 }
