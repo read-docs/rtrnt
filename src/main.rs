@@ -1,4 +1,5 @@
 mod cli;
+mod commands;
 mod log_line;
 mod shutdown;
 
@@ -35,7 +36,16 @@ const PROBLEMS_SHOWN_AFTER_UI: Duration = Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    if let Some(command) = args.command.take() {
+        return match commands::run(command).await {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
     // Relative paths given to the UI's `a` are under it. Should it be gone,
     // they stay relative, and fail to load.
     let start_dir = std::env::current_dir().unwrap_or_default();
