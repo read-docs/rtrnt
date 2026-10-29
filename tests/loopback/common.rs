@@ -303,6 +303,7 @@ pub(crate) fn limited_session(
         seed,
         dht: None,
         rate_limits: Arc::new(rate_limits),
+        torrent_limits: Arc::default(),
         metadata: Some(metadata),
         bars: MultiProgress::new(),
         resume: None,

@@ -1,6 +1,7 @@
 use super::*;
 use crate::download::{DownloadConfig, SeedLimits};
 use crate::stats::TorrentState;
+use crate::torrent_limits::TorrentSettings;
 use anyhow::anyhow;
 use indicatif::{MultiProgress, ProgressDrawTarget};
 use std::future::Future;
@@ -956,6 +957,7 @@ async fn a_saved_session_is_restored_in_order_and_paused_torrents_stay_paused() 
         info_hash: [how; 20],
         source: magnet(how),
         paused,
+        limits: Default::default(),
     };
     let limits = SavedLimits {
         download: 7,
@@ -1014,6 +1016,7 @@ async fn a_saved_torrent_that_no_longer_loads_is_reported_and_dropped() {
                 info_hash: [1; 20],
                 source: Source::File("/no/such/file.torrent".into()),
                 paused: true,
+                limits: Default::default(),
             }],
             rate_limits: None,
         })
@@ -1221,4 +1224,72 @@ async fn a_paused_torrent_keeps_the_choice_of_files_in_its_resume_file() {
         resume::load_selection(&target, 2),
         Some(FileSelection::new(vec![Priority::High; 2]))
     );
+}
+
+#[tokio::test]
+async fn a_torrent_keeps_its_own_limits_live_and_in_the_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path().to_path_buf());
+    let client = client();
+    let mut manager =
+        Manager::with_runner(Arc::clone(&client), never, fake_run).with_session(store.clone());
+    manager.expect_more();
+    let (running, done) = ([UNTIL_STOPPED; 20], [DONE; 20]);
+    manager
+        .start(
+            vec![magnet(UNTIL_STOPPED), magnet(DONE)],
+            StartOptions::default(),
+        )
+        .await;
+    let settings = TorrentSettings {
+        download: 30,
+        upload: 0,
+        seed_ratio_milli: Some(2000),
+        seed_time: None,
+    };
+    let live = client.stats().torrent_limits(running);
+    manager
+        .command(Command::SetTorrentLimits {
+            info_hash: running,
+            settings,
+        })
+        .await;
+    // The limits the running torrent holds are the ones changed.
+    assert_eq!(live.settings(), settings);
+    assert_eq!(live.rates().kib(), (30, 0));
+    assert_eq!(client.stats().torrent_settings(done), Default::default());
+    let saved = saved_session(&store);
+    assert_eq!(saved.torrents[0].limits, settings);
+    assert!(saved.torrents[1].limits.is_default());
+
+    // A torrent the session does not have gets nothing.
+    manager
+        .command(Command::SetTorrentLimits {
+            info_hash: [9; 20],
+            settings,
+        })
+        .await;
+    assert_eq!(client.stats().torrent_settings([9; 20]), Default::default());
+
+    // A restored session puts them back.
+    let next = client_in(dir.path());
+    let mut manager = Manager::with_runner(Arc::clone(&next), never, fake_run);
+    manager.expect_more();
+    manager.restore(saved_session(&store)).await;
+    assert_eq!(next.stats().torrent_settings(running), settings);
+    assert_eq!(next.stats().torrent_limits(running).rates().kib(), (30, 0));
+    assert_eq!(next.stats().torrent_settings(done), Default::default());
+
+    // Removing the torrent drops its settings.
+    manager
+        .command(Command::Remove {
+            info_hash: running,
+            delete: false,
+        })
+        .await;
+    while !manager.tasks.is_empty() {
+        let joined = manager.tasks.join_next_with_id().await.unwrap();
+        manager.ended(joined).await;
+    }
+    assert_eq!(next.stats().torrent_settings(running), Default::default());
 }

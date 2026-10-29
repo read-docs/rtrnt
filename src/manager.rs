@@ -11,6 +11,7 @@ use crate::source::Source;
 use crate::stats::{TorrentState, TorrentStats};
 use crate::storage::{self, Storage};
 use crate::torrent::{self, Info, Metainfo};
+use crate::torrent_limits::TorrentSettings;
 use anyhow::{Result, anyhow};
 use futures_util::future::BoxFuture;
 use std::collections::HashMap;
@@ -46,6 +47,13 @@ pub enum Command {
     SetPriorities {
         info_hash: [u8; 20],
         priorities: Vec<Priority>,
+    },
+    /// Give the torrent with this info hash its own limits and seed
+    /// settings (see `torrent_limits`), live: a running torrent does not
+    /// restart.
+    SetTorrentLimits {
+        info_hash: [u8; 20],
+        settings: TorrentSettings,
     },
     /// Drop the torrent with this info hash from the session, stopping it
     /// first if it runs, and with `delete` its files and resume file too.
@@ -295,6 +303,10 @@ where
                     continue;
                 }
             };
+            self.client
+                .stats()
+                .torrent_limits(saved.info_hash)
+                .set(saved.limits);
             let state = if saved.paused {
                 self.show_paused(&torrent, &saved.source);
                 State::Paused
@@ -375,6 +387,7 @@ where
                     info_hash: entry.info_hash,
                     source: entry.source.clone(),
                     paused,
+                    limits: self.client.stats().torrent_settings(entry.info_hash),
                 })
             })
             .collect();
@@ -911,6 +924,7 @@ where
         if let Some(stats) = &stats {
             self.client.stats().remove_torrent(stats);
         }
+        self.client.stats().forget_torrent_limits(entry.info_hash);
         let span = self.span(&entry.source);
         if !delete {
             self.drop_copy(&entry).await;
@@ -956,6 +970,23 @@ where
         }
     }
 
+    /// Applies `settings` to the torrent with `info_hash`, if the session
+    /// has it, and says so.
+    fn set_torrent_limits(&self, info_hash: [u8; 20], settings: TorrentSettings) {
+        if !self
+            .entries
+            .iter()
+            .any(|entry| entry.info_hash == info_hash)
+        {
+            return;
+        }
+        let stats = self.client.stats();
+        stats.torrent_limits(info_hash).set(settings);
+        let name = stats_of(&self.client, info_hash, |_| true)
+            .map_or_else(|| "torrent".to_string(), |torrent| torrent.name());
+        stats.notice(format!("{name}: {}", settings.describe()));
+    }
+
     async fn command(&mut self, command: Command) {
         let limit = |kib: u64| match kib {
             0 => "none".to_string(),
@@ -981,6 +1012,10 @@ where
                 info_hash,
                 priorities,
             } => self.set_priorities(info_hash, priorities).await,
+            Command::SetTorrentLimits {
+                info_hash,
+                settings,
+            } => self.set_torrent_limits(info_hash, settings),
             Command::Remove { info_hash, delete } => self.remove(info_hash, delete).await,
             Command::Add(source) => self.add(source).await,
             // The feed stops the torrents itself.

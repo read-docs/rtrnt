@@ -132,6 +132,7 @@ fn resumable_session(
         seed: SeedLimits::default(),
         dht: None,
         rate_limits: Arc::default(),
+        torrent_limits: Arc::default(),
         metadata: None,
         bars: MultiProgress::new(),
         resume: resume::Target::new(config, info_hash),

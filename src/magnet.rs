@@ -401,6 +401,7 @@ async fn fetch_and_download(
             seed: config.seed,
             dht,
             rate_limits: client.rate_limits(),
+            torrent_limits: client.stats().torrent_limits(info_hash),
             metadata: Some(fetched.metadata),
             bars: client.bars().clone(),
             resume,

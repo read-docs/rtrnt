@@ -19,6 +19,7 @@ pub mod state;
 pub mod stats;
 pub mod storage;
 pub mod torrent;
+pub mod torrent_limits;
 pub mod tracker;
 pub mod tui;
 pub mod watch;

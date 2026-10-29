@@ -8,6 +8,7 @@ use crate::selection::{self, FileSelection, Priority};
 use crate::stats::{PeerSource, TorrentStats};
 use crate::storage::Storage;
 use crate::torrent::{self, TorrentFile};
+use crate::torrent_limits::TorrentLimits;
 use crate::tracker::announcer::{Announcer, Transferred};
 use crate::tracker::{AnnounceEvent, AnnounceRequest};
 use anyhow::{Result, bail};
@@ -102,6 +103,9 @@ pub struct Session {
     /// How fast block data may move each way, shared by every peer (of
     /// every torrent in the session).
     pub rate_limits: Arc<RateLimits>,
+    /// What this torrent overrides of the session's limits and seed
+    /// settings; its rate limits are nested inside `rate_limits`.
+    pub torrent_limits: Arc<TorrentLimits>,
     /// The torrent's info dictionary exactly as encoded, if we have it, for
     /// peers that fetch it by magnet link (BEP 9).
     pub metadata: Option<Vec<u8>>,
@@ -269,6 +273,7 @@ async fn download_loaded(
         seed: config.seed,
         dht,
         rate_limits: client.rate_limits(),
+        torrent_limits: client.stats().torrent_limits(info_hash),
         metadata: Some(info_bytes),
         bars: client.bars().clone(),
         resume,

@@ -23,7 +23,12 @@ pub fn draw(frame: &mut Frame, app: &App, input: &Input, area: Rect) {
     spans.push(Span::raw("   "));
     let hints = match input.kind {
         InputKind::Filter => [("enter", "keep"), ("esc", "clear")],
-        InputKind::DownloadLimit | InputKind::UploadLimit => [("enter", "set"), ("esc", "cancel")],
+        InputKind::DownloadLimit
+        | InputKind::UploadLimit
+        | InputKind::TorrentDownloadLimit
+        | InputKind::TorrentUploadLimit
+        | InputKind::SeedRatio
+        | InputKind::SeedTime => [("enter", "set"), ("esc", "cancel")],
         InputKind::Add => [("enter", "add"), ("esc", "cancel")],
     };
     spans.extend(keys(theme, &hints));

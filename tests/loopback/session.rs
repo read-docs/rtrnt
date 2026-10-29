@@ -439,6 +439,7 @@ async fn a_torrent_waits_its_turn_to_check_its_data() {
         seed: SeedLimits::default(),
         dht: None,
         rate_limits: Arc::default(),
+        torrent_limits: Arc::default(),
         metadata: None,
         bars: MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::term_like(Box::new(
             term.clone(),

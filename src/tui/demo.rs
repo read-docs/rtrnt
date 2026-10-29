@@ -8,6 +8,7 @@ use super::snapshot::{
 };
 use super::{Command, Feed};
 use crate::stats::{Layout, PeerFlags, PieceSnapshot, TorrentState, TrackerResult, TrackerStatus};
+use crate::torrent_limits::TorrentSettings;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::net::SocketAddr;
@@ -373,6 +374,8 @@ pub struct DemoFeed {
     rng: StdRng,
     stopped: bool,
     rate_limits: (u64, u64),
+    /// What each torrent overrides, by info hash.
+    limits: std::collections::HashMap<[u8; 20], TorrentSettings>,
     /// The latest notice, and when it came.
     notice: Option<(Instant, String)>,
 }
@@ -396,6 +399,7 @@ impl DemoFeed {
             rng: StdRng::seed_from_u64(7),
             stopped: false,
             rate_limits: (0, 2048),
+            limits: std::collections::HashMap::new(),
             notice: None,
         }
     }
@@ -436,6 +440,7 @@ impl DemoFeed {
                 rate_down: 0.0,
                 rate_up: 0.0,
                 eta: None,
+                limits: self.limits.get(&info_hash(i)).copied().unwrap_or_default(),
             })
             .collect();
         let detail = selected.and_then(|hash| {
@@ -601,6 +606,13 @@ impl Feed for DemoFeed {
                 {
                     live.state = state;
                 }
+            }
+            Command::SetTorrentLimits {
+                info_hash,
+                settings,
+            } => {
+                self.limits.insert(info_hash, settings);
+                self.notice = Some((Instant::now(), settings.describe()));
             }
             Command::Recheck(_) => {
                 self.notice = Some((Instant::now(), "the demo checks nothing".into()));

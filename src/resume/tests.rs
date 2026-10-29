@@ -64,6 +64,7 @@ fn session(config: &DownloadConfig) -> Arc<Session> {
         seed: Default::default(),
         dht: None,
         rate_limits: Arc::default(),
+        torrent_limits: Arc::default(),
         metadata: None,
         bars: MultiProgress::new(),
         resume: Target::new(config, [7; 20]),

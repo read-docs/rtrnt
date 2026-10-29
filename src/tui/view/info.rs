@@ -2,6 +2,7 @@
 
 use super::{human_bytes, long_duration, torrents};
 use crate::stats::TorrentState;
+use crate::torrent_limits::format_ratio;
 use crate::tui::app::App;
 use crate::tui::snapshot::{Detail, TorrentSnapshot};
 use ratatui::Frame;
@@ -112,6 +113,37 @@ pub fn draw(
         ],
     ));
     facts.push(("active", vec![value(long_duration(torrent.active))]));
+    let limits = torrent.limits;
+    let dim = |text: &str| Span::styled(text.to_string(), theme.dim_style());
+    let rate = |kib: u64| match kib {
+        0 => dim("session's"),
+        kib => value(format!("{kib} KiB/s")),
+    };
+    facts.push((
+        "limits",
+        vec![
+            dim("↓ "),
+            rate(limits.download),
+            dim("  ↑ "),
+            rate(limits.upload),
+        ],
+    ));
+    facts.push((
+        "seed",
+        vec![
+            dim("ratio "),
+            match limits.seed_ratio_milli {
+                None => dim("session's"),
+                Some(milli) => value(format_ratio(milli)),
+            },
+            dim("  time "),
+            match limits.seed_time {
+                None => dim("session's"),
+                Some(0) => value("none".to_string()),
+                Some(minutes) => value(format!("{minutes} min")),
+            },
+        ],
+    ));
 
     let lines: Vec<Line> = facts
         .into_iter()
