@@ -1,5 +1,6 @@
 //! The session file: the torrents the terminal UI had, in the table's order,
-//! and the rate limits set from it, so that the next run starts where this
+//! and the rate limits set from it (and the alternative speed mode, see
+//! `altspeed`), so that the next run starts where this
 //! one left off.
 //!
 //! It is `session` in the state directory (see `state::state_dir`), bencoded
@@ -9,6 +10,7 @@
 //! the torrent was added, so a `.torrent` the user moves or deletes later
 //! still loads.
 
+use crate::altspeed::Override;
 use crate::magnet::MagnetLink;
 use crate::source::Source;
 use crate::state::write_atomically;
@@ -42,6 +44,15 @@ pub struct SavedLimits {
     pub upload: u64,
 }
 
+/// What the session file keeps of the alternative speed limits.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SavedAltSpeed {
+    /// The alternative limits, if they were set from the UI.
+    pub limits: Option<SavedLimits>,
+    /// The switch made by hand that was in force, if any.
+    pub manual: Option<Override>,
+}
+
 /// What the session file holds.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SavedSession {
@@ -49,6 +60,8 @@ pub struct SavedSession {
     pub torrents: Vec<SavedTorrent>,
     /// The limits set from the UI, if any ever was.
     pub rate_limits: Option<SavedLimits>,
+    /// The alternative speed limits and the manual switch, if either is set.
+    pub alt_speed: Option<SavedAltSpeed>,
 }
 
 /// The file as it is written.
@@ -62,6 +75,53 @@ struct Stored {
         skip_serializing_if = "Option::is_none"
     )]
     rate_limits: Option<SavedLimits>,
+    #[serde(rename = "alt speed", default, skip_serializing_if = "Option::is_none")]
+    alt_speed: Option<StoredAltSpeed>,
+}
+
+/// The alternative speed state as it is written; bencode has no booleans
+/// or nothing, so each is a number or left out.
+#[derive(Serialize, Deserialize)]
+struct StoredAltSpeed {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    download: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upload: Option<u64>,
+    /// 1 if the user switched the alternative limits on by hand, 0 if off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manual: Option<i64>,
+    /// 1 if the schedule had them on at that time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scheduled: Option<i64>,
+}
+
+impl From<SavedAltSpeed> for StoredAltSpeed {
+    fn from(saved: SavedAltSpeed) -> Self {
+        Self {
+            download: saved.limits.map(|limits| limits.download),
+            upload: saved.limits.map(|limits| limits.upload),
+            manual: saved.manual.map(|manual| i64::from(manual.alt)),
+            scheduled: saved.manual.map(|manual| i64::from(manual.scheduled)),
+        }
+    }
+}
+
+impl From<StoredAltSpeed> for SavedAltSpeed {
+    fn from(stored: StoredAltSpeed) -> Self {
+        Self {
+            limits: stored
+                .download
+                .zip(stored.upload)
+                .map(|(download, upload)| SavedLimits { download, upload }),
+            manual: stored
+                .manual
+                .zip(stored.scheduled)
+                .map(|(alt, scheduled)| Override {
+                    alt: alt != 0,
+                    scheduled: scheduled != 0,
+                }),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -114,6 +174,7 @@ impl SavedSession {
             version: VERSION,
             torrents,
             rate_limits: self.rate_limits,
+            alt_speed: self.alt_speed.map(StoredAltSpeed::from),
         };
         Ok(serde_bencode::to_bytes(&stored)?)
     }
@@ -158,6 +219,7 @@ impl SavedSession {
         Ok(Self {
             torrents,
             rate_limits: stored.rate_limits,
+            alt_speed: stored.alt_speed.map(SavedAltSpeed::from),
         })
     }
 }

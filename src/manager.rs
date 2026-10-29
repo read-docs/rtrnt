@@ -1,12 +1,13 @@
 //! The torrents of a session: starting each one, what it is doing, what the
 //! UI asks of them, and the exit code once they have all ended.
 
+use crate::altspeed::{Limits, Schedule, SpeedControl};
 use crate::client::Client;
 use crate::download::{self, CheckedOnly, Interrupted};
 use crate::magnet::{self, FetchInterrupted, MagnetLink};
 use crate::resume;
 use crate::selection::{FilePicks, FileSelection, Priority};
-use crate::session::{SavedLimits, SavedSession, SavedTorrent, SessionStore};
+use crate::session::{SavedAltSpeed, SavedLimits, SavedSession, SavedTorrent, SessionStore};
 use crate::source::Source;
 use crate::stats::{TorrentState, TorrentStats};
 use crate::storage::{self, Storage};
@@ -16,6 +17,7 @@ use futures_util::future::BoxFuture;
 use std::collections::HashMap;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{self, JoinError, JoinSet};
 use tracing::{Instrument, Span, error, info, info_span, warn};
@@ -30,6 +32,9 @@ pub enum Command {
     Stop,
     /// Change the download and upload limits to these KiB/s, 0 for none.
     SetRateLimits(u64, u64),
+    /// Switch between the normal and the alternative speed limits, until
+    /// the schedule next changes (see `altspeed`).
+    ToggleAltSpeed,
     /// Stop the running torrent with this info hash, to start it again
     /// later.
     Pause([u8; 20]),
@@ -178,6 +183,29 @@ pub struct Manager<S, R> {
     store: Option<SessionStore>,
     /// The limits to save: those the session had, until the UI sets others.
     saved_limits: Option<SavedLimits>,
+    /// Which limits apply: the normal ones, the alternative ones, the
+    /// schedule between them and the user's switch.
+    speed: SpeedControl,
+    /// The alternative limits to save: those the UI set, if it did.
+    saved_alt_limits: Option<SavedLimits>,
+    /// Whether the alternative limits were on when last applied.
+    alt_on: bool,
+}
+
+/// A limit in KiB/s as a notice says it.
+fn limit_text(kib: u64) -> String {
+    match kib {
+        0 => "none".to_string(),
+        kib => format!("{kib} KiB/s"),
+    }
+}
+
+/// How often the schedule of the alternative speed limits is looked at.
+const SPEED_TICK: Duration = Duration::from_secs(10);
+
+/// The local time, to which the schedule of the alternative limits goes.
+fn local_now() -> chrono::NaiveDateTime {
+    chrono::Local::now().naive_local()
 }
 
 impl<S, F> Manager<S, RunTorrent>
@@ -202,7 +230,6 @@ where
     /// `new`, running each torrent through `run_torrent`.
     pub fn with_runner(client: Arc<Client>, stop: S, run_torrent: R) -> Self {
         Self {
-            client,
             stop,
             run_torrent,
             entries: Vec::new(),
@@ -213,7 +240,26 @@ where
             idle: watch::Sender::new(true),
             store: None,
             saved_limits: None,
+            speed: SpeedControl::new(
+                client.rate_limits().kib(),
+                (
+                    crate::config::DEFAULT_ALT_SPEED_DOWNLOAD,
+                    crate::config::DEFAULT_ALT_SPEED_UPLOAD,
+                ),
+                Schedule::default(),
+            ),
+            saved_alt_limits: None,
+            alt_on: false,
+            client,
         }
+    }
+
+    /// Has the alternative limits `alt` apply on `schedule`, with the normal
+    /// limits the client has now. They take effect when the manager runs,
+    /// or at `restore`.
+    pub fn with_alt_speed(mut self, alt: Limits, schedule: Schedule) -> Self {
+        self.speed = SpeedControl::new(self.client.rate_limits().kib(), alt, schedule);
+        self
     }
 
     /// Remembers the session in `store` from now on: its torrents, as they
@@ -283,6 +329,13 @@ where
     /// sets others; applying them is up to the caller (see `config`).
     pub async fn restore(&mut self, session: SavedSession) {
         self.saved_limits = session.rate_limits;
+        if let Some(alt) = session.alt_speed {
+            // The limits themselves reach `with_alt_speed` through the
+            // config; they are only kept for the next save.
+            self.saved_alt_limits = alt.limits;
+            self.speed.manual = alt.manual;
+        }
+        self.apply_speed();
         for saved in session.torrents {
             if self.entries.iter().any(|e| e.info_hash == saved.info_hash) {
                 continue;
@@ -396,9 +449,36 @@ where
                 })
             })
             .collect();
+        let alt_speed = SavedAltSpeed {
+            limits: self.saved_alt_limits,
+            manual: self.speed.manual,
+        };
         SavedSession {
             torrents,
             rate_limits: self.saved_limits,
+            alt_speed: (alt_speed != SavedAltSpeed::default()).then_some(alt_speed),
+        }
+    }
+
+    /// Applies the limits that go with the time and the user's switch, and
+    /// says so when the mode changes.
+    fn apply_speed(&mut self) {
+        let now = local_now();
+        self.speed.expire(now);
+        let (down, up) = self.speed.limits(now);
+        if self.client.rate_limits().kib() != (down, up) {
+            self.client.set_rate_limits(down, up);
+        }
+        let alt = self.speed.is_alt(now);
+        self.client.stats().set_alt_speed(alt);
+        if alt != self.alt_on {
+            self.alt_on = alt;
+            self.client.stats().notice(format!(
+                "alternative speed limits {}: download {}, upload {}",
+                if alt { "on" } else { "off" },
+                limit_text(down),
+                limit_text(up)
+            ));
         }
     }
 
@@ -467,8 +547,21 @@ where
     /// `run`, up to the exit code.
     async fn drive(&mut self, mut commands: mpsc::UnboundedReceiver<Command>) {
         let mut open = true;
+        self.apply_speed();
+        // Only a schedule needs looking at as time passes.
+        let mut tick = (!self.speed.schedule.is_empty()).then(|| {
+            let mut tick = tokio::time::interval(SPEED_TICK);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick
+        });
         while open || !self.tasks.is_empty() {
             tokio::select! {
+                () = async {
+                    match tick.as_mut() {
+                        Some(tick) => { tick.tick().await; }
+                        None => std::future::pending().await,
+                    }
+                } => self.apply_speed(),
                 Some(joined) = self.tasks.join_next_with_id() => self.ended(joined).await,
                 command = commands.recv(), if open => match command {
                     Some(command) => self.command(command).await,
@@ -994,22 +1087,32 @@ where
     }
 
     async fn command(&mut self, command: Command) {
-        let limit = |kib: u64| match kib {
-            0 => "none".to_string(),
-            kib => format!("{kib} KiB/s"),
-        };
         match command {
+            // They are the limits of the mode that is on.
             Command::SetRateLimits(down, up) => {
+                let now = local_now();
+                let alt = self.speed.is_alt(now);
+                self.speed.set_active(now, (down, up));
                 self.client.set_rate_limits(down, up);
-                self.saved_limits = Some(SavedLimits {
+                let saved = Some(SavedLimits {
                     download: down,
                     upload: up,
                 });
+                if alt {
+                    self.saved_alt_limits = saved;
+                } else {
+                    self.saved_limits = saved;
+                }
                 self.client.stats().notice(format!(
-                    "rate limits: download {}, upload {}",
-                    limit(down),
-                    limit(up)
+                    "{}rate limits: download {}, upload {}",
+                    if alt { "alternative " } else { "" },
+                    limit_text(down),
+                    limit_text(up)
                 ));
+            }
+            Command::ToggleAltSpeed => {
+                self.speed.toggle(local_now());
+                self.apply_speed();
             }
             Command::Pause(info_hash) => self.pause(info_hash),
             Command::Resume(info_hash) => self.resume(info_hash).await,

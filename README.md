@@ -43,7 +43,8 @@ When stdout and stderr are terminals, a run shows a full-screen UI instead of pr
 | `o` | download the selected torrent in order, the first and last pieces of each file first, or go back to rarest first (see below) |
 | `space`, `+`/`-` | on the Files tab with the detail panel focused: skip the file under the cursor or download it again; raise or lower its priority (skip, normal, high) (see below) |
 | `a` | add a torrent: the path of a `.torrent` file (a relative one is taken from the directory rtrnt was started in) or a magnet link. It starts as one given on the command line would, with the same output directory and settings; one the session has already is refused, and so is a file that does not load, with a note at the bottom |
-| `d` / `u` | set the download / upload limit in KiB/s, 0 for none, until the run ends; the header shows the limits next to the rates |
+| `d` / `u` | set the download / upload limit in KiB/s, 0 for none, until the run ends; the header shows the limits next to the rates. While the alternative speed mode is on they set its limits, not the normal ones |
+| `t` | switch the alternative speed limits ("turtle mode") on or off, until the schedule next changes; the header shows `alt speed` while they apply |
 | `m` | turn the mouse off, so the terminal can select text, or on again |
 | `?` | help |
 | `q`, `Ctrl-C` | stop the torrents, as Ctrl-C does without the UI; pressed again, quit at once |
@@ -88,7 +89,7 @@ Without the UI nothing is loaded or saved, so `rtrnt --no-tui x.torrent` still d
 
 ### Config file
 
-Every option except `--check`, `--recheck`, `--select-file`, `--scrape`, `--config` and `--print-config` can also be set in `~/.config/rtrnt/config.toml` (or `$XDG_CONFIG_HOME/rtrnt/config.toml`), or in a file given with `--config <PATH>`. Keys are the long option names, except that `--no-dht` is `dht = false`, `--no-tui` is `tui = false`, `--no-session` is `session = false`, `--no-sequential` is `sequential = false`, `--watch-dir-delete` is `watch-dir-delete = true` and `--completion-hook` is a `completion-hook` list, and every key is optional:
+Every option except `--check`, `--recheck`, `--select-file`, `--scrape`, `--config` and `--print-config` can also be set in `~/.config/rtrnt/config.toml` (or `$XDG_CONFIG_HOME/rtrnt/config.toml`), or in a file given with `--config <PATH>`. Keys are the long option names, except that `--no-dht` is `dht = false`, `--no-tui` is `tui = false`, `--no-session` is `session = false`, `--no-sequential` is `sequential = false`, `--watch-dir-delete` is `watch-dir-delete = true` and `--completion-hook` is a `completion-hook` list; `alt-speed-schedule` is only in the file; and every key is optional:
 
 ```toml
 output = "~/Downloads"
@@ -106,7 +107,15 @@ watch-dir-delete = false
 blocklist = "~/p2p.txt"
 completion-hook = ["notify-send", "rtrnt", "download complete"]
 sequential = false
+alt-speed-download = 50
+alt-speed-upload = 20
+alt-speed-schedule = [
+    { days = ["weekdays"], from = "08:00", to = "18:00" },
+    { days = ["fri", "sat"], from = "22:00", to = "06:00" },
+]
 ```
+
+Alternative speed limits ("turtle mode") are a second pair of rate limits, `--alt-speed-download` and `--alt-speed-upload` in KiB/s (default 50 each, 0 for none), that replace `--max-download-rate` and `--max-upload-rate` while they are on. `alt-speed-schedule` turns them on by itself: each rule is a span of the day, `from` to `to` as `HH:MM` in local time, on some `days` (`mon` to `sun`, `weekdays`, `weekend`; every day if left out). A `to` that is not after `from` runs past midnight into the next day and belongs to the day it starts on, so the Friday rule above lasts until Saturday 06:00 and Saturday's until Sunday 06:00; equal times make a span of 24 hours. The schedule is looked at every 10 seconds. The `t` key switches by hand, and the switch holds until the schedule next changes (the next time a rule starts or ends), after which the schedule is in charge again; with no schedule it holds until `t` is pressed again. In the terminal UI, limits set with `d` and `u` while the mode is on are its limits, and the session file keeps them, the switch by hand and the normal limits separately, so a restart finds the same mode.
 
 A flag on the command line overrides the file, and the file overrides the built-in defaults. `--print-config` shows the effective settings and where each one came from. Unknown keys are errors, so typos don't go unnoticed.
 
@@ -173,6 +182,7 @@ src/
 │   ├── extension.rs # Extension protocol (BEP 10) handshake
 │   ├── fast.rs      # Fast extension (BEP 6): allowed fast set, Have All/Have None
 │   └── pex.rs       # Peer exchange (BEP 11): telling peers about each other
+├── altspeed.rs    # Alternative speed limits: the schedule, and which limits apply when
 ├── rate_limit.rs  # Upload and download rate limits (shared token buckets)
 ├── resume.rs      # Resume files: what was on disk last time
 ├── selection.rs   # Which files to download, and which first; piece priorities

@@ -1,4 +1,5 @@
-//! The top line: session rates and limits, counts, and the time.
+//! The top line: session rates and limits (marked while they are the
+//! alternative ones), counts, and the time.
 
 use super::{bold, human_rate};
 use crate::tui::app::App;
@@ -41,8 +42,12 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
         Span::raw("  "),
         Span::styled(format!("↑ {}", human_rate(up)), Style::new().fg(theme.up())),
         Span::styled(limit(up_limit), dim),
-        Span::styled(" │ ", Style::new().fg(theme.border())),
     ];
+    // Which limits these are, when they are not the usual ones.
+    if session.alt_speed {
+        spans.push(Span::styled(" alt speed", bold(theme.warn())));
+    }
+    spans.push(Span::styled(" │ ", Style::new().fg(theme.border())));
     // Facts that do not fit are left out, from the last.
     let clock = format!(" {} ", snapshot.clock);
     let mut used: usize = spans.iter().map(Span::width).sum::<usize>() + clock.len();

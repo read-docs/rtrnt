@@ -391,6 +391,23 @@ fn enter_sends_the_new_limit_with_the_other_unchanged() {
 }
 
 #[test]
+fn t_switches_the_alt_speed_limits() {
+    let snapshot = snapshot(&["a"]);
+    let mut app = App::new(Theme::default());
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('t')), &snapshot),
+        Action::Command(Command::ToggleAltSpeed)
+    );
+    // The limit prompts start from the limits in force, whichever mode.
+    let mut alt = snapshot.clone();
+    alt.session.alt_speed = true;
+    alt.session.rate_limits = (50, 10);
+    app.handle_key(key(KeyCode::Char('u')), &alt);
+    app.handle_key(key(KeyCode::Enter), &alt);
+    assert_eq!(app.input, None);
+}
+
+#[test]
 fn m_turns_the_mouse_off_and_on() {
     let snapshot = snapshot(&["a"]);
     let mut app = App::new(Theme::default());

@@ -376,6 +376,7 @@ pub struct DemoFeed {
     rng: StdRng,
     stopped: bool,
     rate_limits: (u64, u64),
+    alt_speed: bool,
     /// The latest notice, and when it came.
     notice: Option<(Instant, String)>,
 }
@@ -399,6 +400,7 @@ impl DemoFeed {
             rng: StdRng::seed_from_u64(7),
             stopped: false,
             rate_limits: (0, 2048),
+            alt_speed: false,
             notice: None,
         }
     }
@@ -464,6 +466,7 @@ impl DemoFeed {
                 connections: 71,
                 max_connections: 200,
                 rate_limits: self.rate_limits,
+                alt_speed: self.alt_speed,
                 watch_dir: None,
             },
             torrents,
@@ -592,6 +595,7 @@ impl Feed for DemoFeed {
         match command {
             Command::Stop => self.stopped = true,
             Command::SetRateLimits(down, up) => self.rate_limits = (down, up),
+            Command::ToggleAltSpeed => self.alt_speed = !self.alt_speed,
             Command::Pause(hash) => {
                 if let Some(live) = self.live(hash)
                     && !live.state.is_finished()

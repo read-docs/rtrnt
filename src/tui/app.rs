@@ -634,6 +634,7 @@ impl App {
                 let limit = snapshot.session.rate_limits.1.to_string();
                 self.input = Some(Input::new(InputKind::UploadLimit, limit));
             }
+            KeyCode::Char('t') => return Action::Command(Command::ToggleAltSpeed),
             // Once stopping, an added torrent would stop at once too.
             KeyCode::Char('a') if !self.stopping => {
                 self.input = Some(Input::new(InputKind::Add, String::new()));

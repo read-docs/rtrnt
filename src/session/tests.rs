@@ -38,6 +38,7 @@ fn a_session_round_trips() {
             download: 100,
             upload: 0,
         }),
+        alt_speed: None,
     };
     let decoded = SavedSession::decode(&session.encode().unwrap()).unwrap();
     assert_eq!(decoded, session);
@@ -48,6 +49,7 @@ fn limits_are_only_there_once_set() {
     let session = SavedSession {
         torrents: vec![saved(1, false)],
         rate_limits: None,
+        alt_speed: None,
     };
     let bytes = session.encode().unwrap();
     assert!(!String::from_utf8_lossy(&bytes).contains("rate limits"));
@@ -94,6 +96,7 @@ fn an_entry_that_makes_no_sense_is_skipped() {
             },
         ],
         rate_limits: None,
+        alt_speed: None,
     };
     let decoded = SavedSession::decode(&serde_bencode::to_bytes(&stored).unwrap()).unwrap();
     assert_eq!(
@@ -118,6 +121,7 @@ fn the_store_saves_and_loads_and_a_missing_file_is_empty() {
             download: 5,
             upload: 6,
         }),
+        alt_speed: None,
     };
     store.save(&session).unwrap();
     assert_eq!(store.load().unwrap(), session);
@@ -185,4 +189,47 @@ async fn the_hash_of_a_source_is_read_from_its_file() {
         info_hash_of(&Source::File("/missing.torrent".into())).await,
         None
     );
+}
+
+#[test]
+fn the_alt_speed_state_round_trips_and_is_only_there_once_set() {
+    let session = SavedSession {
+        torrents: vec![saved(1, false)],
+        rate_limits: None,
+        alt_speed: Some(SavedAltSpeed {
+            limits: Some(SavedLimits {
+                download: 30,
+                upload: 0,
+            }),
+            manual: Some(Override {
+                alt: true,
+                scheduled: false,
+            }),
+        }),
+    };
+    assert_eq!(
+        SavedSession::decode(&session.encode().unwrap()).unwrap(),
+        session
+    );
+    let only_manual = SavedSession {
+        alt_speed: Some(SavedAltSpeed {
+            limits: None,
+            manual: Some(Override {
+                alt: false,
+                scheduled: true,
+            }),
+        }),
+        ..session.clone()
+    };
+    assert_eq!(
+        SavedSession::decode(&only_manual.encode().unwrap()).unwrap(),
+        only_manual
+    );
+    let none = SavedSession {
+        alt_speed: None,
+        ..session
+    };
+    let bytes = none.encode().unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("alt speed"));
+    assert_eq!(SavedSession::decode(&bytes).unwrap().alt_speed, None);
 }

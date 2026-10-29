@@ -8,6 +8,7 @@
 //! `--no-session`, `session = false`; and `--watch-dir-delete` is
 //! `watch-dir-delete = true`; `--no-sequential` is `sequential = false`.
 
+use crate::altspeed::{Limits, Schedule};
 use crate::download::{DownloadConfig, SeedLimits};
 use crate::peer;
 use crate::resume;
@@ -43,6 +44,11 @@ pub const DEFAULT_MAX_DOWNLOAD_RATE: u64 = 0;
 /// Upload limit in KiB/s: none.
 pub const DEFAULT_MAX_UPLOAD_RATE: u64 = 0;
 
+/// Download limit in KiB/s of the alternative speed mode.
+pub const DEFAULT_ALT_SPEED_DOWNLOAD: u64 = 50;
+/// Upload limit in KiB/s of the alternative speed mode.
+pub const DEFAULT_ALT_SPEED_UPLOAD: u64 = 50;
+
 /// What a setting is when nothing sets it.
 enum Fallback<T> {
     /// This built-in default.
@@ -66,6 +72,12 @@ impl ToToml for PathBuf {
 impl ToToml for f64 {
     fn to_toml(&self) -> String {
         toml::Value::from(*self).to_string()
+    }
+}
+
+impl ToToml for Schedule {
+    fn to_toml(&self) -> String {
+        Schedule::to_toml(self)
     }
 }
 
@@ -224,6 +236,21 @@ options! {
     /// is `sequential = false`); the UI's `o` turns it on or off for one.
     #[arg(skip)]
     sequential: bool = Value(DEFAULT_SEQUENTIAL);
+    /// Download limit in KiB per second while the alternative speed mode
+    /// ("turtle mode", `t` in the terminal UI) is on (0: unlimited)
+    /// [default: 50]
+    #[arg(long, value_name = "KIB/S")]
+    alt_speed_download: u64 = Value(DEFAULT_ALT_SPEED_DOWNLOAD);
+    /// Upload limit in KiB per second while the alternative speed mode is
+    /// on (0: unlimited) [default: 50]
+    #[arg(long, value_name = "KIB/S")]
+    alt_speed_upload: u64 = Value(DEFAULT_ALT_SPEED_UPLOAD);
+    /// When the alternative speed mode is on by itself: a list of rules
+    /// like `{ days = ["mon", "tue"], from = "08:00", to = "23:00" }`.
+    /// `days` (mon to sun, weekdays, weekend) is every day if left out; a
+    /// `to` before `from` runs past midnight into the next day.
+    #[arg(skip)]
+    alt_speed_schedule: Schedule = Unset("only by hand");
 }
 
 /// Whether `ratio` is a valid seed ratio: a finite number, 0 or more.
@@ -253,6 +280,19 @@ fn deserialize_ratio<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Optio
 }
 
 impl Options {
+    /// The alternative download and upload limits in KiB/s these settings
+    /// give, and the schedule they apply on.
+    pub fn alt_speed(&self) -> (Limits, Schedule) {
+        (
+            (
+                self.alt_speed_download
+                    .unwrap_or(DEFAULT_ALT_SPEED_DOWNLOAD),
+                self.alt_speed_upload.unwrap_or(DEFAULT_ALT_SPEED_UPLOAD),
+            ),
+            self.alt_speed_schedule.clone().unwrap_or_default(),
+        )
+    }
+
     /// The download config these settings give, with the built-in default
     /// for each one left unset.
     pub fn into_download_config(self) -> DownloadConfig {
