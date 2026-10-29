@@ -216,6 +216,52 @@ pub(crate) fn priorities_of(
         .collect()
 }
 
+/// The place of each piece of a torrent of `num_pieces` pieces of
+/// `piece_length` bytes in a sequential download, where `files` lie: file
+/// by file, in order, each file's first piece, then its last, then the
+/// ones between from the lowest; a piece already placed by an earlier file
+/// (one they share) keeps its place. Skipped and empty files place
+/// nothing, and the pieces left over come last, lowest first. A lower
+/// rank is downloaded first.
+///
+/// Taking the first and last piece of each file first gets the parts of a
+/// media file a player reads before it plays (the index of an MP4 or AVI
+/// is often at the end).
+pub fn sequential_ranks(
+    files: &[FileSpan],
+    piece_length: u64,
+    num_pieces: usize,
+    selection: &FileSelection,
+) -> Vec<usize> {
+    let mut ranks: Vec<Option<usize>> = vec![None; num_pieces];
+    let mut next = 0;
+    let mut place = |piece: usize| {
+        if let Some(rank @ None) = ranks.get_mut(piece) {
+            *rank = Some(next);
+            next += 1;
+        }
+    };
+    if piece_length > 0 && num_pieces > 0 {
+        for (index, file) in files.iter().enumerate() {
+            if file.length == 0 || selection.priority(index) == Priority::Skip {
+                continue;
+            }
+            let last_piece = num_pieces - 1;
+            let first = usize::try_from(file.offset / piece_length)
+                .unwrap_or(usize::MAX)
+                .min(last_piece);
+            let last = usize::try_from((file.offset + file.length - 1) / piece_length)
+                .unwrap_or(usize::MAX)
+                .min(last_piece);
+            place(first);
+            place(last);
+            (first..=last).for_each(&mut place);
+        }
+    }
+    (0..num_pieces).for_each(&mut place);
+    ranks.into_iter().map(|rank| rank.unwrap_or(0)).collect()
+}
+
 /// Total length of the wanted pieces.
 pub fn wanted_len(torrent: &TorrentFile, priorities: &[Option<Priority>]) -> Result<u64> {
     sum_pieces(torrent, priorities, |_| true)

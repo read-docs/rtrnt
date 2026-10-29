@@ -23,7 +23,7 @@ const KEYS: &[(&str, &str)] = &[
 ];
 
 /// Keys shown after them where there is room, after the file keys while the
-/// Files tab has the focus, and `p`, `x` and `r` for the selected torrent.
+/// Files tab has the focus, and `p`, `x`, `r` and `o` for the selected torrent.
 const FILE_KEYS: &[(&str, &str)] = &[("space", "skip"), ("+ -", "priority")];
 
 const MORE_KEYS: &[(&str, &str)] = &[("a", "add"), ("d u", "limits"), ("m", "mouse")];
@@ -52,6 +52,13 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
         let pause = app.pause_command(snapshot).map(|(_, word)| ("p", word));
         let remove = app.removable(snapshot).map(|_| ("x", "remove"));
         let recheck = app.recheck_command(snapshot).map(|_| ("r", "recheck"));
+        let order = app.sequential_command(snapshot).map(|_| {
+            let in_order = app
+                .selected
+                .and_then(|hash| snapshot.torrent(hash))
+                .is_some_and(|torrent| torrent.sequential);
+            ("o", if in_order { "rarest first" } else { "in order" })
+        });
         let files: &[(&str, &str)] = if app.choosing_files(snapshot) {
             FILE_KEYS
         } else {
@@ -62,6 +69,7 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
             .chain(&pause)
             .chain(&remove)
             .chain(&recheck)
+            .chain(&order)
             .chain(MORE_KEYS);
         for pair in pairs {
             let more: Vec<Span> = [Span::raw("  ")]

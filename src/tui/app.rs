@@ -310,6 +310,16 @@ impl App {
         }
     }
 
+    /// What `o` does: turn sequential download on or off for the selected
+    /// torrent, unless it is being removed.
+    pub fn sequential_command(&self, snapshot: &Snapshot) -> Option<Command> {
+        let torrent = snapshot.torrent(self.selected?)?;
+        match torrent.state {
+            TorrentState::Removing => None,
+            _ => Some(Command::ToggleSequential(torrent.info_hash)),
+        }
+    }
+
     /// The selected torrent, if `x` can remove it: not while it is being
     /// removed already.
     pub fn removable<'a>(&self, snapshot: &'a Snapshot) -> Option<&'a TorrentSnapshot> {
@@ -577,6 +587,11 @@ impl App {
             }
             KeyCode::Char('r') => {
                 if let Some(command) = self.recheck_command(snapshot) {
+                    return Action::Command(command);
+                }
+            }
+            KeyCode::Char('o') => {
+                if let Some(command) = self.sequential_command(snapshot) {
                     return Action::Command(command);
                 }
             }

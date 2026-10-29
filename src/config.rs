@@ -6,7 +6,7 @@
 //! exception is `--no-dht`, which is `dht = false` (and `--dht` overrides
 //! it from the command line), and likewise `--no-tui`, `tui = false` and
 //! `--no-session`, `session = false`; and `--watch-dir-delete` is
-//! `watch-dir-delete = true`.
+//! `watch-dir-delete = true`; `--no-sequential` is `sequential = false`.
 
 use crate::download::{DownloadConfig, SeedLimits};
 use crate::peer;
@@ -35,6 +35,9 @@ pub const DEFAULT_DHT: bool = true;
 /// Whether to delete the files taken from the watch directory: they are
 /// renamed instead.
 pub const DEFAULT_WATCH_DIR_DELETE: bool = false;
+/// Whether to download pieces in order, the first and last of each file
+/// first: no, rarest first.
+pub const DEFAULT_SEQUENTIAL: bool = false;
 /// Download limit in KiB/s: none.
 pub const DEFAULT_MAX_DOWNLOAD_RATE: u64 = 0;
 /// Upload limit in KiB/s: none.
@@ -195,6 +198,10 @@ options! {
     /// of renaming them to `<name>.added`.
     #[arg(skip)]
     watch_dir_delete: bool = Value(DEFAULT_WATCH_DIR_DELETE);
+    /// Whether torrents start out downloading in order (`--no-sequential`
+    /// is `sequential = false`); the UI's `o` turns it on or off for one.
+    #[arg(skip)]
+    sequential: bool = Value(DEFAULT_SEQUENTIAL);
 }
 
 /// Whether `ratio` is a valid seed ratio: a finite number, 0 or more.
@@ -239,6 +246,7 @@ impl Options {
                 time: minutes(self.seed_time.unwrap_or(DEFAULT_SEED_TIME)),
             },
             dht: self.dht.unwrap_or(DEFAULT_DHT),
+            sequential: self.sequential.unwrap_or(DEFAULT_SEQUENTIAL),
             max_download_rate: self.max_download_rate.unwrap_or(DEFAULT_MAX_DOWNLOAD_RATE),
             max_upload_rate: self.max_upload_rate.unwrap_or(DEFAULT_MAX_UPLOAD_RATE),
             resume_dir: resume::default_dir(

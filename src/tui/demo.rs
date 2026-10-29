@@ -227,6 +227,8 @@ struct Live {
     paused: Option<TorrentState>,
     /// Gone from the session.
     removed: bool,
+    /// Whether it downloads in order.
+    sequential: bool,
     verified: f64,
     received: f64,
     uploaded: f64,
@@ -274,6 +276,7 @@ impl Live {
             state,
             paused: None,
             removed: false,
+            sequential: false,
             verified,
             received: 0.0,
             uploaded: 0.0,
@@ -424,6 +427,7 @@ impl DemoFeed {
                 layout: live.layout(),
                 priorities: Vec::new(),
                 wanted: None,
+                sequential: live.sequential,
                 save_path: PathBuf::from("/home/me/Downloads"),
                 verified: live.verified as u64,
                 received: live.received as u64,
@@ -600,6 +604,11 @@ impl Feed for DemoFeed {
                     && let Some(state) = live.paused.take()
                 {
                     live.state = state;
+                }
+            }
+            Command::ToggleSequential(hash) => {
+                if let Some(live) = self.live(hash) {
+                    live.sequential = !live.sequential;
                 }
             }
             Command::Recheck(_) => {

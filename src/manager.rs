@@ -47,6 +47,9 @@ pub enum Command {
         info_hash: [u8; 20],
         priorities: Vec<Priority>,
     },
+    /// Turn sequential download on or off for the torrent with this info
+    /// hash, whatever it is doing: a running download changes at once.
+    ToggleSequential([u8; 20]),
     /// Drop the torrent with this info hash from the session, stopping it
     /// first if it runs, and with `delete` its files and resume file too.
     Remove { info_hash: [u8; 20], delete: bool },
@@ -73,6 +76,10 @@ pub struct StartOptions {
     /// they take the place of `selection` once the torrent's files are
     /// known (a magnet link's, not until its metadata arrives).
     pub picks: Option<FilePicks>,
+    /// Whether to download in order, for a torrent the session had saved
+    /// as doing so; `None` to keep what it had, and failing that the
+    /// configured default.
+    pub sequential: Option<bool>,
 }
 
 /// Whether, and what next, a run hashes the data on disk, ignoring the
@@ -297,9 +304,18 @@ where
             };
             let state = if saved.paused {
                 self.show_paused(&torrent, &saved.source);
+                if let Some(on) = saved.sequential
+                    && let Some(stats) = stats_of(&self.client, saved.info_hash, |_| true)
+                {
+                    stats.set_sequential(on);
+                }
                 State::Paused
             } else {
-                self.spawn(torrent, StartOptions::default(), span)
+                let options = StartOptions {
+                    sequential: saved.sequential,
+                    ..StartOptions::default()
+                };
+                self.spawn(torrent, options, span)
             };
             self.entries.push(Entry {
                 source: saved.source,
@@ -375,6 +391,8 @@ where
                     info_hash: entry.info_hash,
                     source: entry.source.clone(),
                     paused,
+                    sequential: stats_of(&self.client, entry.info_hash, |_| true)
+                        .and_then(|stats| stats.sequential_choice()),
                 })
             })
             .collect();
@@ -718,6 +736,25 @@ where
         self.restart(info_hash, then);
     }
 
+    /// Turns sequential download on or off for the torrent with info hash
+    /// `info_hash`, with a notice saying which. It takes effect at once in a
+    /// running download, and in any later run of one that is not.
+    fn toggle_sequential(&self, info_hash: [u8; 20]) {
+        let Some(stats) = stats_of(&self.client, info_hash, |state| {
+            !matches!(state, TorrentState::Removing)
+        }) else {
+            return;
+        };
+        let how = if stats.toggle_sequential() {
+            "in order, first and last pieces first"
+        } else {
+            "rarest first"
+        };
+        self.client
+            .stats()
+            .notice(format!("{}: downloading {how}", stats.name()));
+    }
+
     /// Saves `selection` in the resume file of the torrent of entry
     /// `index`, which is not running, and shows it in the torrent's row.
     /// Fails with what to tell the user.
@@ -981,6 +1018,7 @@ where
                 info_hash,
                 priorities,
             } => self.set_priorities(info_hash, priorities).await,
+            Command::ToggleSequential(info_hash) => self.toggle_sequential(info_hash),
             Command::Remove { info_hash, delete } => self.remove(info_hash, delete).await,
             Command::Add(source) => self.add(source).await,
             // The feed stops the torrents itself.

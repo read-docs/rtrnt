@@ -354,6 +354,7 @@ fn info_tab_lists_the_facts() {
         "│ pieces        1875 / 3016",
         "│ private       no",
         "│ files         1",
+        "│ order         rarest first",
         "│ save path     /home/me/Downloads",
         "│ this session  ↓ 4.0 MiB  ↑ 1.0 MiB  ratio 0.25",
         "│ active        2h 42m 00s",
@@ -481,7 +482,7 @@ fn a_paused_torrent_says_so_and_p_resumes_it() {
     let lines = text(&buffer, buffer.area);
     assert!(lines.iter().any(|line| line.contains("paused")));
     assert!(
-        lines[31].contains("  q quit  p resume  x remove  r recheck  a add  d u limits"),
+        lines[31].contains("  q quit  p resume  x remove  r recheck  o in order  a add"),
         "{}",
         lines[31]
     );

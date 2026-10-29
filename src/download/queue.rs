@@ -5,7 +5,8 @@ use crate::stats::PieceSnapshot;
 use rand::Rng;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::Notify;
 use tracing::debug;
 
@@ -41,6 +42,13 @@ pub(super) struct QueueState {
     /// Whether workers keep serving their peers once every piece is done,
     /// until the queue is closed.
     seed: bool,
+    /// Whether to take pieces in the order of `ranks` instead of the rarest
+    /// first. Read at each claim, so it can change while the download runs.
+    sequential: Arc<AtomicBool>,
+    /// The place of each piece in a sequential download (see
+    /// `selection::sequential_ranks`); a piece it does not list goes by its
+    /// index.
+    ranks: Vec<usize>,
 }
 
 impl PieceQueue {
@@ -63,6 +71,8 @@ impl PieceQueue {
                 completed: Vec::new(),
                 closed: false,
                 seed: false,
+                sequential: Arc::default(),
+                ranks: Vec::new(),
             }),
             changed: Notify::new(),
         }
@@ -84,6 +94,17 @@ impl PieceQueue {
         self
     }
 
+    /// Has the queue take pieces in the order of `ranks` (see
+    /// `selection::sequential_ranks`) while `sequential` is set, and the
+    /// rarest first while it is not. A piece of a higher priority still goes
+    /// before any of a lower one.
+    pub(super) fn sequential(mut self, sequential: Arc<AtomicBool>, ranks: Vec<usize>) -> Self {
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        state.sequential = sequential;
+        state.ranks = ranks;
+        self
+    }
+
     pub(super) fn lock(&self) -> MutexGuard<'_, QueueState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -98,7 +119,8 @@ impl PieceQueue {
     }
 
     /// Takes the pending piece the peer has that is wanted most, and of
-    /// those the rarest, breaking ties at random.
+    /// those the rarest, breaking ties at random; or, while the queue is
+    /// sequential (see `sequential`), the first in order.
     ///
     /// Endgame: once no piece is pending, every remaining piece is already
     /// being downloaded, so this joins the in-flight piece with the fewest
@@ -151,12 +173,19 @@ impl PieceQueue {
         } else {
             let availability = &state.availability;
             let priorities = &state.priorities;
+            let ranks = &state.ranks;
+            let sequential = state.sequential.load(Ordering::Relaxed);
+            // Rarest first, or in order: the second part of the key is
+            // all the choice there is, and ranks are unique, so a
+            // sequential pick has no ties to break.
             let candidates = state.pending.iter().map(|&i| {
                 let priority = priorities.get(i).copied().flatten();
-                (
-                    i,
-                    (Reverse(priority), availability.get(i).copied().unwrap_or(0)),
-                )
+                let order = if sequential {
+                    ranks.get(i).copied().unwrap_or(i)
+                } else {
+                    availability.get(i).copied().unwrap_or(0) as usize
+                };
+                (i, (Reverse(priority), order))
             });
             let index = pick_least(candidates, has, &mut rng)?;
             state.pending.remove(&index);

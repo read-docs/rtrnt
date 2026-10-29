@@ -172,3 +172,42 @@ fn wanted_bytes_follow_a_selection() {
     assert_eq!(wanted_of(&torrent, &selection).unwrap(), 7);
     assert_eq!(wanted_of(&torrent, &FileSelection::default()).unwrap(), 11);
 }
+
+#[test]
+fn sequential_ranks_put_each_files_ends_first() {
+    // Files of 3, 2 and 3 pieces.
+    let ranks = sequential_ranks(&spans(&[30, 20, 30]), 10, 8, &FileSelection::default());
+    // File 0: pieces 0, 2, 1. File 1: 3, 4. File 2: 5, 7, 6.
+    assert_eq!(ranks, [0, 2, 1, 3, 4, 5, 7, 6]);
+}
+
+#[test]
+fn sequential_ranks_of_one_file_are_first_last_then_the_middle() {
+    let ranks = sequential_ranks(&spans(&[50]), 10, 5, &FileSelection::default());
+    assert_eq!(ranks, [0, 2, 3, 4, 1]);
+}
+
+#[test]
+fn a_piece_shared_by_two_files_keeps_its_first_place() {
+    // Pieces of 10: file 0 is bytes 0..15 (pieces 0-1), file 1 bytes 15..40
+    // (pieces 1-3).
+    let ranks = sequential_ranks(&spans(&[15, 25]), 10, 4, &FileSelection::default());
+    // File 0 places 0 then 1; file 1 places 3 (its last), then 2.
+    assert_eq!(ranks, [0, 1, 3, 2]);
+}
+
+#[test]
+fn sequential_ranks_skip_skipped_and_empty_files_and_leave_the_rest_last() {
+    let selection = FileSelection::new(vec![Skip, Normal, Normal]);
+    let ranks = sequential_ranks(&spans(&[20, 30, 0]), 10, 5, &selection);
+    // File 1 is pieces 2-4: 2, 4, 3. Pieces 0 and 1 are left over.
+    assert_eq!(ranks, [3, 4, 0, 2, 1]);
+}
+
+#[test]
+fn sequential_ranks_are_a_permutation() {
+    let ranks = sequential_ranks(&spans(&[7, 33, 1, 12]), 10, 6, &FileSelection::default());
+    let mut sorted = ranks.clone();
+    sorted.sort();
+    assert_eq!(sorted, (0..6).collect::<Vec<_>>());
+}

@@ -19,6 +19,7 @@ fn client_in(output_dir: &std::path::Path) -> Arc<Client> {
         listen_port: 0,
         seed: SeedLimits::default(),
         dht: false,
+        sequential: false,
         max_download_rate: 0,
         max_upload_rate: 0,
         resume_dir: None,
@@ -263,6 +264,7 @@ const RECHECK: StartOptions = StartOptions {
     recheck: Recheck::ThenRun,
     selection: None,
     picks: None,
+    sequential: None,
 };
 
 #[tokio::test]
@@ -956,6 +958,7 @@ async fn a_saved_session_is_restored_in_order_and_paused_torrents_stay_paused() 
         info_hash: [how; 20],
         source: magnet(how),
         paused,
+        sequential: None,
     };
     let limits = SavedLimits {
         download: 7,
@@ -1014,6 +1017,7 @@ async fn a_saved_torrent_that_no_longer_loads_is_reported_and_dropped() {
                 info_hash: [1; 20],
                 source: Source::File("/no/such/file.torrent".into()),
                 paused: true,
+                sequential: None,
             }],
             rate_limits: None,
         })
@@ -1159,6 +1163,7 @@ async fn a_paused_torrent_keeps_the_choice_of_files_in_its_resume_file() {
             listen_port: 0,
             seed: SeedLimits::default(),
             dht: false,
+            sequential: false,
             max_download_rate: 0,
             max_upload_rate: 0,
             resume_dir: Some(state.path().to_path_buf()),
@@ -1221,4 +1226,46 @@ async fn a_paused_torrent_keeps_the_choice_of_files_in_its_resume_file() {
         resume::load_selection(&target, 2),
         Some(FileSelection::new(vec![Priority::High; 2]))
     );
+}
+
+#[tokio::test]
+async fn sequential_download_is_toggled_saved_and_restored() {
+    let client = client();
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path().to_path_buf());
+    let mut manager =
+        Manager::with_runner(Arc::clone(&client), never, fake_run).with_session(store.clone());
+    manager.expect_more();
+    let saved = |how: u8, sequential| SavedTorrent {
+        info_hash: [how; 20],
+        source: magnet(how),
+        paused: true,
+        sequential,
+    };
+    manager
+        .restore(SavedSession {
+            torrents: vec![saved(1, Some(true)), saved(2, None)],
+            rate_limits: None,
+        })
+        .await;
+    let choices = |store: &SessionStore| -> Vec<Option<bool>> {
+        saved_session(store)
+            .torrents
+            .iter()
+            .map(|saved| saved.sequential)
+            .collect()
+    };
+    let rows = client.stats().torrents();
+    assert!(rows[0].sequential());
+    assert!(!rows[1].sequential());
+    assert_eq!(choices(&store), [Some(true), None]);
+
+    manager.command(Command::ToggleSequential([1; 20])).await;
+    manager.command(Command::ToggleSequential([2; 20])).await;
+    assert!(!rows[0].sequential());
+    assert!(rows[1].sequential());
+    assert_eq!(choices(&store), [Some(false), Some(true)]);
+    // One the session does not have is left alone.
+    manager.command(Command::ToggleSequential([9; 20])).await;
+    assert_eq!(choices(&store), [Some(false), Some(true)]);
 }

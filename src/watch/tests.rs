@@ -18,6 +18,7 @@ fn client() -> Arc<Client> {
         listen_port: 0,
         seed: SeedLimits::default(),
         dht: false,
+        sequential: false,
         max_download_rate: 0,
         max_upload_rate: 0,
         resume_dir: None,

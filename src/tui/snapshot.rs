@@ -52,6 +52,9 @@ pub struct TorrentSnapshot {
     pub layout: Option<Layout>,
     /// Each file's priority, once known; empty before.
     pub priorities: Vec<Priority>,
+    /// Whether the download takes its pieces in order rather than the
+    /// rarest first.
+    pub sequential: bool,
     /// Bytes in the pieces wanted, once known; the torrent's size unless
     /// files are skipped.
     pub wanted: Option<u64>,
@@ -237,6 +240,7 @@ fn torrent_snapshot(torrent: &TorrentStats, order: usize, now: Instant) -> Torre
         state: torrent.state(),
         layout: torrent.layout().cloned(),
         priorities: torrent.priorities().unwrap_or_default(),
+        sequential: torrent.sequential(),
         wanted: torrent.wanted(),
         save_path: torrent.save_path().to_path_buf(),
         verified: torrent.verified(),
@@ -369,6 +373,7 @@ mod tests {
             },
             layout: None,
             priorities: Vec::new(),
+            sequential: false,
             wanted: None,
             save_path: PathBuf::new(),
             verified: 0,

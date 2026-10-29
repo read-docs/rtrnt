@@ -30,6 +30,9 @@ pub struct SavedTorrent {
     pub source: Source,
     /// Whether the torrent was paused, rather than running or finished.
     pub paused: bool,
+    /// Whether it downloads in order, if that was chosen rather than left
+    /// to the configured default.
+    pub sequential: Option<bool>,
 }
 
 /// Download and upload limits in KiB/s, 0 for none.
@@ -69,6 +72,9 @@ struct StoredTorrent {
     source: String,
     /// 1 if paused (bencode has no booleans).
     paused: i64,
+    /// 1 or 0 if chosen, left out if not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sequential: Option<i64>,
 }
 
 /// Just the version, read first so that a file of another version is
@@ -100,6 +106,7 @@ impl SavedSession {
                     info_hash: ByteBuf::from(torrent.info_hash.to_vec()),
                     source,
                     paused: i64::from(torrent.paused),
+                    sequential: torrent.sequential.map(i64::from),
                 })
             })
             .collect();
@@ -144,6 +151,7 @@ impl SavedSession {
                     info_hash,
                     source,
                     paused: entry.paused != 0,
+                    sequential: entry.sequential.map(|sequential| sequential != 0),
                 })
             })
             .collect();
