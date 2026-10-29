@@ -1,4 +1,5 @@
 use rtrnt::download::download_from_peers;
+use rtrnt::torrent_limits::{TorrentLimits, TorrentSettings};
 use std::collections::HashMap;
 use std::future::pending;
 use std::net::SocketAddr;
@@ -164,4 +165,52 @@ async fn a_dead_web_seed_does_not_hold_up_a_working_one() {
     .expect("download failed");
 
     assert_files_match(out.path(), &data);
+}
+
+/// A torrent's own download limit holds back its web seeds as it does its
+/// peers: the download takes at least as long as the limit allows.
+#[tokio::test]
+async fn a_torrents_own_download_limit_slows_its_web_seeds() {
+    init_tracing();
+    let data = Arc::new(test_data());
+    let (mut torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+    let (addr, _) = web_server(Arc::clone(&data)).await;
+    torrent.url_list = vec![format!("http://{addr}/files")];
+
+    let out = tempfile::tempdir().unwrap();
+    let mut session = Arc::into_inner(session(torrent, info_hash, out.path())).unwrap();
+    const RATE_KIB: u64 = 32;
+    session.torrent_limits = Arc::new(TorrentLimits::new(TorrentSettings {
+        download: RATE_KIB,
+        ..TorrentSettings::default()
+    }));
+    let start = std::time::Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        download_from_peers(
+            Arc::new(session),
+            &vec![false; num_pieces],
+            &[],
+            10,
+            Vec::new(),
+            None,
+            pending(),
+        ),
+    )
+    .await
+    .expect("download timed out")
+    .expect("download failed");
+    let elapsed = start.elapsed();
+    assert_files_match(out.path(), &data);
+
+    // Two lanes may each have a first piece through at once; the rest waits
+    // for the limit, less a fifth so a slow machine cannot make it flaky.
+    let total = data.len() as u64;
+    let waited = total.saturating_sub(2 * PIECE_LENGTH);
+    let shortest = Duration::from_secs_f64(waited as f64 / (RATE_KIB * 1024) as f64 * 0.8);
+    assert!(
+        elapsed >= shortest,
+        "{total} bytes in {elapsed:?} at {RATE_KIB} KiB/s"
+    );
 }

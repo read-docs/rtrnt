@@ -77,7 +77,10 @@ async fn lane(
     let torrent = &session.torrent;
     // A web seed has every piece.
     let everything = vec![true; torrent.num_pieces()];
-    let mut budget = session.rate_limits.download.allowance();
+    // The torrent's own download limit comes first, inside the session's,
+    // as for its peers.
+    let own = &session.torrent_limits.rates().download;
+    let mut budget = own.allowance_within(&session.rate_limits.download);
     let stopped = || queue.is_closed() || queue.is_done();
     loop {
         if stopped() || stats.state() == WebSeedState::GaveUp {
@@ -168,20 +171,21 @@ fn claim_pending<'a>(
     queue.claim_from(everything, &[])
 }
 
-/// Waits for the session's download limit to allow `bytes`, which are then
-/// taken from it. Returns false if the download stops first.
+/// Waits for the torrent's and the session's download limits to allow
+/// `bytes`, which are then taken from both. Returns false if the download
+/// stops first.
 async fn wait_for_turn(
     budget: &mut Allowance<'_>,
     session: &Session,
     queue: &PieceQueue,
     bytes: u64,
 ) -> bool {
-    let limiter = &session.rate_limits.download;
+    let own = &session.torrent_limits.rates().download;
+    let outer = &session.rate_limits.download;
     loop {
-        // Registered before the try, so that a change of the limit in
-        // between still wakes us.
-        let mut changed = std::pin::pin!(limiter.changed());
-        changed.as_mut().enable();
+        // Made before the try, so that a change of either limit in between
+        // still wakes us (a change notifies every waiter made before it).
+        let mut changed = std::pin::pin!(own.changed_with(outer));
         if budget.try_take(bytes, Instant::now()) {
             return true;
         }
