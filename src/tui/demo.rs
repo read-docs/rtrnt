@@ -614,6 +614,9 @@ impl Feed for DemoFeed {
                     live.removed = true;
                 }
             }
+            Command::MoveUp(_) | Command::MoveDown(_) => {
+                self.notice = Some((Instant::now(), "the demo has no queue".into()));
+            }
             Command::Add(source) => {
                 let text = format!("cannot add {}: the demo adds nothing", source.label());
                 self.notice = Some((Instant::now(), text));

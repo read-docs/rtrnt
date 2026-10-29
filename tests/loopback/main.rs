@@ -7,6 +7,7 @@ mod fast;
 mod magnet;
 mod pause;
 mod pex;
+mod queue;
 mod rate_limit;
 mod recheck;
 mod remove;

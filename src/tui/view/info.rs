@@ -41,6 +41,10 @@ pub fn draw(
             format!("  {} of {}", human_bytes(*done), human_bytes(*total)),
             theme.dim_style(),
         )),
+        TorrentState::Queued => state.push(Span::styled(
+            "  waiting for a free slot (K J move it in the queue)".to_string(),
+            theme.dim_style(),
+        )),
         TorrentState::Failed(e) => state.push(Span::styled(
             format!("  {e}"),
             Style::new().fg(theme.error()),

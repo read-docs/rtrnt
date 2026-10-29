@@ -4,6 +4,7 @@
 use crate::client::Client;
 use crate::download::{self, CheckedOnly, Interrupted};
 use crate::magnet::{self, FetchInterrupted, MagnetLink};
+use crate::queue::{self, QueueLimits, Slot};
 use crate::resume;
 use crate::selection::{FilePicks, FileSelection, Priority};
 use crate::session::{SavedLimits, SavedSession, SavedTorrent, SessionStore};
@@ -12,16 +13,23 @@ use crate::stats::{TorrentState, TorrentStats};
 use crate::storage::{self, Storage};
 use crate::torrent::{self, Info, Metainfo};
 use anyhow::{Result, anyhow};
+use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use std::collections::HashMap;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{self, JoinError, JoinSet};
 use tracing::{Instrument, Span, error, info, info_span, warn};
 
 /// Exit code for a run stopped by Ctrl-C (128 + SIGINT).
 pub const EXIT_INTERRUPTED: u8 = 130;
+
+/// How often the queue is looked at when nothing else happens, since a
+/// download that completes and starts seeding is not an event the manager
+/// is told of.
+const QUEUE_TICK: Duration = Duration::from_secs(1);
 
 /// What the UI asks of the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +60,11 @@ pub enum Command {
     Remove { info_hash: [u8; 20], delete: bool },
     /// Start the torrent from this source too, unless the session has it.
     Add(Source),
+    /// Move the torrent with this info hash one place earlier in the queue
+    /// and the table, which is the order torrents get a free slot in.
+    MoveUp([u8; 20]),
+    /// Move it one place later.
+    MoveDown([u8; 20]),
 }
 
 /// Resolves when a torrent is to stop.
@@ -123,6 +136,19 @@ pub enum State {
     /// Its task was stopped by a pause, to be started again.
     Paused,
     Ended(Outcome),
+    /// Waiting for a slot (see `queue`): no task runs. It starts with
+    /// `options` when there is one for it. `seeding` is whether it was
+    /// complete when it was last running, so that it waits for a seed slot
+    /// rather than a download slot.
+    Queued {
+        seeding: bool,
+        options: StartOptions,
+    },
+    /// A seed over the limit of active seeds, stopping to be queued: its
+    /// task was asked to stop as a pause asks.
+    Requeuing {
+        stop: watch::Sender<bool>,
+    },
     /// Its task was asked to stop, as a pause asks, to be started again
     /// with `then` once it has.
     Restarting {
@@ -171,6 +197,8 @@ pub struct Manager<S, R> {
     store: Option<SessionStore>,
     /// The limits to save: those the session had, until the UI sets others.
     saved_limits: Option<SavedLimits>,
+    /// How many torrents may run at once, before the rest queue.
+    limits: QueueLimits,
 }
 
 impl<S, F> Manager<S, RunTorrent>
@@ -206,7 +234,16 @@ where
             idle: watch::Sender::new(true),
             store: None,
             saved_limits: None,
+            limits: QueueLimits::default(),
         }
+    }
+
+    /// Runs only as many torrents at once as `limits` allow: the others
+    /// wait, shown as queued, in the order of the table, and start as
+    /// others end, pause, or (for downloads) complete.
+    pub fn with_queue_limits(mut self, limits: QueueLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// Remembers the session in `store` from now on: its torrents, as they
@@ -257,7 +294,7 @@ where
                 continue;
             }
             let source = self.keep_copy(source, info_hash).await;
-            let state = self.spawn(torrent, options.clone(), span);
+            let state = self.place(torrent, &source, options.clone(), span);
             self.entries.push(Entry {
                 source,
                 info_hash,
@@ -270,7 +307,7 @@ where
 
     /// Puts the torrents of a saved session back, in its order and before
     /// any `start`: a paused one as paused, with a row to show it, and the
-    /// others running. One the session has twice, or whose source no longer
+    /// others running, or queued if the limits leave no slot. One the session has twice, or whose source no longer
     /// loads, is left out, and the latter is logged and counts as failed.
     /// The session's rate limits are kept for the next save, unless the UI
     /// sets others; applying them is up to the caller (see `config`).
@@ -296,10 +333,10 @@ where
                 }
             };
             let state = if saved.paused {
-                self.show_paused(&torrent, &saved.source);
+                self.show_row(&torrent, &saved.source, TorrentState::Paused);
                 State::Paused
             } else {
-                self.spawn(torrent, StartOptions::default(), span)
+                self.place(torrent, &saved.source, StartOptions::default(), span)
             };
             self.entries.push(Entry {
                 source: saved.source,
@@ -311,9 +348,9 @@ where
         self.save_session().await;
     }
 
-    /// Gives a paused torrent that has not run this session a row, in the
-    /// state a pause leaves, which a resume takes the place of.
-    fn show_paused(&self, torrent: &Torrent, source: &Source) {
+    /// Gives a torrent that has not run this session a row, in `state`
+    /// (paused, or queued), which its first run takes the place of.
+    fn show_row(&self, torrent: &Torrent, source: &Source, state: TorrentState) {
         let name = source.label();
         let stats = self.client.stats().add_torrent(
             torrent.info_hash(),
@@ -331,7 +368,7 @@ where
                 stats.set_selection(selection.for_files(files), wanted);
             }
         }
-        stats.set_state(TorrentState::Paused);
+        stats.set_state(state);
     }
 
     /// With a session store, copies the `.torrent` file `source` names into
@@ -368,7 +405,10 @@ where
                 let paused = match &entry.state {
                     State::Paused => true,
                     State::Running { stop } => *stop.borrow(),
-                    State::Restarting { .. } | State::Ended(_) => false,
+                    State::Restarting { .. }
+                    | State::Requeuing { .. }
+                    | State::Queued { .. }
+                    | State::Ended(_) => false,
                     State::Removing { .. } => return None,
                 };
                 Some(SavedTorrent {
@@ -384,9 +424,18 @@ where
         }
     }
 
+    /// Puts the rows of the table in the queue's order, which is the order
+    /// of the entries.
+    fn publish_order(&self) {
+        let order: Vec<[u8; 20]> = self.entries.iter().map(|entry| entry.info_hash).collect();
+        self.client.stats().arrange(&order);
+    }
+
     /// Writes the session file, if the session is remembered, on the
-    /// blocking pool. A failure is logged and the session goes on.
+    /// blocking pool, and settles the order of the table. A failure is
+    /// logged and the session goes on.
     async fn save_session(&self) {
+        self.publish_order();
         let Some(store) = self.store.clone() else {
             return;
         };
@@ -449,8 +498,18 @@ where
     /// `run`, up to the exit code.
     async fn drive(&mut self, mut commands: mpsc::UnboundedReceiver<Command>) {
         let mut open = true;
+        let mut tick = tokio::time::interval(QUEUE_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         while open || !self.tasks.is_empty() {
             tokio::select! {
+                _ = tick.tick() => {
+                    if self.schedule().await {
+                        self.idle.send_replace(self.tasks.is_empty());
+                        self.save_session().await;
+                    } else {
+                        self.publish_order();
+                    }
+                }
                 Some(joined) = self.tasks.join_next_with_id() => self.ended(joined).await,
                 command = commands.recv(), if open => match command {
                     Some(command) => self.command(command).await,
@@ -472,7 +531,10 @@ where
                 entry.info_hash == info_hash
                     && matches!(
                         entry.state,
-                        State::Running { .. } | State::Restarting { .. } | State::Removing { .. }
+                        State::Running { .. }
+                            | State::Restarting { .. }
+                            | State::Requeuing { .. }
+                            | State::Removing { .. }
                     )
             })
         });
@@ -491,7 +553,19 @@ where
             let entry = &mut self.entries[index];
             let info_hash = entry.info_hash;
             let paused = matches!(&entry.state, State::Running { stop } if *stop.borrow());
+            let requeued = matches!(&entry.state, State::Requeuing { .. });
             entry.state = match outcome {
+                Outcome::Interrupted if requeued => {
+                    let pausing = |state: &TorrentState| *state == TorrentState::Pausing;
+                    if let Some(stats) = stats_of(&self.client, info_hash, pausing) {
+                        stats.set_state(TorrentState::Queued);
+                    }
+                    span.in_scope(|| info!("queued: too many seeding"));
+                    State::Queued {
+                        seeding: true,
+                        options: StartOptions::default(),
+                    }
+                }
                 Outcome::Interrupted if paused => {
                     let pausing = |state: &TorrentState| *state == TorrentState::Pausing;
                     if let Some(stats) = stats_of(&self.client, info_hash, pausing) {
@@ -516,6 +590,7 @@ where
                 outcome => State::Ended(outcome),
             };
         }
+        self.schedule().await;
         self.idle.send_replace(self.tasks.is_empty());
         self.save_session().await;
     }
@@ -524,14 +599,30 @@ where
     /// pause; its task ends as it does on Ctrl-C. One that is to restart
     /// is paused instead, once it has stopped.
     fn pause(&mut self, info_hash: [u8; 20]) {
-        let restarting = self.entries.iter_mut().find(|entry| {
-            entry.info_hash == info_hash && matches!(entry.state, State::Restarting { .. })
+        let stopping = self.entries.iter_mut().find(|entry| {
+            entry.info_hash == info_hash
+                && matches!(
+                    entry.state,
+                    State::Restarting { .. } | State::Requeuing { .. }
+                )
         });
-        if let Some(entry) = restarting {
+        if let Some(entry) = stopping {
             entry.state = match std::mem::replace(&mut entry.state, State::Paused) {
-                State::Restarting { stop, .. } => State::Running { stop },
+                State::Restarting { stop, .. } | State::Requeuing { stop } => {
+                    State::Running { stop }
+                }
                 state => state,
             };
+            return;
+        }
+        let queued = self.entries.iter_mut().find(|entry| {
+            entry.info_hash == info_hash && matches!(entry.state, State::Queued { .. })
+        });
+        if let Some(entry) = queued {
+            entry.state = State::Paused;
+            if let Some(stats) = stats_of(&self.client, info_hash, TorrentState::is_finished) {
+                stats.set_state(TorrentState::Paused);
+            }
             return;
         }
         let Some(State::Running { stop }) = self
@@ -608,6 +699,8 @@ where
         let refused = match &self.entries[index].state {
             State::Removing { .. } => Some("being removed, nothing to check"),
             State::Restarting { .. } => Some("already restarting"),
+            State::Queued { .. } => Some("queued, nothing to check yet"),
+            State::Requeuing { .. } => Some("being queued, nothing to check yet"),
             State::Running { stop } if *stop.borrow() => Some("pausing, nothing to check"),
             State::Running { .. }
                 if matches!(
@@ -678,6 +771,7 @@ where
             State::Running { stop } if *stop.borrow() => {
                 Some("pausing, choose the files once it has stopped")
             }
+            State::Requeuing { .. } => Some("being queued, choose the files once it has stopped"),
             State::Running { .. } => {
                 let files = stats_of(&self.client, info_hash, |_| true)
                     .and_then(|stats| stats.layout().map(|layout| layout.files.len()));
@@ -689,7 +783,7 @@ where
                     Some(_) => None,
                 }
             }
-            State::Paused | State::Ended(_) => {
+            State::Paused | State::Queued { .. } | State::Ended(_) => {
                 let ended = matches!(self.entries[index].state, State::Ended(_));
                 match self.keep_selection(index, &selection).await {
                     Ok(()) => {
@@ -771,6 +865,18 @@ where
         }) else {
             return;
         };
+        // With no row, a queued torrent would not show; it starts anyway.
+        let row = |state: &TorrentState| state.is_finished();
+        if !self.fits()
+            && let Some(stats) = stats_of(&self.client, info_hash, row)
+        {
+            stats.set_state(TorrentState::Queued);
+            self.entries[index].state = State::Queued {
+                seeding: false,
+                options: StartOptions::default(),
+            };
+            return;
+        }
         self.start_again(index, StartOptions::default(), "resuming", "resume")
             .await;
     }
@@ -814,13 +920,15 @@ where
             with_hash(entry)
                 && matches!(
                     entry.state,
-                    State::Running { .. } | State::Restarting { .. }
+                    State::Running { .. } | State::Restarting { .. } | State::Requeuing { .. }
                 )
         });
         if let Some(index) = running {
             let entry = &mut self.entries[index];
             entry.state = match std::mem::replace(&mut entry.state, State::Paused) {
-                State::Running { stop } | State::Restarting { stop, .. } => {
+                State::Running { stop }
+                | State::Restarting { stop, .. }
+                | State::Requeuing { stop } => {
                     stop.send_replace(true);
                     State::Removing { stop, delete }
                 }
@@ -833,7 +941,11 @@ where
             return;
         }
         let stopped = self.entries.iter().position(|entry| {
-            with_hash(entry) && matches!(entry.state, State::Paused | State::Ended(_))
+            with_hash(entry)
+                && matches!(
+                    entry.state,
+                    State::Paused | State::Queued { .. } | State::Ended(_)
+                )
         });
         if let Some(index) = stopped {
             let entry = self.entries.remove(index);
@@ -866,7 +978,7 @@ where
         }
         span.in_scope(|| info!("added"));
         let source = self.keep_copy(source, info_hash).await;
-        let state = self.spawn(torrent, StartOptions::default(), span);
+        let state = self.place(torrent, &source, StartOptions::default(), span);
         self.entries.push(Entry {
             source,
             info_hash,
@@ -891,6 +1003,7 @@ where
             State::Restarting { .. } => "already running, restarting",
             State::Paused => "already added, press p to resume",
             State::Ended(_) => "already added, press p to run it again",
+            State::Queued { .. } | State::Requeuing { .. } => "already added, waiting in the queue",
             State::Removing { .. } => "still being removed, add it again once it has gone",
         };
         let name = stats_of(&self.client, info_hash, |_| true)
@@ -956,6 +1069,141 @@ where
         }
     }
 
+    /// Runs `torrent` if the limits leave a slot for one more download, and
+    /// otherwise queues it, with a row to show so; `schedule` starts it
+    /// later. Returns the state of its entry.
+    fn place(
+        &mut self,
+        torrent: Torrent,
+        source: &Source,
+        options: StartOptions,
+        span: Span,
+    ) -> State {
+        if self.fits() {
+            return self.spawn(torrent, options, span);
+        }
+        span.in_scope(|| info!("queued"));
+        self.show_row(&torrent, source, TorrentState::Queued);
+        State::Queued {
+            seeding: false,
+            options,
+        }
+    }
+
+    /// The torrents as the queue sees them, in its order.
+    fn slots(&self) -> Vec<Slot> {
+        let seeding = |info_hash| {
+            stats_of(&self.client, info_hash, |state| {
+                *state == TorrentState::Seeding
+            })
+            .is_some()
+        };
+        self.entries
+            .iter()
+            .map(|entry| match &entry.state {
+                State::Running { stop } => Slot::Active {
+                    seeding: seeding(entry.info_hash),
+                    movable: !*stop.borrow(),
+                },
+                State::Restarting { .. } => Slot::Active {
+                    seeding: false,
+                    movable: false,
+                },
+                State::Requeuing { .. } => Slot::Active {
+                    seeding: true,
+                    movable: false,
+                },
+                State::Queued { seeding, .. } => Slot::Waiting { seeding: *seeding },
+                State::Paused | State::Ended(_) | State::Removing { .. } => Slot::Out,
+            })
+            .collect()
+    }
+
+    /// Whether the limits leave a slot for one more download, after the
+    /// torrents already waiting.
+    fn fits(&self) -> bool {
+        let mut slots = self.slots();
+        slots.push(Slot::Waiting { seeding: false });
+        let last = slots.len() - 1;
+        queue::plan(self.limits, &slots).start.contains(&last)
+    }
+
+    /// Whether the session has been told to stop, in which case nothing
+    /// more is to start.
+    fn stopping(&self) -> bool {
+        (self.stop)().now_or_never().is_some()
+    }
+
+    /// Carries out the queue: puts the seeds over the limit back in it,
+    /// and starts the waiting torrents the limits leave room for, earliest
+    /// first. Returns whether it changed anything.
+    async fn schedule(&mut self) -> bool {
+        if !self.limits.is_limited() {
+            return false;
+        }
+        let plan = queue::plan(self.limits, &self.slots());
+        let mut changed = false;
+        for &index in &plan.requeue {
+            changed |= self.requeue(index);
+        }
+        if plan.start.is_empty() || self.stopping() {
+            return changed;
+        }
+        for &index in &plan.start {
+            let State::Queued { options, .. } =
+                std::mem::replace(&mut self.entries[index].state, State::Paused)
+            else {
+                continue;
+            };
+            self.start_again(index, options, "starting", "start").await;
+            changed = true;
+        }
+        changed
+    }
+
+    /// Stops the running seed of entry `index` to put it back in the queue.
+    /// Returns whether it did.
+    fn requeue(&mut self, index: usize) -> bool {
+        let entry = &mut self.entries[index];
+        let State::Running { stop } = &entry.state else {
+            return false;
+        };
+        if stop.send_replace(true) {
+            return false;
+        }
+        entry.state = match std::mem::replace(&mut entry.state, State::Paused) {
+            State::Running { stop } => State::Requeuing { stop },
+            state => state,
+        };
+        let info_hash = entry.info_hash;
+        let running = |state: &TorrentState| !state.is_finished();
+        if let Some(stats) = stats_of(&self.client, info_hash, running) {
+            stats.set_state(TorrentState::Pausing);
+        }
+        true
+    }
+
+    /// Swaps the torrent with `info_hash` with the one before it, or after
+    /// it unless `earlier`, in the queue and the table. At either end it
+    /// stays.
+    fn move_in_queue(&mut self, info_hash: [u8; 20], earlier: bool) {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.info_hash == info_hash)
+        else {
+            return;
+        };
+        let other = if earlier {
+            index.checked_sub(1)
+        } else {
+            Some(index + 1).filter(|&other| other < self.entries.len())
+        };
+        if let Some(other) = other {
+            self.entries.swap(index, other);
+        }
+    }
+
     async fn command(&mut self, command: Command) {
         let limit = |kib: u64| match kib {
             0 => "none".to_string(),
@@ -983,9 +1231,13 @@ where
             } => self.set_priorities(info_hash, priorities).await,
             Command::Remove { info_hash, delete } => self.remove(info_hash, delete).await,
             Command::Add(source) => self.add(source).await,
+            Command::MoveUp(info_hash) => self.move_in_queue(info_hash, true),
+            Command::MoveDown(info_hash) => self.move_in_queue(info_hash, false),
             // The feed stops the torrents itself.
             Command::Stop => {}
         }
+        self.schedule().await;
+        self.idle.send_replace(self.tasks.is_empty());
         self.save_session().await;
     }
 
@@ -1000,11 +1252,12 @@ where
                     warn!(name = %entry.source.label(), "paused; run again to resume");
                     interrupted = true;
                 }
-                State::Ended(Outcome::Interrupted) => interrupted = true,
+                State::Ended(Outcome::Interrupted) | State::Queued { .. } => interrupted = true,
                 // A removed torrent has no entry, so it counts for nothing.
                 State::Ended(Outcome::Done | Outcome::Checked)
                 | State::Running { .. }
                 | State::Restarting { .. }
+                | State::Requeuing { .. }
                 | State::Removing { .. } => {}
             }
         }

@@ -10,6 +10,7 @@
 
 use crate::download::{DownloadConfig, SeedLimits};
 use crate::peer;
+use crate::queue::QueueLimits;
 use crate::resume;
 use anyhow::{Context, Result, bail};
 use serde::de::Error as _;
@@ -39,6 +40,11 @@ pub const DEFAULT_WATCH_DIR_DELETE: bool = false;
 pub const DEFAULT_MAX_DOWNLOAD_RATE: u64 = 0;
 /// Upload limit in KiB/s: none.
 pub const DEFAULT_MAX_UPLOAD_RATE: u64 = 0;
+
+/// Torrents downloading at once: no limit.
+pub const DEFAULT_MAX_ACTIVE_DOWNLOADS: usize = 0;
+/// Torrents seeding at once: no limit.
+pub const DEFAULT_MAX_ACTIVE_SEEDS: usize = 0;
 
 /// What a setting is when nothing sets it.
 enum Fallback<T> {
@@ -176,6 +182,14 @@ options! {
     /// torrents (0: unlimited) [default: 0]
     #[arg(long, value_name = "KIB/S")]
     max_upload_rate: u64 = Value(DEFAULT_MAX_UPLOAD_RATE);
+    /// Most torrents downloading at once; the rest wait in the queue (0: no
+    /// limit) [default: 0]
+    #[arg(long, value_name = "N")]
+    max_active_downloads: usize = Value(DEFAULT_MAX_ACTIVE_DOWNLOADS);
+    /// Most complete torrents seeding at once; the rest wait in the queue
+    /// (0: no limit) [default: 0]
+    #[arg(long, value_name = "N")]
+    max_active_seeds: usize = Value(DEFAULT_MAX_ACTIVE_SEEDS);
     /// Whether to show the terminal UI; unset, it shows when stdout and
     /// stderr are terminals.
     #[arg(skip)]
@@ -224,6 +238,17 @@ fn deserialize_ratio<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Optio
 }
 
 impl Options {
+    /// The queue limits these settings give, with the built-in default for
+    /// each one left unset.
+    pub fn queue_limits(&self) -> QueueLimits {
+        QueueLimits {
+            downloads: self
+                .max_active_downloads
+                .unwrap_or(DEFAULT_MAX_ACTIVE_DOWNLOADS),
+            seeds: self.max_active_seeds.unwrap_or(DEFAULT_MAX_ACTIVE_SEEDS),
+        }
+    }
+
     /// The download config these settings give, with the built-in default
     /// for each one left unset.
     pub fn into_download_config(self) -> DownloadConfig {

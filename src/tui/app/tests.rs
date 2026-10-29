@@ -942,3 +942,37 @@ fn the_trackers_scroll_stops_where_the_view_does() {
     app.fit_detail(&areas, &snapshot);
     assert_eq!(app.detail_scroll, 2);
 }
+
+#[test]
+fn k_and_j_move_the_selected_torrent_in_the_queue() {
+    let snapshot = snapshot(&["a", "b"]);
+    let mut app = App::new(Theme::default());
+    app.ensure_selection(&snapshot);
+    app.handle_key(key(KeyCode::Down), &snapshot);
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('K')), &snapshot),
+        Action::Command(Command::MoveUp([1; 20]))
+    );
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('J')), &snapshot),
+        Action::Command(Command::MoveDown([1; 20]))
+    );
+    // With nothing selected, nothing.
+    let mut app = App::new(Theme::default());
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('K')), &Snapshot::default()),
+        Action::None
+    );
+}
+
+#[test]
+fn p_pauses_a_queued_torrent() {
+    let mut snapshot = snapshot(&["a"]);
+    snapshot.torrents[0].state = TorrentState::Queued;
+    let mut app = App::new(Theme::default());
+    app.ensure_selection(&snapshot);
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('p')), &snapshot),
+        Action::Command(Command::Pause([0; 20]))
+    );
+}

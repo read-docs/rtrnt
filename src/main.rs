@@ -118,6 +118,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         .watch_dir_delete
         .or(file.options.watch_dir_delete)
         .unwrap_or(config::DEFAULT_WATCH_DIR_DELETE);
+    let queue_limits = cli.clone().or(file.options.clone()).queue_limits();
     let config = config::resolve(cli.or(from_session), file.options);
     if args.check || args.scrape {
         let (config, check_mode) = (&config, args.check);
@@ -137,6 +138,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         let shutdown = Arc::clone(&shutdown);
         move || Arc::clone(&shutdown).signal()
     });
+    manager = manager.with_queue_limits(queue_limits);
     let mut sources = args.torrents;
     // The watch directory keeps its copies of .torrent files in the
     // session's store, or else in the state directory even though the

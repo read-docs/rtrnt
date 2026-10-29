@@ -23,6 +23,9 @@ pub enum TorrentState {
     },
     /// Waiting for another torrent to finish checking its data.
     QueuedForChecking,
+    /// Waiting for a slot, as the limits on active downloads and seeds
+    /// allow only so many torrents to run (see `queue`). No task runs.
+    Queued,
     /// Hashing the data on disk: `done` of `total` bytes.
     Checking {
         done: u64,
@@ -42,11 +45,13 @@ pub enum TorrentState {
 }
 
 impl TorrentState {
-    /// Whether the torrent's task has ended.
+    /// Whether the torrent's task has ended, or has not started: it is
+    /// paused, waiting in the queue, done, stopped or failed.
     pub fn is_finished(&self) -> bool {
         matches!(
             self,
             TorrentState::Paused
+                | TorrentState::Queued
                 | TorrentState::Done
                 | TorrentState::Interrupted
                 | TorrentState::Failed(_)

@@ -16,6 +16,10 @@ const KEYS: &[(&str, &str)] = &[
     ("s  S", "sort by the next column, reverse the order"),
     ("/", "filter torrents by name; esc clears it"),
     ("p  x", "pause or resume the selected torrent; remove it"),
+    (
+        "K  J",
+        "move the selected torrent earlier or later in the queue",
+    ),
     ("r", "hash the selected torrent's files again"),
     (
         "space + -",

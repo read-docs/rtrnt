@@ -37,8 +37,9 @@ When stdout and stderr are terminals, a run shows a full-screen UI instead of pr
 | `l` | show or hide the log |
 | `s` / `S` | sort by the next column / reverse the order |
 | `/` | filter torrents by name; `esc` clears the filter |
-| `p` | pause the selected torrent, or resume it; a finished or failed torrent is run again |
+| `p` | pause the selected torrent (or take a queued one out of the queue), or resume it; a finished or failed torrent is run again |
 | `x` | remove the selected torrent from the session, after asking: `y` keeps its files, `D` deletes them too |
+| `K` / `J` | move the selected torrent earlier / later in the queue and the table (see Queue) |
 | `r` | recheck the selected torrent: hash its files again, ignoring the resume file (see below) |
 | `space`, `+`/`-` | on the Files tab with the detail panel focused: skip the file under the cursor or download it again; raise or lower its priority (skip, normal, high) (see below) |
 | `a` | add a torrent: the path of a `.torrent` file (a relative one is taken from the directory rtrnt was started in) or a magnet link. It starts as one given on the command line would, with the same output directory and settings; one the session has already is refused, and so is a file that does not load, with a note at the bottom |
@@ -67,6 +68,10 @@ Options: `-o, --output <DIR>` (default `.`), `--max-peers <N>` per torrent (defa
 
 Progress is saved in a resume file per torrent, `$XDG_STATE_HOME/rtrnt/resume/<info hash>.resume` (`~/.local/state/rtrnt/resume/` when that is unset), every 30 seconds while pieces complete and at exit. A restart trusts the pieces it lists as long as the files still have the size and modification time they had then, so a clean exit rehashes nothing, and after a crash only the files written since the last save are hashed. `--recheck` ignores the file; `--check` never reads it. The file also keeps which files of the torrent are skipped or come first, once something sets that.
 
+### Queue
+
+`--max-active-downloads <N>` and `--max-active-seeds <N>` (`max-active-downloads` and `max-active-seeds` in the config file; both default to 0, no limit) cap how many torrents run at once. A torrent counts as a download until it is complete (checking its data and fetching metadata included) and as a seed after, and each kind has its own slots. The rest wait with the status `queued`, in the order of the table, which is the queue: `K` and `J` move the selected torrent one place earlier or later (the table must be sorted by `added`, the default, to see it). A slot freed by a pause, a removal, a torrent that ends or one that completes and stops, goes to the first torrent in line for that kind; a seed over its limit (a download finished while the seed slots were full) goes back in the queue, the later ones first, and returns when a slot frees. Pausing a queued torrent takes it out of the queue; resuming it puts it back at its place, and runs it at once if a slot is free. The order is in the session file, so a restart queues in the same order (the file does not say which torrents were complete, so after a restart a finished torrent waits for a download slot until its check shows it complete; the check of a finished torrent is quick). A rate limit is not affected by the queue. Once Ctrl-C has been pressed, no queued torrent starts.
+
 ### Session
 
 The terminal UI remembers its torrents between runs. The session file, `$XDG_STATE_HOME/rtrnt/session` (`~/.local/state/rtrnt/session` when that is unset), holds the torrents in the table's order, whether each was paused, and the rate limits once they are set from the UI (`d`, `u`). It is saved after every change and when the run ends; a torrent running when you quit is saved as running, so the next run starts it again, and a paused one comes back paused. A `.torrent` file is copied to `$XDG_STATE_HOME/rtrnt/torrents/<info hash>.torrent` when it is added, so moving or deleting the original does not lose the torrent; removing the torrent deletes the copy. At startup the session's torrents come first, then those on the command line (one the session has already is not added twice, and one it has paused is resumed). The rate limits are taken from the command line, then the session, then the config file, then the default; `--print-config` says `session` where the session's limits apply. A session file that cannot be read (another version, say) is moved to `session.bad` and the run starts empty.
@@ -91,6 +96,8 @@ seed-time = 120
 dht = false
 max-download-rate = 2048
 max-upload-rate = 256
+max-active-downloads = 3
+max-active-seeds = 5
 tui = false
 watch-dir = "~/torrents"
 watch-dir-delete = false
@@ -160,6 +167,7 @@ src/
 │   ├── extension.rs # Extension protocol (BEP 10) handshake
 │   ├── fast.rs      # Fast extension (BEP 6): allowed fast set, Have All/Have None
 │   └── pex.rs       # Peer exchange (BEP 11): telling peers about each other
+├── queue.rs       # Which torrents run: the active download and seed limits
 ├── rate_limit.rs  # Upload and download rate limits (shared token buckets)
 ├── resume.rs      # Resume files: what was on disk last time
 ├── selection.rs   # Which files to download, and which first; piece priorities

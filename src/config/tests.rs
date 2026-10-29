@@ -253,6 +253,8 @@ fn describe_names_each_source() {
          dht = false  # command line\n\
          max-download-rate = 0  # default\n\
          max-upload-rate = 64  # command line\n\
+         max-active-downloads = 0  # default\n\
+         max-active-seeds = 0  # default\n\
          # tui: when stdout and stderr are terminals  # default\n\
          # session: only in the terminal UI  # default\n\
          # watch-dir: none  # default\n\
@@ -269,6 +271,8 @@ fn describe_names_each_source() {
             dht: Some(false),
             max_download_rate: Some(0),
             max_upload_rate: Some(64),
+            max_active_downloads: Some(0),
+            max_active_seeds: Some(0),
             watch_dir_delete: Some(false),
             ..options(Some("/data"), Some(5), Some(6881))
         }
@@ -376,4 +380,30 @@ fn the_watch_directory_comes_from_the_command_line_or_the_file() {
         parse(&text, None).unwrap().watch_dir,
         Some(PathBuf::from("/home/me/incoming"))
     );
+}
+
+#[test]
+fn queue_limits_come_from_the_command_line_then_the_file_and_default_to_none() {
+    assert_eq!(Options::default().queue_limits(), QueueLimits::default());
+    let file = Options {
+        max_active_downloads: Some(3),
+        max_active_seeds: Some(5),
+        ..Options::default()
+    };
+    let cli = Options {
+        max_active_downloads: Some(1),
+        ..Options::default()
+    };
+    let limits = cli.or(file).queue_limits();
+    assert_eq!(limits.downloads, 1);
+    assert_eq!(limits.seeds, 5);
+    let parsed = parse("max-active-downloads = 2\nmax-active-seeds = 4\n", None).unwrap();
+    assert_eq!(
+        parsed.queue_limits(),
+        QueueLimits {
+            downloads: 2,
+            seeds: 4
+        }
+    );
+    assert!(parse("max-active-seeds = -1\n", None).is_err());
 }

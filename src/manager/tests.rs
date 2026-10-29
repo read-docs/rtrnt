@@ -1222,3 +1222,294 @@ async fn a_paused_torrent_keeps_the_choice_of_files_in_its_resume_file() {
         Some(FileSelection::new(vec![Priority::High; 2]))
     );
 }
+
+/// The magnet link of the fake torrent number `n`, which runs until it is
+/// stopped, so that several can run at once.
+fn until(n: u8) -> Source {
+    let hex: String = until_hash(n).iter().map(|b| format!("{b:02x}")).collect();
+    Source::parse(&format!("magnet:?xt=urn:btih:{hex}")).unwrap()
+}
+
+fn until_hash(n: u8) -> [u8; 20] {
+    let mut hash = [UNTIL_STOPPED; 20];
+    hash[19] = n;
+    hash
+}
+
+/// What each entry is doing, as `r` for running, `q` for queued, `p` for
+/// paused and `u` for a seed being put back in the queue.
+fn shape(entries: &[Entry]) -> String {
+    entries
+        .iter()
+        .map(|entry| match entry.state {
+            State::Running { .. } => 'r',
+            State::Queued { .. } => 'q',
+            State::Paused => 'p',
+            State::Requeuing { .. } => 'u',
+            _ => '?',
+        })
+        .collect()
+}
+
+/// The last byte of each info hash, which tells the fake torrents apart.
+fn numbers(entries: &[Entry]) -> Vec<u8> {
+    entries.iter().map(|entry| entry.info_hash[19]).collect()
+}
+
+/// Waits for one task of `manager` to end, as the run loop would.
+async fn end_one<S, F, R, Fut>(manager: &mut Manager<S, R>)
+where
+    S: Fn() -> F,
+    F: Future<Output = ()> + Send + 'static,
+    R: Fn(Arc<Client>, Torrent, StartOptions, StopSignal) -> Fut,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    let joined = manager.tasks.join_next_with_id().await.unwrap();
+    manager.ended(joined).await;
+}
+
+fn download_limit(downloads: usize) -> QueueLimits {
+    QueueLimits {
+        downloads,
+        seeds: 0,
+    }
+}
+
+#[tokio::test]
+async fn downloads_over_the_limit_queue_and_start_as_others_stop() {
+    let client = client();
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, fake_run)
+        .with_queue_limits(download_limit(1));
+    manager.expect_more();
+    manager
+        .start(vec![until(1), until(2), until(3)], StartOptions::default())
+        .await;
+    assert_eq!(shape(manager.entries()), "rqq");
+    // The queued ones show it; the running one has no row of its own here.
+    let rows = client.stats().torrents();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.state() == TorrentState::Queued));
+
+    // What the real run would have published.
+    client
+        .stats()
+        .add_torrent(until_hash(1), "one", ".".as_ref());
+    // A pause of the running one frees its slot for the first in line.
+    manager.command(Command::Pause(until_hash(1))).await;
+    end_one(&mut manager).await;
+    assert_eq!(shape(manager.entries()), "prq");
+    // Resuming it queues it behind, as the slot is taken.
+    manager.command(Command::Resume(until_hash(1))).await;
+    assert_eq!(shape(manager.entries()), "qrq");
+    // A new torrent queues too.
+    manager.command(Command::Add(until(4))).await;
+    assert_eq!(shape(manager.entries()), "qrqq");
+    // Removing a queued one is at once, and its row goes.
+    manager
+        .command(Command::Remove {
+            info_hash: until_hash(3),
+            delete: false,
+        })
+        .await;
+    assert_eq!(shape(manager.entries()), "qrq");
+    assert!(
+        client
+            .stats()
+            .torrents()
+            .iter()
+            .all(|row| row.info_hash() != until_hash(3))
+    );
+}
+
+#[tokio::test]
+async fn nothing_queues_without_limits() {
+    let mut manager = Manager::with_runner(client(), never, fake_run);
+    manager.expect_more();
+    manager
+        .start(vec![until(1), until(2), until(3)], StartOptions::default())
+        .await;
+    assert_eq!(shape(manager.entries()), "rrr");
+}
+
+#[tokio::test]
+async fn a_queued_torrent_keeps_the_options_it_was_added_with() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut manager = Manager::with_runner(client(), never, recording(&seen))
+        .with_queue_limits(download_limit(1));
+    manager.expect_more();
+    manager.start(vec![until(1), until(2)], RECHECK).await;
+    assert_eq!(shape(manager.entries()), "rq");
+    manager.command(Command::Pause(until_hash(1))).await;
+    end_one(&mut manager).await;
+    assert_eq!(shape(manager.entries()), "pr");
+    assert_eq!(*seen.lock().unwrap(), [RECHECK, RECHECK]);
+}
+
+#[tokio::test]
+async fn a_queued_torrent_can_be_paused_and_then_resumed_into_the_queue() {
+    let client = client();
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, fake_run)
+        .with_queue_limits(download_limit(1));
+    manager.expect_more();
+    manager
+        .start(vec![until(1), until(2)], StartOptions::default())
+        .await;
+    manager.command(Command::Pause(until_hash(2))).await;
+    assert_eq!(shape(manager.entries()), "rp");
+    assert_eq!(client.stats().torrents()[0].state(), TorrentState::Paused);
+    manager.command(Command::Resume(until_hash(2))).await;
+    assert_eq!(shape(manager.entries()), "rq");
+    assert_eq!(client.stats().torrents()[0].state(), TorrentState::Queued);
+}
+
+#[tokio::test]
+async fn moving_a_torrent_changes_the_queue_order_and_the_table() {
+    let client = client();
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path().to_path_buf());
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, fake_run)
+        .with_queue_limits(download_limit(1))
+        .with_session(store.clone());
+    manager.expect_more();
+    manager
+        .start(vec![until(1), until(2), until(3)], StartOptions::default())
+        .await;
+    let rows = |client: &Client| -> Vec<u8> {
+        client
+            .stats()
+            .torrents()
+            .iter()
+            .map(|row| row.info_hash()[19])
+            .collect()
+    };
+    // The running torrent has no row in this test; give it one.
+    client
+        .stats()
+        .add_torrent(until_hash(1), "one", ".".as_ref());
+    manager.command(Command::MoveUp(until_hash(3))).await;
+    assert_eq!(numbers(manager.entries()), [1, 3, 2]);
+    assert_eq!(rows(&client), [1, 3, 2]);
+    manager.command(Command::MoveDown(until_hash(1))).await;
+    assert_eq!(numbers(manager.entries()), [3, 1, 2]);
+    assert_eq!(rows(&client), [3, 1, 2]);
+    // At either end nothing moves.
+    manager.command(Command::MoveUp(until_hash(3))).await;
+    manager.command(Command::MoveDown(until_hash(2))).await;
+    assert_eq!(numbers(manager.entries()), [3, 1, 2]);
+    // The order is what the session keeps.
+    let saved: Vec<u8> = store
+        .load()
+        .unwrap()
+        .torrents
+        .iter()
+        .map(|saved| saved.info_hash[19])
+        .collect();
+    assert_eq!(saved, [3, 1, 2]);
+    // The first in line in the new order starts once the slot is free.
+    manager.command(Command::Pause(until_hash(1))).await;
+    end_one(&mut manager).await;
+    assert_eq!(shape(manager.entries()), "rpq");
+}
+
+#[tokio::test]
+async fn a_restored_session_queues_in_its_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path().to_path_buf());
+    let mut manager = Manager::with_runner(client(), never, fake_run)
+        .with_queue_limits(download_limit(2))
+        .with_session(store.clone());
+    manager.expect_more();
+    let saved = |n: u8, paused: bool| SavedTorrent {
+        info_hash: until_hash(n),
+        source: until(n),
+        paused,
+    };
+    manager
+        .restore(SavedSession {
+            torrents: vec![
+                saved(3, false),
+                saved(1, true),
+                saved(2, false),
+                saved(4, false),
+            ],
+            rate_limits: None,
+        })
+        .await;
+    assert_eq!(shape(manager.entries()), "rprq");
+    // Queued is saved as not paused, in the same order.
+    let in_file: Vec<_> = saved_session(&store)
+        .torrents
+        .iter()
+        .map(|t| (t.info_hash[19], t.paused))
+        .collect();
+    assert_eq!(in_file, [(3, false), (1, true), (2, false), (4, false)]);
+}
+
+/// Runs the fake torrent as a seed: it publishes a row in the seeding state
+/// and runs until it is stopped.
+fn seeding_run(
+    client: Arc<Client>,
+    torrent: Torrent,
+    _: StartOptions,
+    stop: StopSignal,
+) -> impl Future<Output = Result<()>> + Send + 'static {
+    let stats = client
+        .stats()
+        .add_torrent(torrent.info_hash(), "seed", ".".as_ref());
+    stats.set_state(TorrentState::Seeding);
+    async move {
+        stop.await;
+        Err(Interrupted {
+            remaining: 0,
+            pieces: 2,
+        }
+        .into())
+    }
+}
+
+#[tokio::test]
+async fn seeds_over_the_limit_go_back_in_the_queue_and_return_in_turn() {
+    let client = client();
+    let limits = QueueLimits {
+        downloads: 0,
+        seeds: 1,
+    };
+    let mut manager =
+        Manager::with_runner(Arc::clone(&client), never, seeding_run).with_queue_limits(limits);
+    manager.expect_more();
+    manager
+        .start(vec![until(1), until(2)], StartOptions::default())
+        .await;
+    assert_eq!(shape(manager.entries()), "rr");
+    // The next look at the queue sees both seeding, and stops the later.
+    assert!(manager.schedule().await);
+    assert_eq!(shape(manager.entries()), "ru");
+    end_one(&mut manager).await;
+    assert_eq!(shape(manager.entries()), "rq");
+    assert!(matches!(
+        manager.entries()[1].state,
+        State::Queued { seeding: true, .. }
+    ));
+    assert_eq!(client.stats().torrents()[1].state(), TorrentState::Queued);
+    // Nothing more to do while the seed holds the slot.
+    assert!(!manager.schedule().await);
+
+    // When it is paused, the queued seed takes the slot.
+    manager.command(Command::Pause(until_hash(1))).await;
+    end_one(&mut manager).await;
+    assert_eq!(shape(manager.entries()), "pr");
+}
+
+#[tokio::test]
+async fn a_session_that_stops_starts_nothing_from_the_queue() {
+    let mut manager =
+        Manager::with_runner(client(), || async {}, fake_run).with_queue_limits(download_limit(1));
+    manager.expect_more();
+    manager
+        .start(vec![until(1), until(2)], StartOptions::default())
+        .await;
+    assert_eq!(shape(manager.entries()), "rq");
+    // The first stops as soon as it runs; the second stays queued.
+    let code = manager.run(closed()).await.unwrap();
+    assert_eq!(code, ExitCode::from(EXIT_INTERRUPTED));
+}
