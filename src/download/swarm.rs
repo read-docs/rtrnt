@@ -24,6 +24,7 @@ use tracing::{Instrument, debug, info, warn};
 
 use super::progress::Progress;
 use super::queue::PieceQueue;
+use super::smart_ban::SmartBan;
 use super::web::web_seed_worker;
 use super::worker::peer_worker;
 use super::{Interrupted, Misbehaved, Session};
@@ -103,6 +104,7 @@ pub(crate) async fn download_with(
     let (pex, mut pex_peers) = PeerExchange::new(!torrent.is_private());
     let stats = &session.stats;
     let priorities = session.piece_priorities();
+    let (smart_ban, mut verdicts) = SmartBan::new();
     let swarm = Arc::new(Swarm {
         queue: PieceQueue::new(have, &priorities)
             .seeding(seed.enabled())
@@ -117,6 +119,7 @@ pub(crate) async fn download_with(
         connected: ConnectedPeers::default(),
         choker: Choker::default(),
         pex,
+        smart_ban,
     });
     let Swarm {
         queue,
@@ -396,6 +399,14 @@ pub(crate) async fn download_with(
                     pool.add(peers);
                 }
             }
+            // Found guilty of corrupt blocks by a piece completed elsewhere.
+            Some(sender) = verdicts.recv() => {
+                if sender.inbound {
+                    banned_ips.insert(sender.addr.ip());
+                } else {
+                    pool.ban(sender.addr);
+                }
+            }
             () = &mut choking => {}
             () = &mut seed_changed => {}
             () = queue.wait_for(|| queue.is_done()), if seeding_since.is_none() => {}
@@ -519,6 +530,9 @@ pub(super) struct Swarm {
     pub(super) choker: Choker,
     /// Tells peers about each other (BEP 11).
     pub(super) pex: PeerExchange,
+    /// Remembers which peers sent the blocks of pieces that failed their
+    /// hash check, to ban them once the piece is completed elsewhere.
+    pub(super) smart_ban: SmartBan,
 }
 
 impl PieceSource for Swarm {

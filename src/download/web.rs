@@ -72,7 +72,10 @@ async fn lane(
     shared: &Shared,
 ) -> Result<()> {
     let Swarm {
-        queue, progress, ..
+        queue,
+        progress,
+        smart_ban,
+        ..
     } = swarm;
     let torrent = &session.torrent;
     // A web seed has every piece.
@@ -123,7 +126,12 @@ async fn lane(
         let error = match fetched {
             Ok(data) => {
                 let hash = torrent.piece_hash(index)?;
+                // Peers that sent a bad copy of the piece are found out by it.
+                let good = smart_ban.watching(index).then(|| data.clone());
                 if session.storage.verify_and_write(index, data, hash).await? {
+                    if let Some(good) = good {
+                        smart_ban.verified(index, &good);
+                    }
                     if claim.complete() {
                         progress.add(len);
                         debug!(url = %seed.url, index, "piece complete");

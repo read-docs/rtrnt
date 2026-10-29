@@ -16,6 +16,7 @@ use super::queue::PieceQueue;
 use super::requests::{
     ActivePiece, Pipeline, drop_completed, expire_requests, release_choked, request_blocks,
 };
+use super::smart_ban::Sender;
 use super::swarm::{Link, Swarm, sleep_until_some};
 use super::upload::{Uploads, serve_block};
 use super::{Misbehaved, Session};
@@ -56,6 +57,7 @@ pub(super) async fn peer_worker(
         connected,
         choker,
         pex,
+        smart_ban,
     } = swarm;
     let torrent = &session.torrent;
     let (info_hash, peer_id, num_pieces) =
@@ -169,6 +171,11 @@ pub(super) async fn peer_worker(
             }
         });
 
+        if smart_ban.is_banned(addr) {
+            bail!(Misbehaved(
+                "sent corrupt blocks of a piece completed elsewhere"
+            ));
+        }
         drop_completed(&mut conn, &mut active, fast.then_some(&mut cancelled)).await?;
         announce_pieces(&mut conn, queue, &mut announced).await?;
         if queue.is_finished() {
@@ -421,13 +428,19 @@ pub(super) async fn peer_worker(
                     continue;
                 }
                 let piece_len = data.len() as u64;
-                if !session.storage.verify_and_write(index, data, hash).await? {
+                // Peers that sent a bad copy of the piece are found out by it.
+                let good = smart_ban.watching(index).then(|| data.clone());
+                if let Err(bad) = session.storage.write_verified(index, data, hash).await? {
                     hash_failures += 1;
                     warn!(%addr, index, "piece failed hash check");
+                    smart_ban.failed(index, &bad, Sender { addr, inbound });
                     if hash_failures >= MAX_HASH_FAILURES {
                         bail!(Misbehaved("too many corrupt pieces"));
                     }
                     continue;
+                }
+                if let Some(good) = good {
+                    smart_ban.verified(index, &good);
                 }
                 if claim.complete() {
                     *pieces_done += 1;

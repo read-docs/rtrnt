@@ -28,6 +28,7 @@ pub(crate) mod peer_pool;
 mod progress;
 mod queue;
 mod requests;
+mod smart_ban;
 mod swarm;
 mod upload;
 mod web;
