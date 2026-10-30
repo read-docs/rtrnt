@@ -64,9 +64,7 @@ pub fn is_public(ip: Ipv4Addr) -> bool {
     !(is_local(ip) || shared || ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast())
 }
 
-/// `is_public` for either family. Only tests use it until the node learns
-/// an IPv6 address of its own.
-#[cfg(test)]
+/// `is_public` for either family.
 pub fn is_public_ip(ip: IpAddr) -> bool {
     match ip.to_canonical() {
         IpAddr::V4(ip) => is_public(ip),
@@ -106,12 +104,14 @@ impl NodeId {
     }
 
     /// A random id that is valid for a node at `ip`.
+    #[cfg(test)]
     pub fn secure_v4(ip: Ipv4Addr) -> NodeId {
         Self::secure(ip.into())
     }
 
     /// Whether the id is valid for a node at `ip`. Nodes on the local
     /// network always are.
+    #[cfg(test)]
     pub fn is_secure_v4(&self, ip: Ipv4Addr) -> bool {
         self.is_secure(ip.into())
     }
@@ -150,11 +150,12 @@ impl NodeId {
 }
 
 /// What nodes say our external address is. One report counts per reporting
-/// node, so that a single liar cannot decide it.
+/// node, so that a single liar cannot decide it. A node keeps one tally for
+/// its own family of addresses.
 #[derive(Default)]
 pub struct IpVotes {
     /// Reporter and the address it reported, oldest first.
-    votes: Vec<(Ipv4Addr, Ipv4Addr)>,
+    votes: Vec<(IpAddr, IpAddr)>,
 }
 
 impl IpVotes {
@@ -162,8 +163,16 @@ impl IpVotes {
     /// address once at least `MIN_VOTES` nodes agree on it and they are
     /// the majority of all reports. Addresses that cannot be public are
     /// never accepted, as they say nothing about our public one.
-    pub fn vote(&mut self, reporter: Ipv4Addr, reported: Ipv4Addr) -> Option<Ipv4Addr> {
-        if !is_public(reported) {
+    pub fn vote(
+        &mut self,
+        reporter: impl Into<IpAddr>,
+        reported: impl Into<IpAddr>,
+    ) -> Option<IpAddr> {
+        let (reporter, reported) = (
+            reporter.into().to_canonical(),
+            reported.into().to_canonical(),
+        );
+        if reporter.is_ipv4() != reported.is_ipv4() || !is_public_ip(reported) {
             return None;
         }
         self.votes.retain(|&(who, _)| who != reporter);
