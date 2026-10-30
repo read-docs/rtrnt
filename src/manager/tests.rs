@@ -1005,6 +1005,8 @@ async fn a_saved_session_is_restored_in_order_and_paused_torrents_stay_paused() 
 
         dir: None,
         trackers: None,
+
+        dir_from_tag: false,
     };
     let limits = SavedLimits {
         download: 7,
@@ -1070,6 +1072,8 @@ async fn a_saved_torrent_that_no_longer_loads_is_reported_and_dropped() {
 
                 dir: None,
                 trackers: None,
+
+                dir_from_tag: false,
             }],
             rate_limits: None,
             alt_speed: None,
@@ -1308,6 +1312,8 @@ async fn sequential_download_is_toggled_saved_and_restored() {
 
         dir: None,
         trackers: None,
+
+        dir_from_tag: false,
     };
     manager
         .restore(SavedSession {
@@ -1615,6 +1621,8 @@ async fn a_restored_session_queues_in_its_order() {
 
         dir: None,
         trackers: None,
+
+        dir_from_tag: false,
     };
     manager
         .restore(SavedSession {
@@ -1657,6 +1665,8 @@ async fn a_queued_torrent_keeps_its_choice_to_download_in_order() {
 
         dir: None,
         trackers: None,
+
+        dir_from_tag: false,
     };
     manager
         .restore(SavedSession {
@@ -2074,4 +2084,109 @@ async fn invalid_tracker_edits_leave_the_existing_list_intact() {
             .trackers,
         Some(vec![])
     );
+}
+
+#[tokio::test]
+async fn tag_directories_use_the_first_tag_and_explicit_moves_take_precedence() {
+    let temp = tempfile::tempdir().unwrap();
+    let old = temp.path().join("global");
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    let own = temp.path().join("own");
+    std::fs::create_dir(&old).unwrap();
+    std::fs::write(old.join("payload"), b"data").unwrap();
+    let (path, hash) = torrent_file(temp.path(), "payload");
+    let directories: TagDirectories = [
+        ("first".into(), first.clone()),
+        ("second".into(), second.clone()),
+    ]
+    .into();
+    let mut manager =
+        Manager::with_runner(client_in(&old), never, fake_run).with_tag_directories(directories);
+    manager
+        .command(Command::AddPaused(Source::File(path)))
+        .await;
+    manager
+        .command(Command::SetTags {
+            info_hash: hash,
+            tags: vec!["none".into(), "second".into(), "first".into()],
+        })
+        .await;
+    assert_eq!(std::fs::read(second.join("payload")).unwrap(), b"data");
+    assert!(!first.exists());
+    assert!(manager.session().torrents[0].dir_from_tag);
+    manager
+        .command(Command::SetTags {
+            info_hash: hash,
+            tags: vec!["first".into()],
+        })
+        .await;
+    assert_eq!(std::fs::read(first.join("payload")).unwrap(), b"data");
+    assert!(!second.join("payload").exists());
+    // A restore uses the saved directory even if the configured tag changes.
+    let saved = SavedSession::decode(&manager.session().encode().unwrap()).unwrap();
+    assert!(saved.torrents[0].dir_from_tag);
+    let mut restored = Manager::with_runner(client_in(&old), never, fake_run)
+        .with_tag_directories([("first".into(), second.clone())].into());
+    restored.restore(saved).await;
+    assert_eq!(restored.dir_of(hash), first.canonicalize().unwrap());
+    // Removing the tag returns data to the global directory; another tag
+    // may then select a new one without counting this as an explicit move.
+    manager
+        .command(Command::SetTags {
+            info_hash: hash,
+            tags: vec![],
+        })
+        .await;
+    assert_eq!(std::fs::read(old.join("payload")).unwrap(), b"data");
+    manager
+        .command(Command::SetTags {
+            info_hash: hash,
+            tags: vec!["second".into()],
+        })
+        .await;
+    assert_eq!(std::fs::read(second.join("payload")).unwrap(), b"data");
+    manager
+        .command(Command::MoveData {
+            info_hash: hash,
+            dir: own.clone(),
+        })
+        .await;
+    assert!(!manager.session().torrents[0].dir_from_tag);
+    manager
+        .command(Command::SetTags {
+            info_hash: hash,
+            tags: vec!["first".into()],
+        })
+        .await;
+    assert_eq!(manager.dir_of(hash), own.canonicalize().unwrap());
+    assert_eq!(std::fs::read(own.join("payload")).unwrap(), b"data");
+}
+
+#[tokio::test]
+async fn tagging_an_active_torrent_never_moves_its_data() {
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("tag");
+    let client = client_in(temp.path());
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, fake_run)
+        .with_tag_directories([("tag".into(), destination.clone())].into());
+    manager
+        .start(vec![magnet(UNTIL_STOPPED)], StartOptions::default())
+        .await;
+    manager
+        .command(Command::SetTags {
+            info_hash: [UNTIL_STOPPED; 20],
+            tags: vec!["tag".into()],
+        })
+        .await;
+    assert_eq!(
+        client.stats().torrent_tags([UNTIL_STOPPED; 20]),
+        vec!["tag"]
+    );
+    assert!(client.stats().last_notice().unwrap().1.contains("pause"));
+    assert!(!destination.exists());
+    assert!(!manager.dirs.contains_key(&[UNTIL_STOPPED; 20]));
+    assert!(matches!(manager.entries()[0].state, State::Running { .. }));
+    manager.command(Command::Pause([UNTIL_STOPPED; 20])).await;
+    manager.drive(closed()).await;
 }

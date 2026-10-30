@@ -16,6 +16,8 @@ fn saved(byte: u8, paused: bool) -> SavedTorrent {
 
         dir: None,
         trackers: None,
+
+        dir_from_tag: false,
     }
 }
 
@@ -40,6 +42,8 @@ fn a_session_round_trips() {
 
                 dir: None,
                 trackers: None,
+
+                dir_from_tag: false,
             },
             SavedTorrent {
                 info_hash: [2; 20],
@@ -51,6 +55,8 @@ fn a_session_round_trips() {
 
                 dir: None,
                 trackers: None,
+
+                dir_from_tag: false,
             },
             saved(3, false),
         ],
@@ -123,6 +129,8 @@ fn tags_that_make_no_sense_are_cleaned_up_on_loading() {
 
             dir: None,
             trackers: None,
+
+            dir_from_tag: 0,
         }],
         rate_limits: None,
         alt_speed: None,
@@ -162,6 +170,8 @@ fn an_entry_that_makes_no_sense_is_skipped() {
 
                 dir: None,
                 trackers: None,
+
+                dir_from_tag: 0,
             },
             StoredTorrent {
                 info_hash: ByteBuf::from(vec![2; 20]),
@@ -173,6 +183,8 @@ fn an_entry_that_makes_no_sense_is_skipped() {
 
                 dir: None,
                 trackers: None,
+
+                dir_from_tag: 0,
             },
             StoredTorrent {
                 info_hash: ByteBuf::from(vec![3; 20]),
@@ -184,6 +196,8 @@ fn an_entry_that_makes_no_sense_is_skipped() {
 
                 dir: None,
                 trackers: None,
+
+                dir_from_tag: 0,
             },
         ],
         rate_limits: None,
@@ -202,6 +216,8 @@ fn an_entry_that_makes_no_sense_is_skipped() {
 
             dir: None,
             trackers: None,
+
+            dir_from_tag: false,
         }]
     );
 }

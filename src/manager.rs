@@ -12,7 +12,7 @@ use crate::session::{SavedAltSpeed, SavedLimits, SavedSession, SavedTorrent, Ses
 use crate::source::Source;
 use crate::stats::{TorrentState, TorrentStats};
 use crate::storage::{self, Storage};
-use crate::tags::{self, TagSettings};
+use crate::tags::{self, TagDirectories, TagSettings};
 use crate::torrent::{self, Info, Metainfo};
 use crate::torrent_limits::TorrentSettings;
 use anyhow::{Result, anyhow};
@@ -40,7 +40,7 @@ pub fn validate_trackers(trackers: Vec<String>) -> Result<Vec<String>> {
 }
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -102,7 +102,8 @@ pub enum Command {
         settings: TorrentSettings,
     },
     /// Give the torrent with this info hash these tags, in place of its
-    /// own (see `tags`): the settings its tags give it apply at once.
+    /// own (see `tags`): limits apply at once; tag directories move stopped
+    /// torrents only, unless an explicit per-torrent directory wins.
     SetTags {
         info_hash: [u8; 20],
         tags: Vec<String>,
@@ -289,6 +290,9 @@ pub struct Manager<S, R> {
     limits: QueueLimits,
     /// What each tag gives the torrents that have it.
     tag_settings: TagSettings,
+    tag_directories: TagDirectories,
+    /// Directories from tags may follow later tag edits; explicit moves win.
+    tag_dirs: HashSet<[u8; 20]>,
     /// The torrents that are saved in a directory of their own, by info
     /// hash, rather than in the client's output directory.
     dirs: HashMap<[u8; 20], PathBuf>,
@@ -345,6 +349,8 @@ where
             saved_limits: None,
             limits: QueueLimits::default(),
             tag_settings: TagSettings::new(),
+            tag_directories: TagDirectories::new(),
+            tag_dirs: HashSet::new(),
             dirs: HashMap::new(),
             trackers: HashMap::new(),
             speed: SpeedControl::new(
@@ -374,6 +380,13 @@ where
     /// tagged later.
     pub fn with_tag_settings(mut self, tag_settings: TagSettings) -> Self {
         self.tag_settings = tag_settings;
+        self
+    }
+
+    /// Gives tags their download directories. A tag edit can move stopped
+    /// data; active torrents require pausing and reapplying the tags first.
+    pub fn with_tag_directories(mut self, directories: TagDirectories) -> Self {
+        self.tag_directories = directories;
         self
     }
 
@@ -485,6 +498,9 @@ where
             }
             if let Some(dir) = saved.dir {
                 self.dirs.insert(saved.info_hash, dir);
+                if saved.dir_from_tag {
+                    self.tag_dirs.insert(saved.info_hash);
+                }
             }
             self.client
                 .stats()
@@ -604,6 +620,7 @@ where
                     limits: self.client.stats().torrent_settings(entry.info_hash),
                     tags: self.client.stats().torrent_tags(entry.info_hash),
                     dir: self.dirs.get(&entry.info_hash).cloned(),
+                    dir_from_tag: self.tag_dirs.contains(&entry.info_hash),
                     trackers: self.trackers.get(&entry.info_hash).cloned(),
                 })
             })
@@ -1300,6 +1317,7 @@ where
         }
         self.client.stats().forget_torrent_limits(entry.info_hash);
         let dir = self.dirs.remove(&entry.info_hash);
+        self.tag_dirs.remove(&entry.info_hash);
         self.trackers.remove(&entry.info_hash);
         let span = self.span(&entry.source);
         if !delete {
@@ -1543,6 +1561,10 @@ where
     /// Moves a stopped torrent’s data, keeping the original directory on
     /// any failure before the destination files have all been prepared.
     async fn move_data(&mut self, info_hash: [u8; 20], dir: PathBuf) {
+        self.move_data_to(info_hash, dir, false).await;
+    }
+
+    async fn move_data_to(&mut self, info_hash: [u8; 20], dir: PathBuf, from_tag: bool) {
         let Some(index) = self
             .entries
             .iter()
@@ -1623,6 +1645,11 @@ where
         match result {
             Ok((dir, torrent)) => {
                 self.dirs.insert(info_hash, dir.clone());
+                if from_tag {
+                    self.tag_dirs.insert(info_hash);
+                } else {
+                    self.tag_dirs.remove(&info_hash);
+                }
                 let previous = stats_of(&self.client, info_hash, |_| true);
                 let state = previous
                     .as_ref()
@@ -1686,7 +1713,7 @@ where
 
     /// Tags the torrent with `info_hash`, if the session has it, and says
     /// so.
-    fn set_tags(&self, info_hash: [u8; 20], tags: Vec<String>) {
+    async fn set_tags(&mut self, info_hash: [u8; 20], tags: Vec<String>) {
         if !self
             .entries
             .iter()
@@ -1701,8 +1728,44 @@ where
         } else {
             format!("{name}: tags {}", tags::join_tags(&tags))
         };
+        let tag_dir = if !self.dirs.contains_key(&info_hash) || self.tag_dirs.contains(&info_hash) {
+            tags.iter()
+                .find_map(|tag| self.tag_directories.get(tag))
+                .cloned()
+                .or_else(|| {
+                    self.tag_dirs
+                        .contains(&info_hash)
+                        .then(|| self.client.config().output_dir.clone())
+                })
+        } else {
+            None
+        };
         self.apply_tags(info_hash, tags);
         self.client.stats().notice(notice);
+        if let Some(dir) = tag_dir {
+            let absolute = |dir: &Path| dir.canonicalize().or_else(|_| std::path::absolute(dir));
+            let same = matches!((absolute(&dir),absolute(self.dir_of(info_hash))), (Ok(a),Ok(b)) if a == b);
+            // Even an equal path must keep its origin, so an explicit M
+            // can override future tag edits without moving any bytes.
+            if same {
+                if let std::collections::hash_map::Entry::Vacant(entry) = self.dirs.entry(info_hash)
+                {
+                    entry.insert(std::path::absolute(&dir).unwrap_or(dir));
+                    self.tag_dirs.insert(info_hash);
+                }
+                return;
+            }
+            let stopped = self
+                .entries
+                .iter()
+                .find(|entry| entry.info_hash == info_hash)
+                .is_some_and(|entry| matches!(entry.state, State::Paused | State::Ended(_)));
+            if !stopped {
+                self.client.stats().notice("tags saved; pause the torrent, wait, then reapply tags with e to use their download directory");
+                return;
+            }
+            self.move_data_to(info_hash, dir, true).await;
+        }
     }
 
     async fn command(&mut self, command: Command) {
@@ -1750,7 +1813,7 @@ where
                 trackers,
             } => self.set_trackers(info_hash, trackers).await,
             Command::MoveData { info_hash, dir } => self.move_data(info_hash, dir).await,
-            Command::SetTags { info_hash, tags } => self.set_tags(info_hash, tags),
+            Command::SetTags { info_hash, tags } => self.set_tags(info_hash, tags).await,
             Command::Remove { info_hash, delete } => self.remove(info_hash, delete).await,
             Command::Add(source) => self.add(source, false, None).await,
             Command::AddPaused(source) => self.add(source, true, None).await,

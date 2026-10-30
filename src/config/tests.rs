@@ -787,8 +787,8 @@ fn a_bad_tag_table_names_the_problem() {
     assert!(format!("{e:#}").contains("Linux"), "{e:#}");
     let e = parse("[tags.tv]\nspeed = 1\n", None).unwrap_err();
     assert!(format!("{e:#}").contains("speed"), "{e:#}");
-    // `download-dir` is not read.
-    assert!(parse("[tags.tv]\ndownload-dir = \"/tv\"\n", None).is_err());
+    let config = parse("[tags.tv]\ndownload-dir = \"/tv\"\n", None).unwrap();
+    assert_eq!(config.tag_directories()["tv"], PathBuf::from("/tv"));
 }
 
 #[test]

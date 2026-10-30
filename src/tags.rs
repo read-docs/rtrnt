@@ -16,12 +16,18 @@ use std::collections::BTreeMap;
 /// The settings a tag gives, by tag name: what `[tags.<name>]` holds.
 pub type TagSettings = BTreeMap<String, TorrentSettings>;
 
-/// One `[tags.<name>]` table of the config file: the limits and seed
-/// settings of the torrents with the tag, each applying unless the torrent
-/// sets its own.
+/// Download directories by tag; the first tag with one wins.
+pub type TagDirectories = BTreeMap<String, std::path::PathBuf>;
+
+/// One `[tags.<name>]` table: limits, seed settings and a download directory.
+/// Explicit torrent settings win; directory changes require stopped data.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct TagConfig {
+    /// Destination applied when tagging a stopped torrent, unless it has
+    /// an explicit per-torrent directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_dir: Option<std::path::PathBuf>,
     /// Most block data to download per second, in KiB, across the
     /// torrent's peers (0: no limit of the tag's).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -66,7 +72,14 @@ impl TagTable {
     /// Checks the names of the tags: each must be as `normalize_tag` leaves
     /// it, so that the tag a user types finds its table.
     pub fn validate(&self) -> Result<()> {
-        for name in self.0.keys() {
+        for (name, config) in &self.0 {
+            if config
+                .download_dir
+                .as_ref()
+                .is_some_and(|dir| dir.as_os_str().is_empty())
+            {
+                bail!("tag {name:?}: download-dir must not be empty");
+            }
             if normalize_tag(name).as_deref() != Some(name) {
                 bail!(
                     "invalid tag name {name:?} in the config file: use lowercase words \
@@ -75,6 +88,14 @@ impl TagTable {
             }
         }
         Ok(())
+    }
+
+    /// Directories supplied by tags; tags without one are omitted.
+    pub fn directories(&self) -> TagDirectories {
+        self.0
+            .iter()
+            .filter_map(|(name, config)| config.download_dir.clone().map(|dir| (name.clone(), dir)))
+            .collect()
     }
 
     /// The settings of each tag.

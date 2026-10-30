@@ -44,6 +44,8 @@ pub struct SavedTorrent {
     /// The directory its files are in, if it has one of its own rather than
     /// the session's output directory.
     pub dir: Option<PathBuf>,
+    /// Whether the directory came from tags rather than an explicit move/feed.
+    pub dir_from_tag: bool,
     /// Tracker overrides; absent uses the source’s original list.
     pub trackers: Option<Vec<String>>,
 }
@@ -158,6 +160,8 @@ struct StoredTorrent {
     /// files from before it existed have none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dir: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    dir_from_tag: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     trackers: Option<Vec<String>>,
 }
@@ -255,6 +259,7 @@ impl SavedSession {
                     limits: torrent.limits.into(),
                     tags: torrent.tags.clone(),
                     dir,
+                    dir_from_tag: u64::from(torrent.dir_from_tag),
                     trackers: torrent.trackers.clone(),
                 })
             })
@@ -305,6 +310,7 @@ impl SavedSession {
                     limits: entry.limits.into(),
                     tags: parse_tags(&entry.tags.join(",")),
                     dir: entry.dir.filter(|dir| !dir.is_empty()).map(PathBuf::from),
+                    dir_from_tag: entry.dir_from_tag != 0,
                     trackers: entry.trackers,
                 })
             })

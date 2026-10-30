@@ -16,7 +16,7 @@ use crate::queue::QueueLimits;
 use crate::resume;
 use crate::rss::{self, Subscription};
 use crate::storage::Preallocate;
-use crate::tags::{TagSettings, TagTable};
+use crate::tags::{TagDirectories, TagSettings, TagTable};
 use anyhow::{Context, Result, bail};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer};
@@ -483,6 +483,14 @@ impl Options {
         self.tags
             .as_ref()
             .map(TagTable::settings)
+            .unwrap_or_default()
+    }
+
+    /// Download directories offered by each configured tag.
+    pub fn tag_directories(&self) -> TagDirectories {
+        self.tags
+            .as_ref()
+            .map(TagTable::directories)
             .unwrap_or_default()
     }
 

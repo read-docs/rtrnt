@@ -44,6 +44,8 @@ pub(super) fn move_files(pairs: &[(PathBuf, PathBuf)]) -> Result<()> {
                         .create_new(true)
                         .open(destination)?;
                     created.push((source, destination));
+                    // Preserve restrictive permissions before copying bytes.
+                    output.set_permissions(input.metadata()?.permissions())?;
                     io::copy(&mut input, &mut output)?;
                     output.sync_all()?;
                 }
