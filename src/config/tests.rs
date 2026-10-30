@@ -288,6 +288,7 @@ fn describe_names_each_source() {
             seed_ratio: Some(1.5),
             seed_time: Some(0),
             dht: Some(false),
+            lsd: Some(true),
             portmap: Some(true),
             max_download_rate: Some(0),
             max_upload_rate: Some(64),
