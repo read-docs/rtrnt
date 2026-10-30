@@ -681,10 +681,16 @@ impl Feed for DemoFeed {
                     live.removed = true;
                 }
             }
+            Command::SetTrackers { .. } | Command::MoveData { .. } => {
+                self.notice = Some((
+                    Instant::now(),
+                    "the demo cannot edit trackers or move files".into(),
+                ));
+            }
             Command::MoveUp(_) | Command::MoveDown(_) => {
                 self.notice = Some((Instant::now(), "the demo has no queue".into()));
             }
-            Command::Add(source) | Command::AddPaused(source) => {
+            Command::Add(source) | Command::AddPaused(source) | Command::AddIn { source, .. } => {
                 let text = format!("cannot add {}: the demo adds nothing", source.label());
                 self.notice = Some((Instant::now(), text));
             }

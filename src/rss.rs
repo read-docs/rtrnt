@@ -219,7 +219,13 @@ impl<F: Fetch> Poller<F> {
             }
             match self.source_of(&item).await {
                 Ok(source) => {
-                    let command = if subscription.paused {
+                    let command = if let Some(dir) = &subscription.download_dir {
+                        Command::AddIn {
+                            source,
+                            paused: subscription.paused,
+                            dir: dir.clone(),
+                        }
+                    } else if subscription.paused {
                         Command::AddPaused(source)
                     } else {
                         Command::Add(source)

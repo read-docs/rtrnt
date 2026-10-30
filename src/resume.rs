@@ -46,13 +46,39 @@ impl Target {
     /// The resume file of the torrent with `info_hash` as `config` has it, or
     /// `None` if there is no `resume_dir`.
     pub fn new(config: &DownloadConfig, info_hash: [u8; 20]) -> Option<Self> {
+        Self::in_dir(config, &config.output_dir, info_hash)
+    }
+
+    /// `new` for a torrent saved in `output_dir`, not the one `config` has.
+    pub fn in_dir(config: &DownloadConfig, output_dir: &Path, info_hash: [u8; 20]) -> Option<Self> {
         let dir = config.resume_dir.as_ref()?;
         Some(Self {
             path: dir.join(format!("{}.resume", hex(&info_hash))),
             info_hash,
-            output_dir: std::path::absolute(&config.output_dir)
-                .unwrap_or_else(|_| config.output_dir.clone()),
+            output_dir: std::path::absolute(output_dir)
+                .unwrap_or_else(|_| output_dir.to_path_buf()),
         })
+    }
+
+    /// Retarget an existing resume file after moving the data. File stamps
+    /// still guard every piece; copied files whose stamps changed rehash.
+    pub async fn relocate(&self, output_dir: &Path, files: usize, pieces: usize) -> Result<()> {
+        let target = self.clone();
+        let output_dir = std::path::absolute(output_dir)?;
+        tokio::task::spawn_blocking(move || {
+            let data = match std::fs::read(&target.path) {
+                Ok(data) => data,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error.into()),
+            };
+            // Invalid resume files already force a recheck; leave them alone.
+            let Ok(mut saved) = parse(&data, &target, files, pieces) else {
+                return Ok(());
+            };
+            saved.output_dir = ByteBuf::from(output_dir.as_os_str().as_encoded_bytes());
+            write_atomically(&target.path, &serde_bencode::to_bytes(&saved)?)
+        })
+        .await?
     }
 
     /// Where the resume file is.

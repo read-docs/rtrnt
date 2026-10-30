@@ -142,6 +142,10 @@ pub enum InputKind {
     SeedTime,
     /// The selected torrent's tags, comma separated.
     Tags,
+    /// Replace tracker URLs, separated by whitespace.
+    Trackers,
+    /// Move a stopped torrent’s data to another directory.
+    MoveData,
     /// A torrent to add.
     Add,
 }
@@ -158,6 +162,8 @@ impl InputKind {
             InputKind::SeedRatio => "torrent seed ratio (0: none, empty: session's): ",
             InputKind::SeedTime => "torrent seed time, minutes (0: none, empty: session's): ",
             InputKind::Tags => "tags (comma separated): ",
+            InputKind::Trackers => "trackers (space separated, empty: none): ",
+            InputKind::MoveData => "move data to directory (pause first): ",
             InputKind::Add => "add: ",
         }
     }
@@ -167,7 +173,9 @@ impl InputKind {
         match self {
             InputKind::Add => Some("path to a .torrent or magnet link"),
             InputKind::Tags => Some("none; e.g. linux, iso"),
-            InputKind::Filter
+            InputKind::Trackers
+            | InputKind::MoveData
+            | InputKind::Filter
             | InputKind::DownloadLimit
             | InputKind::UploadLimit
             | InputKind::TorrentDownloadLimit
@@ -703,6 +711,30 @@ impl App {
             KeyCode::Char('g') => self.cycle_tag_view(snapshot, true),
             KeyCode::Char('G') => self.cycle_tag_view(snapshot, false),
             KeyCode::Char('0') => self.view = View::default(),
+            KeyCode::Char('E') => {
+                if self.limitable(snapshot).is_some() {
+                    let text = self
+                        .detail(snapshot)
+                        .map(|detail| {
+                            detail
+                                .trackers
+                                .iter()
+                                .map(|tracker| tracker.url.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .unwrap_or_default();
+                    self.input = Some(Input::new(InputKind::Trackers, text));
+                }
+            }
+            KeyCode::Char('M') => {
+                if let Some(torrent) = self.limitable(snapshot) {
+                    self.input = Some(Input::new(
+                        InputKind::MoveData,
+                        torrent.save_path.to_string_lossy().into_owned(),
+                    ));
+                }
+            }
             KeyCode::Char('e') => {
                 if let Some(torrent) = self.limitable(snapshot) {
                     let tags = join_tags(&torrent.tags);
@@ -903,6 +935,32 @@ impl App {
                     }),
                     None => Action::None,
                 };
+            }
+            InputKind::Trackers => {
+                let Some((info_hash, _)) = current else {
+                    return Action::None;
+                };
+                crate::manager::validate_trackers(
+                    text.split_whitespace().map(str::to_string).collect(),
+                )
+                .map(|trackers| Command::SetTrackers {
+                    info_hash,
+                    trackers,
+                })
+                .map_err(|error| format!("{error:#}"))
+            }
+            InputKind::MoveData => {
+                let Some((info_hash, _)) = current else {
+                    return Action::None;
+                };
+                if text.is_empty() {
+                    Err("enter a destination directory".to_string())
+                } else {
+                    Ok(Command::MoveData {
+                        info_hash,
+                        dir: self.dir.join(&text),
+                    })
+                }
             }
             InputKind::DownloadLimit => limit()
                 .map(|down| Command::SetRateLimits(down, up))

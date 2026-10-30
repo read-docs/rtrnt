@@ -284,7 +284,8 @@ pub async fn download_magnet(
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let config = client.config();
-    if let Some(path) = saved_torrent(link, &config.output_dir).await {
+    let output_dir = options.output_dir(config);
+    if let Some(path) = saved_torrent(link, output_dir).await {
         info!(path = %path.display(), "using metadata saved by an earlier run");
         let metainfo = torrent::load_metainfo(&path).await?;
         return download::download_metainfo(metainfo, options, client, shutdown).await;
@@ -295,7 +296,7 @@ pub async fn download_magnet(
     let name = link.name.clone().unwrap_or_else(|| hex(&link.info_hash));
     let stats = client
         .stats()
-        .add_torrent(link.info_hash, &name, &config.output_dir);
+        .add_torrent(link.info_hash, &name, output_dir);
     stats.set_state(TorrentState::FetchingMetadata {
         pieces: 0,
         total: 0,
@@ -317,6 +318,7 @@ async fn fetch_and_download(
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let config = client.config();
+    let output_dir = options.output_dir(config);
     let info_hash = link.info_hash;
     info!(
         name = link.name.as_deref().unwrap_or("unknown"),
@@ -328,7 +330,10 @@ async fn fetch_and_download(
     let dht = client.dht().await;
     let mut incoming = client.listener().await.register(info_hash)?;
     let listen_port = incoming.port();
-    let tiers = link.tracker_tiers();
+    let tiers = options.trackers.as_ref().map_or_else(
+        || link.tracker_tiers(),
+        |trackers| trackers.iter().map(|url| vec![url.clone()]).collect(),
+    );
     let mut pool = PeerPool::with_blocklist(Arc::clone(client.blocklist()));
     pool.add(link.peers.iter().copied());
     let mut announcer = None;
@@ -393,10 +398,10 @@ async fn fetch_and_download(
         stats.set_torrent(&torrent);
         claim.claim_files(
             &torrent.info.name,
-            &Storage::paths_async(&torrent.info, &config.output_dir).await?,
+            &Storage::paths_async(&torrent.info, output_dir).await?,
         )?;
-        save_torrent(link, &config.output_dir, &tiers, &fetched.metadata).await;
-        let resume = Target::new(config, info_hash);
+        save_torrent(link, output_dir, &tiers, &fetched.metadata).await;
+        let resume = Target::in_dir(config, output_dir, info_hash);
         let selection = download::initial_selection(
             options,
             resume.as_ref(),
@@ -406,12 +411,13 @@ async fn fetch_and_download(
         let storage = Arc::new(
             Storage::new_async(
                 &torrent.info,
-                &config.output_dir,
+                output_dir,
                 &selection,
                 config.storage_options(),
             )
             .await?,
         );
+
         // BEP 27: a private torrent's peers come from its trackers alone.
         // Magnet links for private torrents are not a thing in practice,
         // but should one come, we stop using the DHT once we know.
@@ -422,7 +428,7 @@ async fn fetch_and_download(
             }
             dht => dht,
         };
-        let completion = download::completion_for(&torrent, info_hash, config);
+        let completion = download::completion_for(&torrent, info_hash, config, output_dir);
         let session = Arc::new(Session {
             torrent,
             info_hash,
@@ -462,7 +468,7 @@ async fn fetch_and_download(
         announcer.set_left(left);
     }
     if left == 0 && !config.seed.enabled() {
-        info!(output = %config.output_dir.display(), "already complete");
+        info!(output = %output_dir.display(), "already complete");
         if let Some(announcer) = announcer {
             announcer.stop(&Transferred::default()).await;
         }
@@ -512,7 +518,7 @@ async fn fetch_and_download(
         shutdown,
     )
     .await?;
-    info!(output = %config.output_dir.display(), "done");
+    info!(output = %output_dir.display(), "done");
     Ok(())
 }
 

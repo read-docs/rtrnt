@@ -84,6 +84,8 @@ pub struct Subscription {
     pub filter: Filter,
     /// Whether the torrents are added paused.
     pub paused: bool,
+    /// Directory for torrents added by this feed, overriding the global one.
+    pub download_dir: Option<std::path::PathBuf>,
 }
 
 /// An entry as the file spells it.
@@ -98,6 +100,8 @@ struct Raw {
     exclude: Option<String>,
     #[serde(default)]
     paused: bool,
+    #[serde(rename = "download-dir")]
+    download_dir: Option<std::path::PathBuf>,
 }
 
 impl TryFrom<Raw> for Subscription {
@@ -114,11 +118,19 @@ impl TryFrom<Raw> for Subscription {
                 "`interval` is in minutes and must be at least {MIN_INTERVAL_MINUTES}, not {minutes}"
             ));
         }
+        if raw
+            .download_dir
+            .as_ref()
+            .is_some_and(|dir| dir.as_os_str().is_empty())
+        {
+            return Err("`download-dir` must not be empty".into());
+        }
         Ok(Self {
             url,
             interval: Duration::from_secs(minutes.saturating_mul(60)),
             filter: Filter::new(&raw.patterns, raw.exclude.as_deref())?,
             paused: raw.paused,
+            download_dir: raw.download_dir,
         })
     }
 }
@@ -138,6 +150,9 @@ pub fn to_toml(feeds: &[Subscription]) -> String {
             ];
             if let Some(exclude) = feed.filter.exclude() {
                 fields.push(format!("exclude = {}", quote(exclude)));
+            }
+            if let Some(dir) = &feed.download_dir {
+                fields.push(format!("download-dir = {}", quote(&dir.to_string_lossy())));
             }
             if feed.paused {
                 fields.push("paused = true".to_string());

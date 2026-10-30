@@ -449,3 +449,18 @@ async fn a_selection_is_saved_into_the_resume_file_with_or_without_one() {
         .unwrap();
     assert_eq!(load_selection(&target, 2), None);
 }
+
+#[tokio::test]
+async fn relocation_keeps_the_selection_and_changes_the_directory_guard() {
+    let out = tempfile::tempdir().unwrap();
+    let new = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let config = config(out.path(), state.path());
+    let target = Target::new(&config, [7; 20]).unwrap();
+    let selection = FileSelection::new(vec![Priority::Skip, Priority::High]);
+    target.save_selection(&selection, 2, 3).await.unwrap();
+    target.relocate(new.path(), 2, 3).await.unwrap();
+    let moved = Target::in_dir(&config, new.path(), [7; 20]).unwrap();
+    assert_eq!(load_selection(&moved, 2), Some(selection));
+    assert_eq!(load_selection(&target, 2), None);
+}

@@ -273,6 +273,9 @@ const RECHECK: StartOptions = StartOptions {
     selection: None,
     picks: None,
     sequential: None,
+
+    output_dir: None,
+    trackers: None,
 };
 
 #[tokio::test]
@@ -999,6 +1002,9 @@ async fn a_saved_session_is_restored_in_order_and_paused_torrents_stay_paused() 
         sequential: None,
         limits: Default::default(),
         tags: Vec::new(),
+
+        dir: None,
+        trackers: None,
     };
     let limits = SavedLimits {
         download: 7,
@@ -1061,6 +1067,9 @@ async fn a_saved_torrent_that_no_longer_loads_is_reported_and_dropped() {
                 sequential: None,
                 limits: Default::default(),
                 tags: Vec::new(),
+
+                dir: None,
+                trackers: None,
             }],
             rate_limits: None,
             alt_speed: None,
@@ -1296,6 +1305,9 @@ async fn sequential_download_is_toggled_saved_and_restored() {
         sequential,
         limits: Default::default(),
         tags: Vec::new(),
+
+        dir: None,
+        trackers: None,
     };
     manager
         .restore(SavedSession {
@@ -1600,6 +1612,9 @@ async fn a_restored_session_queues_in_its_order() {
         sequential: None,
         limits: Default::default(),
         tags: Vec::new(),
+
+        dir: None,
+        trackers: None,
     };
     manager
         .restore(SavedSession {
@@ -1639,6 +1654,9 @@ async fn a_queued_torrent_keeps_its_choice_to_download_in_order() {
         sequential,
         limits: Default::default(),
         tags: Vec::new(),
+
+        dir: None,
+        trackers: None,
     };
     manager
         .restore(SavedSession {
@@ -1926,4 +1944,116 @@ async fn tags_give_a_torrent_settings_live_and_are_kept_in_the_session() {
         manager.ended(joined).await;
     }
     assert!(next.stats().torrent_tags(running).is_empty());
+}
+
+#[tokio::test]
+async fn per_torrent_directories_and_trackers_survive_a_session_restore() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(temp.path().join("state"));
+    let dir = temp.path().join("downloads");
+    let mut manager = Manager::with_runner(client(), never, fake_run).with_session(store.clone());
+    manager
+        .command(Command::AddIn {
+            source: magnet(UNTIL_STOPPED),
+            paused: true,
+            dir: dir.clone(),
+        })
+        .await;
+    let trackers = vec!["https://tracker.example/announce".to_string()];
+    manager
+        .command(Command::SetTrackers {
+            info_hash: [UNTIL_STOPPED; 20],
+            trackers: trackers.clone(),
+        })
+        .await;
+    let saved = saved_session(&store);
+    assert_eq!(saved.torrents[0].dir, Some(dir.clone()));
+    assert_eq!(saved.torrents[0].trackers, Some(trackers.clone()));
+    let options = Arc::new(Mutex::new(Vec::new()));
+    let mut restored = Manager::with_runner(client(), never, recording(&options));
+    restored.restore(saved).await;
+    assert_eq!(restored.dir_of([UNTIL_STOPPED; 20]), dir);
+    restored.command(Command::Resume([UNTIL_STOPPED; 20])).await;
+    let seen = options.lock().unwrap().clone();
+    assert_eq!(seen[0].output_dir, Some(dir));
+    assert_eq!(seen[0].trackers, Some(trackers));
+    restored.command(Command::Pause([UNTIL_STOPPED; 20])).await;
+    restored.drive(closed()).await;
+}
+
+#[tokio::test]
+async fn moving_paused_data_updates_the_saved_directory_and_preserves_pause() {
+    let temp = tempfile::tempdir().unwrap();
+    let old = temp.path().join("old");
+    let new = temp.path().join("new");
+    std::fs::create_dir(&old).unwrap();
+    let (path, hash) = torrent_file(temp.path(), "payload");
+    std::fs::write(old.join("payload"), b"keep these bytes").unwrap();
+    let client = client_in(&old);
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, fake_run);
+    manager
+        .command(Command::AddPaused(Source::File(path)))
+        .await;
+    manager
+        .command(Command::MoveData {
+            info_hash: hash,
+            dir: new.clone(),
+        })
+        .await;
+    assert!(!old.join("payload").exists());
+    assert_eq!(
+        std::fs::read(new.join("payload")).unwrap(),
+        b"keep these bytes"
+    );
+    assert_eq!(manager.dir_of(hash), new.canonicalize().unwrap());
+    assert!(matches!(manager.entries()[0].state, State::Paused));
+    let stats = client.stats().torrents();
+    assert_eq!(stats.len(), 1);
+    assert_eq!(stats[0].save_path(), new.canonicalize().unwrap());
+    assert_eq!(stats[0].state(), TorrentState::Paused);
+    // A destination collision leaves the chosen directory and both files alone.
+    std::fs::write(old.join("payload"), b"different").unwrap();
+    manager
+        .command(Command::MoveData {
+            info_hash: hash,
+            dir: old.clone(),
+        })
+        .await;
+    assert_eq!(manager.dir_of(hash), new.canonicalize().unwrap());
+    assert_eq!(std::fs::read(old.join("payload")).unwrap(), b"different");
+}
+
+#[tokio::test]
+async fn invalid_tracker_edits_leave_the_existing_list_intact() {
+    let mut manager = Manager::with_runner(client(), never, fake_run);
+    manager.command(Command::AddPaused(magnet(DONE))).await;
+    let trackers = vec!["udp://tracker.example:6969/announce".into()];
+    manager
+        .command(Command::SetTrackers {
+            info_hash: [DONE; 20],
+            trackers: trackers.clone(),
+        })
+        .await;
+    manager
+        .command(Command::SetTrackers {
+            info_hash: [DONE; 20],
+            trackers: vec!["file:///tmp/data".into()],
+        })
+        .await;
+    assert_eq!(manager.session().torrents[0].trackers, Some(trackers));
+    // An explicit empty list must remain distinct from no override.
+    manager
+        .command(Command::SetTrackers {
+            info_hash: [DONE; 20],
+            trackers: vec![],
+        })
+        .await;
+    let saved = manager.session();
+    assert_eq!(
+        SavedSession::decode(&saved.encode().unwrap())
+            .unwrap()
+            .torrents[0]
+            .trackers,
+        Some(vec![])
+    );
 }

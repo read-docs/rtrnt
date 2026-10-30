@@ -17,13 +17,13 @@ const KEYS: &[(&str, &str)] = &[
     ("/", "filter torrents by name; esc clears it"),
     ("f  g", "show one state, or one tag, only; F G go back"),
     ("0", "show every torrent again"),
-    ("e", "set the selected torrent's tags, comma separated"),
+    ("e  E", "set tags; replace trackers (space separated)"),
     ("p  x", "pause or resume the selected torrent; remove it"),
     (
         "K  J",
         "move the selected torrent earlier or later in the queue",
     ),
-    ("r", "hash the selected torrent's files again"),
+    ("r  M", "rehash files; move data (pause and wait first)"),
     (
         "o",
         "download the selected torrent in order, first and last pieces first",
