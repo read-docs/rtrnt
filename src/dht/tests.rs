@@ -595,3 +595,21 @@ async fn an_oversized_remote_token_is_not_sent_back() {
         std::io::ErrorKind::WouldBlock
     );
 }
+
+#[tokio::test]
+async fn binding_policy_selects_the_dht_source_family_and_refuses_proxy_udp() {
+    let ipv4 = crate::network::Policy::new(Some(Ipv4Addr::LOCALHOST.into()), None, None).unwrap();
+    let node = Dht::bind_with_policy(0, &ipv4).await.unwrap();
+    assert_eq!(node.local_addr().ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert_eq!(node.local_addr_v6(), None);
+    let ipv6 = crate::network::Policy::new(Some(Ipv6Addr::LOCALHOST.into()), None, None).unwrap();
+    if let Ok(probe) = UdpSocket::bind("[::1]:0").await {
+        drop(probe);
+        let node = Dht::bind_with_policy(0, &ipv6).await.unwrap();
+        assert_eq!(node.local_addr().ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(node.local_addr_v6(), Some(node.local_addr()));
+    }
+    let proxied =
+        crate::network::Policy::new(None, None, Some("socks5h://127.0.0.1:1080")).unwrap();
+    assert!(Dht::bind_with_policy(0, &proxied).await.is_err());
+}
