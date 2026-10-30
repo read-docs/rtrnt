@@ -1994,6 +1994,8 @@ async fn moving_paused_data_updates_the_saved_directory_and_preserves_pause() {
     manager
         .command(Command::AddPaused(Source::File(path)))
         .await;
+    client.stats().torrents()[0].set_verified(7);
+    client.stats().torrents()[0].set_selection(vec![Priority::High], 16 * 1024);
     manager
         .command(Command::MoveData {
             info_hash: hash,
@@ -2011,6 +2013,8 @@ async fn moving_paused_data_updates_the_saved_directory_and_preserves_pause() {
     assert_eq!(stats.len(), 1);
     assert_eq!(stats[0].save_path(), new.canonicalize().unwrap());
     assert_eq!(stats[0].state(), TorrentState::Paused);
+    assert_eq!(stats[0].verified(), 7);
+    assert_eq!(stats[0].priorities(), Some(vec![Priority::High]));
     // A destination collision leaves the chosen directory and both files alone.
     std::fs::write(old.join("payload"), b"different").unwrap();
     manager

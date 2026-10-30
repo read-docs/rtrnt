@@ -1579,6 +1579,8 @@ where
             let dir = std::path::absolute(&dir)?;
             tokio::fs::create_dir_all(&dir).await?;
             let dir = tokio::fs::canonicalize(dir).await?;
+            // A torrent added paused may never have created its old root.
+            tokio::fs::create_dir_all(&old_dir).await?;
             let old_dir = tokio::fs::canonicalize(&old_dir).await?;
             if dir == old_dir {
                 return Ok::<_, anyhow::Error>((dir, torrent));
@@ -1618,12 +1620,10 @@ where
         match result {
             Ok((dir, torrent)) => {
                 self.dirs.insert(info_hash, dir.clone());
-                let paused = matches!(self.entries[index].state, State::Paused);
-                let state = if paused {
-                    TorrentState::Paused
-                } else {
-                    TorrentState::Interrupted
-                };
+                let previous = stats_of(&self.client, info_hash, |_| true);
+                let state = previous
+                    .as_ref()
+                    .map_or(TorrentState::Paused, |stats| stats.state());
                 // Replace the stopped row so its save path and layout agree.
                 let metainfo = Torrent::File(Box::new(Metainfo {
                     torrent,
@@ -1631,6 +1631,19 @@ where
                     info_bytes: Vec::new(),
                 }));
                 self.show_row(&metainfo, &source, state);
+                if let Some(previous) = previous
+                    && let Some(current) = stats_of(&self.client, info_hash, |_| true)
+                {
+                    current.set_verified(previous.verified());
+                    if let Some(pieces) = previous.pieces() {
+                        current.set_final_pieces(pieces);
+                    }
+                    if let (Some(priorities), Some(wanted)) =
+                        (previous.priorities(), previous.wanted())
+                    {
+                        current.set_selection(priorities, wanted);
+                    }
+                }
                 self.client
                     .stats()
                     .notice(format!("data moved to {}", dir.display()));
