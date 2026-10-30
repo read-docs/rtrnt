@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod demo;
+pub mod filter;
 pub mod log_buffer;
 pub mod snapshot;
 pub mod theme;

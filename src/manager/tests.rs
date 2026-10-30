@@ -995,6 +995,7 @@ async fn a_saved_session_is_restored_in_order_and_paused_torrents_stay_paused() 
         paused,
         sequential: None,
         limits: Default::default(),
+        tags: Vec::new(),
     };
     let limits = SavedLimits {
         download: 7,
@@ -1056,6 +1057,7 @@ async fn a_saved_torrent_that_no_longer_loads_is_reported_and_dropped() {
                 paused: true,
                 sequential: None,
                 limits: Default::default(),
+                tags: Vec::new(),
             }],
             rate_limits: None,
             alt_speed: None,
@@ -1287,6 +1289,7 @@ async fn sequential_download_is_toggled_saved_and_restored() {
         paused: true,
         sequential,
         limits: Default::default(),
+        tags: Vec::new(),
     };
     manager
         .restore(SavedSession {
@@ -1590,6 +1593,7 @@ async fn a_restored_session_queues_in_its_order() {
         paused,
         sequential: None,
         limits: Default::default(),
+        tags: Vec::new(),
     };
     manager
         .restore(SavedSession {
@@ -1628,6 +1632,7 @@ async fn a_queued_torrent_keeps_its_choice_to_download_in_order() {
         paused: false,
         sequential,
         limits: Default::default(),
+        tags: Vec::new(),
     };
     manager
         .restore(SavedSession {
@@ -1794,4 +1799,125 @@ async fn a_torrent_keeps_its_own_limits_live_and_in_the_session() {
         manager.ended(joined).await;
     }
     assert_eq!(next.stats().torrent_settings(running), Default::default());
+}
+
+fn tag_settings() -> crate::tags::TagSettings {
+    let mut tags = crate::tags::TagSettings::new();
+    tags.insert(
+        "slow".into(),
+        TorrentSettings {
+            download: 40,
+            upload: 10,
+            seed_ratio_milli: Some(2000),
+            seed_time: None,
+        },
+    );
+    tags
+}
+
+#[tokio::test]
+async fn tags_give_a_torrent_settings_live_and_are_kept_in_the_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path().to_path_buf());
+    let client = client();
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, fake_run)
+        .with_session(store.clone())
+        .with_tag_settings(tag_settings());
+    manager.expect_more();
+    let (running, done) = ([UNTIL_STOPPED; 20], [DONE; 20]);
+    manager
+        .start(
+            vec![magnet(UNTIL_STOPPED), magnet(DONE)],
+            StartOptions::default(),
+        )
+        .await;
+    let live = client.stats().torrent_limits(running);
+    assert_eq!(live.rates().kib(), (0, 0));
+
+    manager
+        .command(Command::SetTags {
+            info_hash: running,
+            tags: vec!["tv".into(), "slow".into()],
+        })
+        .await;
+    assert_eq!(client.stats().torrent_tags(running), ["tv", "slow"]);
+    assert!(client.stats().torrent_tags(done).is_empty());
+    // The running torrent holds the limits its tag gives, with nothing of
+    // its own set, and only the own settings are saved.
+    assert_eq!(live.rates().kib(), (40, 10));
+    assert_eq!(live.effective().seed_ratio_milli, Some(2000));
+    assert!(live.settings().is_default());
+    let saved = saved_session(&store);
+    assert_eq!(saved.torrents[0].tags, ["tv", "slow"]);
+    assert!(saved.torrents[0].limits.is_default());
+    assert!(saved.torrents[1].tags.is_empty());
+
+    // Its own limit wins over the tag's, where it sets one.
+    let own = TorrentSettings {
+        download: 5,
+        ..Default::default()
+    };
+    manager
+        .command(Command::SetTorrentLimits {
+            info_hash: running,
+            settings: own,
+        })
+        .await;
+    assert_eq!(live.rates().kib(), (5, 10));
+
+    // A torrent the session does not have gets nothing.
+    manager
+        .command(Command::SetTags {
+            info_hash: [9; 20],
+            tags: vec!["slow".into()],
+        })
+        .await;
+    assert!(client.stats().torrent_tags([9; 20]).is_empty());
+
+    // Taking the tag off takes its limits away.
+    manager
+        .command(Command::SetTags {
+            info_hash: running,
+            tags: Vec::new(),
+        })
+        .await;
+    assert_eq!(live.rates().kib(), (5, 0));
+    assert!(saved_session(&store).torrents[0].tags.is_empty());
+
+    // A restored session tags the torrents again, and the tags' settings
+    // reach them.
+    manager
+        .command(Command::SetTags {
+            info_hash: done,
+            tags: vec!["slow".into()],
+        })
+        .await;
+    manager
+        .command(Command::SetTags {
+            info_hash: running,
+            tags: vec!["slow".into()],
+        })
+        .await;
+    let next = client_in(dir.path());
+    let mut manager =
+        Manager::with_runner(Arc::clone(&next), never, fake_run).with_tag_settings(tag_settings());
+    manager.expect_more();
+    manager.restore(saved_session(&store)).await;
+    assert_eq!(next.stats().torrent_tags(done), ["slow"]);
+    assert_eq!(next.stats().torrent_limits(done).rates().kib(), (40, 10));
+    // The torrent's own download limit still wins over its tag's.
+    assert_eq!(next.stats().torrent_limits(running).rates().kib(), (5, 10));
+
+    // Removing the torrent drops its tags.
+    manager
+        .command(Command::Remove {
+            info_hash: running,
+            delete: false,
+        })
+        .await;
+    while !manager.tasks.is_empty() {
+        let joined = manager.tasks.join_next_with_id().await.unwrap();
+        manager.ended(joined).await;
+    }
+    assert!(next.stats().torrent_tags(running).is_empty());
 }

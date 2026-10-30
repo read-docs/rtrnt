@@ -277,7 +277,8 @@ fn describe_names_each_source() {
          alt-speed-upload = 50  # default\n\
          # alt-speed-schedule: only by hand  # default\n\
          # metrics-listen: off  # default\n\
-         # rss: none  # default\n"
+         # rss: none  # default\n\
+         # tags: none  # default\n"
     );
     // The settings part is valid TOML that parses to the same values.
     let reparsed = parse(&text, None).unwrap();
@@ -665,5 +666,54 @@ fn rss_feeds_come_from_the_file_and_are_shown_as_it_spells_them() {
             None
         )
         .is_err()
+    );
+}
+
+#[test]
+fn tag_tables_come_from_the_file_and_default_to_none() {
+    assert!(Options::default().tag_settings().is_empty());
+    let text = "max-peers = 10\n\
+                [tags.private]\nupload = 100\nseed-ratio = 2.0\n\
+                [tags.slow]\ndownload = 50\nseed-time = 90\n";
+    let parsed = parse(text, None).unwrap();
+    assert_eq!(parsed.max_peers, Some(10));
+    let tags = parsed.tag_settings();
+    assert_eq!(tags.len(), 2);
+    assert_eq!(tags["private"].upload, 100);
+    assert_eq!(tags["private"].seed_ratio_milli, Some(2000));
+    assert_eq!(tags["slow"].download, 50);
+    assert_eq!(tags["slow"].seed_time, Some(90));
+    // The command line has none, so the file's reach the session.
+    let merged = Options::default().or(parsed);
+    assert_eq!(merged.tag_settings().len(), 2);
+}
+
+#[test]
+fn a_bad_tag_table_names_the_problem() {
+    let e = parse("[tags.Linux]\nupload = 1\n", None).unwrap_err();
+    assert!(format!("{e:#}").contains("Linux"), "{e:#}");
+    let e = parse("[tags.tv]\nspeed = 1\n", None).unwrap_err();
+    assert!(format!("{e:#}").contains("speed"), "{e:#}");
+    // `download-dir` is not read.
+    assert!(parse("[tags.tv]\ndownload-dir = \"/tv\"\n", None).is_err());
+}
+
+#[test]
+fn print_config_shows_the_tags_as_toml_that_reads_back() {
+    let text = "[tags.private]\nupload = 100\n[tags.slow]\nseed-time = 90\n";
+    let file = ConfigFile {
+        path: None,
+        options: parse(text, None).unwrap(),
+    };
+    let text = describe(&Options::default(), &Options::default(), &file);
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("tags = "))
+        .unwrap();
+    assert!(line.ends_with("  # config file"), "{line}");
+    let value = line.trim_end_matches("  # config file");
+    assert_eq!(
+        parse(value, None).unwrap().tag_settings(),
+        file.options.tag_settings()
     );
 }

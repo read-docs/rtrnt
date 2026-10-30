@@ -31,6 +31,8 @@ pub struct SessionStats {
     torrents: Mutex<Vec<Arc<TorrentStats>>>,
     /// What each torrent overrides of the session's settings, by info hash.
     limits: Mutex<HashMap<[u8; 20], Arc<TorrentLimits>>>,
+    /// The tags of each torrent that has any (see `tags`), by info hash.
+    tags: Mutex<HashMap<[u8; 20], Vec<String>>>,
     /// Set once the DHT node is started.
     dht: OnceLock<Dht>,
     /// Set once the client has one.
@@ -54,6 +56,7 @@ impl SessionStats {
         Self {
             torrents: Mutex::new(Vec::new()),
             limits: Mutex::new(HashMap::new()),
+            tags: Mutex::new(HashMap::new()),
             dht: OnceLock::new(),
             portmap: OnceLock::new(),
             port: OnceLock::new(),
@@ -85,9 +88,38 @@ impl SessionStats {
             .unwrap_or_default()
     }
 
-    /// Drops the settings of a torrent removed from the session.
+    /// The settings that apply to the torrent with `info_hash`, its own over
+    /// its tags', none overridden if it has none.
+    pub fn effective_settings(&self, info_hash: [u8; 20]) -> TorrentSettings {
+        lock(&self.limits)
+            .get(&info_hash)
+            .map(|limits| limits.effective())
+            .unwrap_or_default()
+    }
+
+    /// Drops the settings and tags of a torrent removed from the session.
     pub fn forget_torrent_limits(&self, info_hash: [u8; 20]) {
         lock(&self.limits).remove(&info_hash);
+        lock(&self.tags).remove(&info_hash);
+    }
+
+    /// The tags of the torrent with `info_hash`, none if it has none.
+    pub fn torrent_tags(&self, info_hash: [u8; 20]) -> Vec<String> {
+        lock(&self.tags)
+            .get(&info_hash)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Gives the torrent with `info_hash` these tags, in place of its
+    /// earlier ones.
+    pub fn set_torrent_tags(&self, info_hash: [u8; 20], tags: Vec<String>) {
+        let mut all = lock(&self.tags);
+        if tags.is_empty() {
+            all.remove(&info_hash);
+        } else {
+            all.insert(info_hash, tags);
+        }
     }
 
     /// Adds a torrent called `name` (until its metadata says otherwise),

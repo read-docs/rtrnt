@@ -1,6 +1,7 @@
 use super::*;
 use crate::stats::TorrentState;
 use crate::torrent_limits::TorrentSettings;
+use crate::tui::filter::{StateView, View};
 use crate::tui::snapshot::Detail;
 use crossterm::event::KeyEvent;
 use std::path::PathBuf;
@@ -28,6 +29,8 @@ pub(crate) fn torrent(hash: u8, name: &str) -> TorrentSnapshot {
         rate_up: 0.0,
         eta: None,
         limits: TorrentSettings::default(),
+        effective_limits: TorrentSettings::default(),
+        tags: Vec::new(),
     }
 }
 
@@ -1104,4 +1107,140 @@ fn p_pauses_a_queued_torrent() {
         app.handle_key(key(KeyCode::Char('p')), &snapshot),
         Action::Command(Command::Pause([0; 20]))
     );
+}
+
+fn shown(app: &App, snapshot: &Snapshot) -> Vec<String> {
+    app.visible(snapshot)
+        .iter()
+        .map(|torrent| torrent.name.clone())
+        .collect()
+}
+
+/// Three torrents: `a` downloading, tagged linux and iso; `b` seeding,
+/// tagged linux; `c` paused, with no tags.
+fn tagged_snapshot() -> Snapshot {
+    let mut snapshot = snapshot(&["a", "b", "c"]);
+    snapshot.torrents[0].tags = vec!["linux".into(), "iso".into()];
+    snapshot.torrents[1].tags = vec!["linux".into()];
+    snapshot.torrents[1].state = TorrentState::Seeding;
+    snapshot.torrents[2].state = TorrentState::Paused;
+    snapshot
+}
+
+#[test]
+fn f_cycles_the_state_views_and_zero_shows_everything() {
+    let snapshot = tagged_snapshot();
+    let mut app = App::new(Theme::default());
+    app.ensure_selection(&snapshot);
+    assert_eq!(shown(&app, &snapshot), ["a", "b", "c"]);
+
+    app.handle_key(key(KeyCode::Char('f')), &snapshot);
+    assert_eq!(app.view.state, StateView::Downloading);
+    assert_eq!(shown(&app, &snapshot), ["a"]);
+    app.handle_key(key(KeyCode::Char('f')), &snapshot);
+    assert_eq!(shown(&app, &snapshot), ["b"]);
+    // The selection follows into the view.
+    assert_eq!(app.selected, Some([1; 20]));
+    app.handle_key(key(KeyCode::Char('f')), &snapshot);
+    assert_eq!(shown(&app, &snapshot), ["c"]);
+    // Queued and error have none.
+    app.handle_key(key(KeyCode::Char('f')), &snapshot);
+    assert!(shown(&app, &snapshot).is_empty());
+    app.handle_key(key(KeyCode::Char('f')), &snapshot);
+    assert_eq!(app.view.state, StateView::Error);
+    // Back round to every torrent, and backwards.
+    app.handle_key(key(KeyCode::Char('f')), &snapshot);
+    assert_eq!(shown(&app, &snapshot), ["a", "b", "c"]);
+    app.handle_key(key(KeyCode::Char('F')), &snapshot);
+    assert_eq!(app.view.state, StateView::Error);
+    app.handle_key(key(KeyCode::Char('0')), &snapshot);
+    assert_eq!(app.view, View::default());
+}
+
+#[test]
+fn g_cycles_the_tags_in_use() {
+    let snapshot = tagged_snapshot();
+    let mut app = App::new(Theme::default());
+    app.ensure_selection(&snapshot);
+    app.handle_key(key(KeyCode::Char('g')), &snapshot);
+    assert_eq!(app.view.tag.as_deref(), Some("iso"));
+    assert_eq!(shown(&app, &snapshot), ["a"]);
+    app.handle_key(key(KeyCode::Char('g')), &snapshot);
+    assert_eq!(app.view.tag.as_deref(), Some("linux"));
+    assert_eq!(shown(&app, &snapshot), ["a", "b"]);
+    app.handle_key(key(KeyCode::Char('g')), &snapshot);
+    assert_eq!(app.view.tag, None);
+    app.handle_key(key(KeyCode::Char('G')), &snapshot);
+    assert_eq!(app.view.tag.as_deref(), Some("linux"));
+    app.handle_key(key(KeyCode::Char('0')), &snapshot);
+    assert_eq!(app.view.tag, None);
+}
+
+#[test]
+fn views_combine_with_each_other_and_the_name_filter() {
+    let snapshot = tagged_snapshot();
+    let mut app = App::new(Theme::default());
+    app.ensure_selection(&snapshot);
+    app.view = View {
+        state: StateView::Seeding,
+        tag: Some("linux".into()),
+    };
+    assert_eq!(shown(&app, &snapshot), ["b"]);
+    app.view.state = StateView::Downloading;
+    app.filter = "b".into();
+    assert!(shown(&app, &snapshot).is_empty());
+    app.view.state = StateView::All;
+    assert_eq!(shown(&app, &snapshot), ["b"]);
+    // Esc clears the name filter and leaves the view.
+    app.handle_key(key(KeyCode::Esc), &snapshot);
+    assert_eq!(shown(&app, &snapshot), ["a", "b"]);
+}
+
+#[test]
+fn e_sets_the_selected_torrents_tags() {
+    let snapshot = tagged_snapshot();
+    let mut app = App::new(Theme::default());
+    app.ensure_selection(&snapshot);
+    app.handle_key(key(KeyCode::Char('e')), &snapshot);
+    let input = app.input.as_ref().unwrap();
+    assert_eq!(
+        (input.kind, input.text.as_str()),
+        (InputKind::Tags, "linux, iso")
+    );
+    for _ in 0..4 {
+        app.handle_key(key(KeyCode::Backspace), &snapshot);
+    }
+    type_text(&mut app, &snapshot, ", Tv ,tv");
+    assert_eq!(
+        app.handle_key(key(KeyCode::Enter), &snapshot),
+        Action::Command(Command::SetTags {
+            info_hash: [0; 20],
+            tags: vec!["linux".into(), "tv".into()],
+        })
+    );
+    assert!(app.input.is_none());
+
+    // Emptying the line takes the tags off, and Esc changes nothing.
+    app.handle_key(key(KeyCode::Char('e')), &snapshot);
+    for _ in 0..10 {
+        app.handle_key(key(KeyCode::Backspace), &snapshot);
+    }
+    assert_eq!(
+        app.handle_key(key(KeyCode::Enter), &snapshot),
+        Action::Command(Command::SetTags {
+            info_hash: [0; 20],
+            tags: Vec::new(),
+        })
+    );
+    app.handle_key(key(KeyCode::Char('e')), &snapshot);
+    assert_eq!(app.handle_key(key(KeyCode::Esc), &snapshot), Action::None);
+
+    // With nothing selected, or a torrent being removed, there is no prompt.
+    let mut removing = tagged_snapshot();
+    removing.torrents[0].state = TorrentState::Removing;
+    app.handle_key(key(KeyCode::Char('e')), &removing);
+    assert!(app.input.is_none());
+    let mut app = App::new(Theme::default());
+    app.handle_key(key(KeyCode::Char('e')), &Snapshot::default());
+    assert!(app.input.is_none());
 }

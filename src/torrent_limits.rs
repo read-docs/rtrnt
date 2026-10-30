@@ -7,6 +7,11 @@
 //! them as it runs, so a change applies without restarting it. They belong
 //! to the torrent, not to a run of it: they outlast a pause, and are saved
 //! in the session file.
+//!
+//! A torrent's tags can give it settings too (`[tags.<name>]` in the config
+//! file, see `tags`). They rank between the torrent's own and the session's:
+//! the torrent's own setting wins over its tag's, which wins over the
+//! session's.
 
 use crate::download::SeedLimits;
 use crate::rate_limit::RateLimits;
@@ -60,6 +65,18 @@ impl TorrentSettings {
         )
     }
 
+    /// These settings, with each one that is not set taken from `base`: the
+    /// torrent's own over its tags' (see `tags::tag_settings`).
+    pub fn over(self, base: Self) -> Self {
+        let rate = |own: u64, base: u64| if own != 0 { own } else { base };
+        Self {
+            download: rate(self.download, base.download),
+            upload: rate(self.upload, base.upload),
+            seed_ratio_milli: self.seed_ratio_milli.or(base.seed_ratio_milli),
+            seed_time: self.seed_time.or(base.seed_time),
+        }
+    }
+
     /// `global` with this torrent's seed ratio and seed time put in place
     /// of the session's, where they are set.
     pub fn resolve_seed(&self, global: SeedLimits) -> SeedLimits {
@@ -84,42 +101,82 @@ pub fn format_ratio(milli: u32) -> String {
     text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
+/// The two layers of a torrent's settings.
+#[derive(Debug, Default, Clone, Copy)]
+struct Layers {
+    /// Set on the torrent itself.
+    own: TorrentSettings,
+    /// What its tags give it.
+    tags: TorrentSettings,
+}
+
+impl Layers {
+    /// What applies: the torrent's own, then its tags'.
+    fn effective(&self) -> TorrentSettings {
+        self.own.over(self.tags)
+    }
+}
+
 /// A torrent's settings, live: the rate limits its peers hold allowances in,
 /// and the seed settings its download checks.
 #[derive(Debug, Default)]
 pub struct TorrentLimits {
     rates: RateLimits,
-    settings: Mutex<TorrentSettings>,
-    /// Notified whenever the seed ratio or time changes.
+    layers: Mutex<Layers>,
+    /// Notified whenever the seed ratio or time that applies changes.
     seed_changed: Notify,
 }
 
 impl TorrentLimits {
-    /// Limits with `settings`.
+    /// Limits with `settings` of the torrent's own.
     pub fn new(settings: TorrentSettings) -> Self {
         let limits = Self::default();
         limits.set(settings);
         limits
     }
 
-    /// Changes the settings, at once for the torrent's peers.
+    /// Changes the torrent's own settings, at once for its peers.
     pub fn set(&self, settings: TorrentSettings) {
-        let old = std::mem::replace(
-            &mut *self.settings.lock().unwrap_or_else(PoisonError::into_inner),
-            settings,
-        );
-        if old.download != settings.download || old.upload != settings.upload {
-            self.rates.set(settings.download, settings.upload);
+        self.change(|layers| layers.own = settings);
+    }
+
+    /// Changes what the torrent's tags give it, at once for its peers.
+    pub fn set_tag_settings(&self, settings: TorrentSettings) {
+        self.change(|layers| layers.tags = settings);
+    }
+
+    /// Applies `change` to the layers, and tells whoever depends on what
+    /// applies if that changed.
+    fn change(&self, change: impl FnOnce(&mut Layers)) {
+        let (old, new) = {
+            let mut layers = self.layers.lock().unwrap_or_else(PoisonError::into_inner);
+            let old = layers.effective();
+            change(&mut layers);
+            (old, layers.effective())
+        };
+        if old.download != new.download || old.upload != new.upload {
+            self.rates.set(new.download, new.upload);
         }
-        if old.seed_ratio_milli != settings.seed_ratio_milli || old.seed_time != settings.seed_time
-        {
+        if old.seed_ratio_milli != new.seed_ratio_milli || old.seed_time != new.seed_time {
             self.seed_changed.notify_waiters();
         }
     }
 
-    /// The settings as they are now.
+    /// The torrent's own settings as they are now, which is what the
+    /// session file keeps.
     pub fn settings(&self) -> TorrentSettings {
-        *self.settings.lock().unwrap_or_else(PoisonError::into_inner)
+        self.layers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .own
+    }
+
+    /// The settings that apply: the torrent's own over its tags'.
+    pub fn effective(&self) -> TorrentSettings {
+        self.layers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .effective()
     }
 
     /// The torrent's own rate limits, to nest inside the session's.
@@ -129,7 +186,7 @@ impl TorrentLimits {
 
     /// The seed limits that apply, given the session's.
     pub fn seed(&self, global: SeedLimits) -> SeedLimits {
-        self.settings().resolve_seed(global)
+        self.effective().resolve_seed(global)
     }
 
     /// Resolves once the seed ratio or time changes after this call.

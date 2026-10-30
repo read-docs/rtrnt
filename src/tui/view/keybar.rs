@@ -28,6 +28,8 @@ const FILE_KEYS: &[(&str, &str)] = &[("space", "skip"), ("+ -", "priority")];
 
 const MORE_KEYS: &[(&str, &str)] = &[
     ("a", "add"),
+    ("e", "tags"),
+    ("f g", "views"),
     ("d u", "limits"),
     ("K J", "queue"),
     ("t", "alt speed"),

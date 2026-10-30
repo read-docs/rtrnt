@@ -15,6 +15,9 @@ const KEYS: &[(&str, &str)] = &[
     ("l", "show or hide the log"),
     ("s  S", "sort by the next column, reverse the order"),
     ("/", "filter torrents by name; esc clears it"),
+    ("f  g", "show one state, or one tag, only; F G go back"),
+    ("0", "show every torrent again"),
+    ("e", "set the selected torrent's tags, comma separated"),
     ("p  x", "pause or resume the selected torrent; remove it"),
     (
         "K  J",
@@ -31,11 +34,12 @@ const KEYS: &[(&str, &str)] = &[
     ),
     ("a", "add a .torrent file or a magnet link"),
     ("d  u", "set the download or upload limit, in KiB/s"),
-    ("D  U", "the same for the selected torrent alone"),
-    ("R  T", "set its seed ratio or seed time, in minutes"),
+    (
+        "D U R T",
+        "the selected torrent's own limits, seed ratio, time",
+    ),
     ("t", "alt speed on or off; d u edit the active limits"),
-    ("m", "turn the mouse off to select text, and on again"),
-    ("?", "this help"),
+    ("m  ?", "turn the mouse off to select text, and on; help"),
     ("q  Ctrl-C", "stop the torrents; again to quit at once"),
 ];
 

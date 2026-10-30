@@ -2,6 +2,7 @@
 
 use super::{human_bytes, long_duration, torrents};
 use crate::stats::TorrentState;
+use crate::tags::join_tags;
 use crate::torrent_limits::format_ratio;
 use crate::tui::app::App;
 use crate::tui::snapshot::{Detail, TorrentSnapshot};
@@ -128,36 +129,49 @@ pub fn draw(
         ],
     ));
     facts.push(("active", vec![value(long_duration(torrent.active))]));
-    let limits = torrent.limits;
+    let (limits, effective) = (torrent.limits, torrent.effective_limits);
     let dim = |text: &str| Span::styled(text.to_string(), theme.dim_style());
-    let rate = |kib: u64| match kib {
-        0 => dim("session's"),
-        kib => value(format!("{kib} KiB/s")),
+    // A value the torrent sets itself, or one its tags give it, or the
+    // session's.
+    let given = |own: bool, set: bool, text: String| match (own, set) {
+        (true, _) => vec![value(text)],
+        (false, true) => vec![value(text), dim(" (tag)")],
+        (false, false) => vec![dim("session's")],
     };
-    facts.push((
-        "limits",
-        vec![
-            dim("↓ "),
-            rate(limits.download),
-            dim("  ↑ "),
-            rate(limits.upload),
-        ],
+    let rate =
+        |own: u64, effective: u64| given(own != 0, effective != 0, format!("{effective} KiB/s"));
+    let minutes = |minutes: u64| match minutes {
+        0 => "none".to_string(),
+        minutes => format!("{minutes} min"),
+    };
+    let mut limit_spans = vec![dim("↓ ")];
+    limit_spans.extend(rate(limits.download, effective.download));
+    limit_spans.push(dim("  ↑ "));
+    limit_spans.extend(rate(limits.upload, effective.upload));
+    facts.push(("limits", limit_spans));
+    let mut seed_spans = vec![dim("ratio ")];
+    seed_spans.extend(given(
+        limits.seed_ratio_milli.is_some(),
+        effective.seed_ratio_milli.is_some(),
+        effective
+            .seed_ratio_milli
+            .map(format_ratio)
+            .unwrap_or_default(),
     ));
+    seed_spans.push(dim("  time "));
+    seed_spans.extend(given(
+        limits.seed_time.is_some(),
+        effective.seed_time.is_some(),
+        effective.seed_time.map(minutes).unwrap_or_default(),
+    ));
+    facts.push(("seed", seed_spans));
     facts.push((
-        "seed",
-        vec![
-            dim("ratio "),
-            match limits.seed_ratio_milli {
-                None => dim("session's"),
-                Some(milli) => value(format_ratio(milli)),
-            },
-            dim("  time "),
-            match limits.seed_time {
-                None => dim("session's"),
-                Some(0) => value("none".to_string()),
-                Some(minutes) => value(format!("{minutes} min")),
-            },
-        ],
+        "tags",
+        vec![if torrent.tags.is_empty() {
+            dim("none (e sets them)")
+        } else {
+            value(join_tags(&torrent.tags))
+        }],
     ));
 
     let lines: Vec<Line> = facts

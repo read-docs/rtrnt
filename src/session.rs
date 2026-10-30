@@ -14,6 +14,7 @@ use crate::altspeed::Override;
 use crate::magnet::MagnetLink;
 use crate::source::Source;
 use crate::state::write_atomically;
+use crate::tags::parse_tags;
 use crate::torrent;
 use crate::torrent_limits::TorrentSettings;
 use anyhow::{Context, Result, bail};
@@ -38,6 +39,8 @@ pub struct SavedTorrent {
     pub sequential: Option<bool>,
     /// What the torrent overrides of the session's limits and seed settings.
     pub limits: TorrentSettings,
+    /// The torrent's tags (see `tags`), in the order they were given.
+    pub tags: Vec<String>,
 }
 
 /// Download and upload limits in KiB/s, 0 for none.
@@ -142,6 +145,10 @@ struct StoredTorrent {
     /// they existed have none.
     #[serde(default, skip_serializing_if = "StoredLimits::is_default")]
     limits: StoredLimits,
+    /// The torrent's tags, left out while it has none; files from before
+    /// they existed have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<String>,
 }
 
 /// `TorrentSettings` as it is written: each setting left out unless set.
@@ -227,6 +234,7 @@ impl SavedSession {
                     paused: i64::from(torrent.paused),
                     sequential: torrent.sequential.map(i64::from),
                     limits: torrent.limits.into(),
+                    tags: torrent.tags.clone(),
                 })
             })
             .collect();
@@ -274,6 +282,7 @@ impl SavedSession {
                     paused: entry.paused != 0,
                     sequential: entry.sequential.map(|sequential| sequential != 0),
                     limits: entry.limits.into(),
+                    tags: parse_tags(&entry.tags.join(",")),
                 })
             })
             .collect();

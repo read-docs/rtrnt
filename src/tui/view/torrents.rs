@@ -2,7 +2,7 @@
 
 use super::{
     Rows, bar, bold, boxed, fit, human_bytes, human_rate, inner_of, scroll_to, selected_style,
-    short_duration, title,
+    short_duration, title, truncate,
 };
 use crate::stats::TorrentState;
 use crate::tui::app::{App, Focus, Sort};
@@ -13,6 +13,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use unicode_width::UnicodeWidthStr;
 
 /// Width of the progress bar, before its percentage.
 const BAR: usize = 10;
@@ -172,6 +173,22 @@ pub fn status(theme: Theme, torrent: &TorrentSnapshot) -> (String, Color) {
     }
 }
 
+/// The tags as the name column shows them after the name, `#linux #iso`,
+/// cut to a third of the column at most so the name keeps most of it; empty
+/// without tags or without the room.
+fn tags_text(tags: &[String], width: usize) -> String {
+    let all = tags
+        .iter()
+        .map(|tag| format!("#{tag}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let room = width / 3;
+    if all.is_empty() || room < 4 {
+        return String::new();
+    }
+    truncate(&all, room)
+}
+
 /// Whether the torrent moves data, so its rates mean something.
 fn active(torrent: &TorrentSnapshot) -> bool {
     matches!(
@@ -189,6 +206,9 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
     );
     if !app.filter.is_empty() {
         hint = format!("/{}  {hint}", app.filter);
+    }
+    if !app.view.is_all() {
+        hint = format!("{}  {hint}", app.view.label());
     }
     let block = boxed(
         theme,
@@ -237,7 +257,7 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot, app: &App, area: Rect) {
         let note = if snapshot.torrents.is_empty() {
             " no torrents yet: press a to add a torrent"
         } else {
-            " no torrent matches the filter"
+            " no torrent matches the filter or the view (0 shows every torrent)"
         };
         lines.push(Line::from(Span::styled(note, theme.dim_style())));
     }
@@ -260,7 +280,16 @@ fn cell(
             } else {
                 Style::new()
             };
-            vec![Span::styled(fit(&torrent.name, width, false), style)]
+            let tags = tags_text(&torrent.tags, width);
+            if tags.is_empty() {
+                return vec![Span::styled(fit(&torrent.name, width, false), style)];
+            }
+            let tags_width = tags.width();
+            vec![
+                Span::styled(fit(&torrent.name, width - tags_width - 1, false), style),
+                Span::raw(" "),
+                Span::styled(tags, theme.dim_style()),
+            ]
         }
         Column::Size => match torrent.size() {
             Some(size) => vec![Span::raw(fit(&human_bytes(size), width, true))],

@@ -9,6 +9,7 @@ use super::snapshot::{
 use super::{Command, Feed};
 use crate::portmap::Status as PortmapStatus;
 use crate::stats::{Layout, PeerFlags, PieceSnapshot, TorrentState, TrackerResult, TrackerStatus};
+use crate::tags;
 use crate::torrent_limits::TorrentSettings;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -370,6 +371,10 @@ impl Live {
     }
 }
 
+/// The tags the demo's first torrents start with, by place in the list.
+const DEMO_TAGS: &[(usize, &[&str])] =
+    &[(0, &["linux", "iso"]), (1, &["linux"]), (2, &["archive"])];
+
 /// The made-up session, moving on each time it is asked for a snapshot.
 pub struct DemoFeed {
     torrents: Vec<Live>,
@@ -381,6 +386,8 @@ pub struct DemoFeed {
     alt_speed: bool,
     /// What each torrent overrides, by info hash.
     limits: std::collections::HashMap<[u8; 20], TorrentSettings>,
+    /// The tags of each torrent, by info hash.
+    tags: std::collections::HashMap<[u8; 20], Vec<String>>,
     /// The latest notice, and when it came.
     notice: Option<(Instant, String)>,
 }
@@ -406,8 +413,23 @@ impl DemoFeed {
             rate_limits: (0, 2048),
             alt_speed: false,
             limits: std::collections::HashMap::new(),
+            tags: std::collections::HashMap::new(),
             notice: None,
         }
+    }
+
+    /// The session with the first torrents tagged, as in a used one.
+    pub fn tagged(mut self) -> Self {
+        self.tags = DEMO_TAGS
+            .iter()
+            .map(|&(i, tags)| {
+                (
+                    info_hash(i),
+                    tags.iter().map(|tag| tag.to_string()).collect(),
+                )
+            })
+            .collect();
+        self
     }
 
     /// The torrent with info hash `hash`.
@@ -448,6 +470,8 @@ impl DemoFeed {
                 rate_down: 0.0,
                 rate_up: 0.0,
                 eta: None,
+                effective_limits: self.limits.get(&info_hash(i)).copied().unwrap_or_default(),
+                tags: self.tags.get(&info_hash(i)).cloned().unwrap_or_default(),
                 limits: self.limits.get(&info_hash(i)).copied().unwrap_or_default(),
             })
             .collect();
@@ -634,6 +658,10 @@ impl Feed for DemoFeed {
             } => {
                 self.limits.insert(info_hash, settings);
                 self.notice = Some((Instant::now(), settings.describe()));
+            }
+            Command::SetTags { info_hash, tags } => {
+                self.notice = Some((Instant::now(), tags::join_tags(&tags)));
+                self.tags.insert(info_hash, tags);
             }
             Command::Recheck(_) => {
                 self.notice = Some((Instant::now(), "the demo checks nothing".into()));
