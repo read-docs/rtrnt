@@ -157,3 +157,61 @@ fn public_addresses() {
         assert!(!is_public(Ipv4Addr::from(ip)), "{ip:?}");
     }
 }
+
+fn v6(text: &str) -> IpAddr {
+    text.parse().unwrap()
+}
+
+/// BEP 42 gives no IPv6 vectors, so this follows its formula: the first 64
+/// bits masked with 0x0103070f1f3f7fff, `r` in the top 3 bits, CRC-32C of
+/// those 8 bytes.
+#[test]
+fn ipv6_ids_follow_the_formula() {
+    let ip = v6("2a01:4f8:1c1e:9a42::1");
+    let r = 5u8;
+    let high: u64 = 0x2a01_04f8_1c1e_9a42;
+    let masked = (high & 0x0103_070f_1f3f_7fff) | (u64::from(r) << 61);
+    let hash = crc32c(&masked.to_be_bytes());
+    let id = NodeId::secure_with(ip, 0xd0 | r, [0x77; 20]);
+    assert_eq!(id.0[0], (hash >> 24) as u8);
+    assert_eq!(id.0[1], (hash >> 16) as u8);
+    assert_eq!(id.0[2] & 0xf8, (hash >> 8) as u8 & 0xf8);
+    assert_eq!(id.0[2] & 0x07, 0x77 & 0x07);
+    assert_eq!(id.0[19], 0xd5);
+    assert_eq!(&id.0[3..19], &[0x77; 16]);
+    assert!(id.is_secure(ip));
+}
+
+#[test]
+fn ipv6_ids_are_valid_for_their_network_only() {
+    let ip = v6("2a01:4f8:1c1e:9a42::1");
+    for _ in 0..100 {
+        let id = NodeId::secure(ip);
+        assert!(id.is_secure(ip));
+        // Only the first 64 bits count, and only some of them: the host
+        // part is free.
+        assert!(id.is_secure(v6("2a01:4f8:1c1e:9a42:dead:beef:1:2")));
+        assert!(!id.is_secure(v6("2606:4700::1")));
+        // An IPv4 address does not pass as an IPv6 one.
+        assert!(!id.is_secure(v6("8.8.8.8")));
+    }
+}
+
+#[test]
+fn ipv6_local_addresses_are_exempt_and_not_public() {
+    let id = NodeId([0xab; 20]);
+    for ip in ["::1", "fe80::1", "febf::1", "fc00::1", "fd12:3456::1"] {
+        assert!(id.is_secure(v6(ip)), "{ip}");
+        assert!(!is_public_ip(v6(ip)), "{ip}");
+    }
+    for ip in ["2001:db8::1", "2a01:4f8::1"] {
+        assert!(!id.is_secure(v6(ip)), "{ip}");
+        assert!(is_public_ip(v6(ip)), "{ip}");
+    }
+    for ip in ["::", "ff02::1"] {
+        assert!(!is_public_ip(v6(ip)), "{ip}");
+    }
+    // A mapped IPv4 address is judged as IPv4.
+    assert!(!is_public_ip(v6("::ffff:192.168.1.1")));
+    assert!(is_public_ip(v6("::ffff:8.8.8.8")));
+}

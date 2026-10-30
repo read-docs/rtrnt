@@ -5,7 +5,7 @@
 use super::bloom::Bloom;
 use rand::seq::IndexedRandom;
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -19,7 +19,7 @@ pub const MAX_VALUES: usize = 50;
 /// A peer that announced.
 #[derive(Clone, Copy)]
 struct Entry {
-    addr: SocketAddrV4,
+    addr: SocketAddr,
     /// When it last announced.
     at: Instant,
     /// Whether it said it has the whole torrent.
@@ -37,7 +37,7 @@ impl PeerStore {
     /// replaces its old one. When full, the peer that
     /// announced longest ago gives way; when tracking too many torrents, a
     /// new one is ignored.
-    pub fn announce(&mut self, info_hash: [u8; 20], peer: SocketAddrV4, seed: bool, now: Instant) {
+    pub fn announce(&mut self, info_hash: [u8; 20], peer: SocketAddr, seed: bool, now: Instant) {
         if !self.torrents.contains_key(&info_hash) && self.torrents.len() >= MAX_TORRENTS {
             self.expire(now);
             if self.torrents.len() >= MAX_TORRENTS {
@@ -76,7 +76,7 @@ impl PeerStore {
 
     /// Up to `MAX_VALUES` peers of the torrent, picked at random. With
     /// `noseed`, only those that are not seeds.
-    pub fn get(&mut self, info_hash: &[u8; 20], noseed: bool, now: Instant) -> Vec<SocketAddrV4> {
+    pub fn get(&mut self, info_hash: &[u8; 20], noseed: bool, now: Instant) -> Vec<SocketAddr> {
         let Some(peers) = self.live(info_hash, now) else {
             return Vec::new();
         };
@@ -92,7 +92,7 @@ impl PeerStore {
         let (mut seeds, mut others) = (Bloom::default(), Bloom::default());
         for entry in peers {
             let filter = if entry.seed { &mut seeds } else { &mut others };
-            filter.insert(IpAddr::V4(*entry.addr.ip()));
+            filter.insert(entry.addr.ip());
         }
         Some((seeds, others))
     }
@@ -108,10 +108,16 @@ impl PeerStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
+
+    /// A socket address from anything that is an IP address.
+    fn sock(ip: impl Into<IpAddr>, port: u16) -> SocketAddr {
+        SocketAddr::new(ip.into(), port)
+    }
     use std::net::Ipv4Addr;
 
-    fn peer(n: u32) -> SocketAddrV4 {
-        SocketAddrV4::new(Ipv4Addr::from(n), 6881)
+    fn peer(n: u32) -> SocketAddr {
+        sock(Ipv4Addr::from(n), 6881)
     }
 
     #[test]
@@ -140,17 +146,14 @@ mod tests {
         let mut store = PeerStore::default();
         let ip = Ipv4Addr::new(10, 0, 0, 1);
         for port in 1..=MAX_PEERS_PER_TORRENT as u16 {
-            store.announce([1; 20], SocketAddrV4::new(ip, port), false, now);
+            store.announce([1; 20], sock(ip, port), false, now);
         }
         // Another host is unaffected.
         store.announce([1; 20], peer(7), false, now);
         let mut peers = store.get(&[1; 20], false, now);
         peers.sort();
         // The newest port stands.
-        assert_eq!(
-            peers,
-            [peer(7), SocketAddrV4::new(ip, MAX_PEERS_PER_TORRENT as u16)]
-        );
+        assert_eq!(peers, [peer(7), sock(ip, MAX_PEERS_PER_TORRENT as u16)]);
     }
 
     #[test]
@@ -200,8 +203,8 @@ mod tests {
 
         let (seeds, others) = store.scrape(&[1; 20], now).unwrap();
         assert_eq!((seeds.count(), others.count()), (1, 2));
-        assert!(seeds.contains(IpAddr::V4(*peer(1).ip())));
-        assert!(!others.contains(IpAddr::V4(*peer(1).ip())));
+        assert!(seeds.contains(peer(1).ip()));
+        assert!(!others.contains(peer(1).ip()));
         assert!(store.scrape(&[2; 20], now).is_none());
 
         // A peer that finishes announces again as a seed, and moves over.

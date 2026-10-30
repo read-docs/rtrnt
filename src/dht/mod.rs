@@ -7,7 +7,12 @@
 //! it announces us to the closest nodes. [`DhtSearch`] repeats the lookup
 //! for one torrent while it downloads.
 //!
-//! IPv4 only: IPv6 nodes and peers (`nodes6`, 18-byte values) are ignored.
+//! The node speaks over one IPv4 socket. The wire format and the routing
+//! table already handle IPv6 (BEP 32: `nodes6`, 18-byte `values`, `want`),
+//! so peers announced from IPv6 addresses are stored and handed out, and a
+//! lookup returns IPv6 peers, but IPv6 nodes are not queried until the node
+//! gets a socket for them.
+//!
 //! The node id starts out random. Once enough nodes agree on our external
 //! address (the `ip` field of their answers, BEP 42), it is replaced by an
 //! id derived from that address, and nodes with such ids are preferred in
@@ -26,13 +31,13 @@ pub use search::DhtSearch;
 
 use anyhow::{Context, Result, anyhow};
 use bloom::Bloom;
-use krpc::{Body, ERROR_METHOD_UNKNOWN, ERROR_PROTOCOL, Message, Query, Response};
+use krpc::{Body, ERROR_METHOD_UNKNOWN, ERROR_PROTOCOL, Message, Query, Response, Want};
 use lookup::Lookup;
 use routing::{Insert, K, NodeId, NodeInfo, RoutingTable};
 use secure::IpVotes;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use store::PeerStore;
@@ -205,12 +210,10 @@ impl Dht {
     }
 
     /// Pings `addr`, which a peer named in a `Port` message, and adds it to
-    /// the routing table if it answers. IPv6 addresses are ignored.
+    /// the routing table if it answers. IPv6 addresses are ignored, as the
+    /// node has no IPv6 socket yet.
     pub fn add_node(&self, addr: SocketAddr) {
-        if let SocketAddr::V4(addr) = addr
-            && addr.port() != 0
-            && self.0.node.verify.try_send(addr).is_err()
-        {
+        if addr.is_ipv4() && addr.port() != 0 && self.0.node.verify.try_send(addr).is_err() {
             debug!(%addr, "too many DHT nodes to verify; skipping");
         }
     }
@@ -240,7 +243,7 @@ struct Node {
     routers: Vec<String>,
     state: Mutex<State>,
     /// Unknown nodes to ping, and add to the table if they answer.
-    verify: mpsc::Sender<SocketAddrV4>,
+    verify: mpsc::Sender<SocketAddr>,
 }
 
 struct State {
@@ -251,7 +254,7 @@ struct State {
     pending: HashMap<u16, Pending>,
     /// Resolved bootstrap routers. They help lookups but stay out of the
     /// table: they hold no peers and do not want the traffic.
-    routers: HashSet<SocketAddrV4>,
+    routers: HashSet<SocketAddr>,
     /// What nodes say our external address is.
     votes: IpVotes,
     /// Our external address once nodes agree on it.
@@ -303,7 +306,7 @@ impl State {
 }
 
 struct Pending {
-    addr: SocketAddrV4,
+    addr: SocketAddr,
     reply: oneshot::Sender<Result<Response>>,
 }
 
@@ -346,7 +349,7 @@ enum Kind {
 
 /// What a lookup found.
 struct Found {
-    peers: HashSet<SocketAddrV4>,
+    peers: HashSet<SocketAddr>,
     /// The merged bloom filters of the nodes that sent them: seeds, and
     /// other peers.
     seeds: Option<Bloom>,
@@ -366,7 +369,7 @@ impl Found {
         let seeds = self.seeds.clone().unwrap_or_default();
         let mut others = self.others.clone().unwrap_or_default();
         for peer in &self.peers {
-            let ip = IpAddr::V4(*peer.ip());
+            let ip = peer.ip();
             if !seeds.contains(ip) {
                 others.insert(ip);
             }
@@ -422,9 +425,6 @@ impl Node {
                     continue;
                 }
             };
-            let SocketAddr::V4(from) = from else {
-                continue;
-            };
             match Message::decode(&buf[..len]) {
                 Ok(message) => self.handle(message, from).await,
                 Err(e) => debug!(%from, "dropping malformed DHT packet: {e:#}"),
@@ -432,7 +432,7 @@ impl Node {
         }
     }
 
-    async fn handle(self: &Arc<Self>, message: Message, from: SocketAddrV4) {
+    async fn handle(self: &Arc<Self>, message: Message, from: SocketAddr) {
         let now = Instant::now();
         match message.body {
             Body::Query { id, query } => {
@@ -447,7 +447,7 @@ impl Node {
                     debug!(%from, "too many DHT nodes to verify; skipping");
                 }
                 // Tells the node its address as we see it (BEP 42).
-                let ip = matches!(body, Body::Response(_)).then_some(SocketAddr::V4(from));
+                let ip = matches!(body, Body::Response(_)).then_some(from);
                 let reply = Message {
                     tid: message.tid,
                     ip,
@@ -459,8 +459,8 @@ impl Node {
             }
             Body::Response(response) => {
                 self.resolve(&message.tid, from, Ok(response), now);
-                if let Some(SocketAddr::V4(ip)) = message.ip {
-                    self.learn_external(*from.ip(), *ip.ip(), now);
+                if let (IpAddr::V4(reporter), Some(SocketAddr::V4(ip))) = (from.ip(), message.ip) {
+                    self.learn_external(reporter, *ip.ip(), now);
                 }
             }
             Body::Error {
@@ -479,7 +479,7 @@ impl Node {
     fn resolve(
         self: &Arc<Self>,
         tid: &[u8],
-        from: SocketAddrV4,
+        from: SocketAddr,
         reply: Result<Response>,
         now: Instant,
     ) {
@@ -517,7 +517,7 @@ impl Node {
 
     fn register(
         &self,
-        addr: SocketAddrV4,
+        addr: SocketAddr,
     ) -> Result<(u16, oneshot::Receiver<Result<Response>>), QueryError> {
         let mut state = self.lock();
         if state.pending.len() >= MAX_PENDING {
@@ -539,7 +539,7 @@ impl Node {
     /// routing table.
     async fn query(
         self: &Arc<Self>,
-        addr: SocketAddrV4,
+        addr: SocketAddr,
         query: Query,
     ) -> Result<Response, QueryError> {
         let (tid, mut reply) = self.register(addr)?;
@@ -570,14 +570,11 @@ impl Node {
     }
 
     /// Resolves the bootstrap routers to IPv4 addresses.
-    async fn resolve_routers(&self) -> Vec<SocketAddrV4> {
+    async fn resolve_routers(&self) -> Vec<SocketAddr> {
         let mut found = Vec::new();
         for router in &self.routers {
             match timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(router.as_str())).await {
-                Ok(Ok(addrs)) => found.extend(addrs.filter_map(|addr| match addr {
-                    SocketAddr::V4(addr) => Some(addr),
-                    SocketAddr::V6(_) => None,
-                })),
+                Ok(Ok(addrs)) => found.extend(addrs.filter(SocketAddr::is_ipv4)),
                 Ok(Err(e)) => warn!(router, "cannot resolve DHT router: {e}"),
                 Err(_) => warn!(router, "resolving DHT router timed out"),
             }
@@ -617,10 +614,14 @@ impl Node {
                 let query = match kind {
                     Kind::GetPeers { noseed } => Query::GetPeers {
                         info_hash: target.0,
+                        want: Want::default(),
                         noseed,
                         scrape: true,
                     },
-                    Kind::FindNode => Query::FindNode { target },
+                    Kind::FindNode => Query::FindNode {
+                        target,
+                        want: Want::default(),
+                    },
                 };
                 slow.push_back((Instant::now() + QUERY_TIMEOUT, addr));
                 queries.spawn(async move { (addr, node.query(addr, query).await) });
@@ -654,7 +655,7 @@ impl Node {
             match result {
                 Ok(response) => {
                     let reachable =
-                        |peer: &SocketAddrV4| peer.port() != 0 && !peer.ip().is_unspecified();
+                        |peer: &SocketAddr| peer.port() != 0 && !peer.ip().is_unspecified();
                     for (filter, sent) in [
                         (&mut seeds, &response.seed_filter),
                         (&mut others, &response.peer_filter),
@@ -669,7 +670,10 @@ impl Node {
                         }
                         peers.insert(peer);
                     }
-                    lookup.on_response(addr, response.id, response.nodes, response.token);
+                    // Only nodes of our socket's family can be asked.
+                    let mut nodes = response.nodes;
+                    nodes.retain(|node| node.addr.is_ipv4());
+                    lookup.on_response(addr, response.id, nodes, response.token);
                 }
                 Err(e) => {
                     debug!(%addr, "DHT query failed: {e:#}");
@@ -712,7 +716,7 @@ impl Node {
             self.announce(info_hash, port, seeding, found.closest).await;
         }
         DhtPeers {
-            peers: found.peers.into_iter().map(SocketAddr::V4).collect(),
+            peers: found.peers.into_iter().collect(),
             swarm,
         }
     }
@@ -782,7 +786,7 @@ impl Node {
     /// Pings nodes that queried us or were named in `Port` messages, so
     /// that they enter the table if they answer, and refreshes the table
     /// every `MAINTENANCE_INTERVAL`.
-    async fn maintain(self: Arc<Self>, mut verify: mpsc::Receiver<SocketAddrV4>) {
+    async fn maintain(self: Arc<Self>, mut verify: mpsc::Receiver<SocketAddr>) {
         let start = Instant::now() + MAINTENANCE_INTERVAL;
         let mut tick = tokio::time::interval_at(start, MAINTENANCE_INTERVAL);
         let mut pings = JoinSet::new();
@@ -849,6 +853,15 @@ async fn sleep_until_some(at: Option<Instant>) {
     }
 }
 
+/// The nodes closest to `target` of the families a query `want`s, which
+/// came from `ip`. We only keep nodes of the family of our socket, so a
+/// query that wants the other gets none.
+fn wanted(table: &RoutingTable, target: &NodeId, want: Want, ip: IpAddr) -> Vec<NodeInfo> {
+    let mut nodes = table.closest(target, K);
+    nodes.retain(|node| want.includes(node.addr.ip(), ip));
+    nodes
+}
+
 /// Answers a query from node `id` at `from`. Also says whether that node is
 /// new to us and would get a place in the table, so is worth pinging.
 fn answer(
@@ -856,12 +869,12 @@ fn answer(
     own: NodeId,
     id: NodeId,
     query: Query,
-    from: SocketAddrV4,
+    from: SocketAddr,
     now: Instant,
 ) -> (Body, bool) {
     let node = NodeInfo { id, addr: from };
     let verify = !state.table.heard_from(&id, from, now) && state.table.wants(&node);
-    let ip = *from.ip();
+    let ip = from.ip();
     let response = |response: Response| {
         Body::Response(Response {
             id: own,
@@ -874,14 +887,15 @@ fn answer(
     };
     let body = match query {
         Query::Ping => response(Response::default()),
-        Query::FindNode { target } => response(Response {
-            nodes: state.table.closest(&target, K),
+        Query::FindNode { target, want } => response(Response {
+            nodes: wanted(&state.table, &target, want, ip),
             ..Response::default()
         }),
         // Nodes come along even when there are peers, as most clients do:
         // they help the lookup go on.
         Query::GetPeers {
             info_hash,
+            want,
             noseed,
             scrape,
         } => {
@@ -893,7 +907,7 @@ fn answer(
                 None => (None, None),
             };
             response(Response {
-                nodes: state.table.closest(&NodeId(info_hash), K),
+                nodes: wanted(&state.table, &NodeId(info_hash), want, ip),
                 values: state.store.get(&info_hash, noseed, now),
                 token: Some(state.tokens.issue(ip, now)),
                 seed_filter,
@@ -912,7 +926,7 @@ fn answer(
                 let port = if implied_port { from.port() } else { port };
                 state
                     .store
-                    .announce(info_hash, SocketAddrV4::new(ip, port), seed, now);
+                    .announce(info_hash, SocketAddr::new(ip, port), seed, now);
                 response(Response::default())
             } else {
                 error(ERROR_PROTOCOL, "bad token")

@@ -14,7 +14,7 @@
 
 use rand::Rng;
 use std::fmt;
-use std::net::SocketAddrV4;
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -77,7 +77,7 @@ impl fmt::Debug for NodeId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeInfo {
     pub id: NodeId,
-    pub addr: SocketAddrV4,
+    pub addr: SocketAddr,
 }
 
 /// What `RoutingTable::insert` did with a node.
@@ -97,7 +97,7 @@ pub enum Insert {
 impl NodeInfo {
     /// Whether the node's id is valid for its address (BEP 42).
     pub fn is_secure(&self) -> bool {
-        self.id.is_secure_v4(*self.addr.ip())
+        self.id.is_secure(self.addr.ip())
     }
 }
 
@@ -351,7 +351,7 @@ impl RoutingTable {
 
     /// Records a query to `addr` that went unanswered. A node that goes bad
     /// this way is replaced at once if a replacement is waiting.
-    pub fn failed(&mut self, addr: SocketAddrV4, now: Instant) {
+    pub fn failed(&mut self, addr: SocketAddr, now: Instant) {
         for bucket in &mut self.buckets {
             let Some(entry) = bucket.entries.iter_mut().find(|e| e.node.addr == addr) else {
                 continue;
@@ -368,7 +368,7 @@ impl RoutingTable {
 
     /// Notes a query from a known node. Returns false if it is not in the
     /// table (at that address).
-    pub fn heard_from(&mut self, id: &NodeId, addr: SocketAddrV4, now: Instant) -> bool {
+    pub fn heard_from(&mut self, id: &NodeId, addr: SocketAddr, now: Instant) -> bool {
         let index = self.index(id);
         let entry = self.buckets[index]
             .entries

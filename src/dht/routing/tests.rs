@@ -1,4 +1,10 @@
 use super::*;
+use std::net::IpAddr;
+
+/// A socket address from anything that is an IP address.
+fn sock(ip: impl Into<IpAddr>, port: u16) -> SocketAddr {
+    SocketAddr::new(ip.into(), port)
+}
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use std::net::Ipv4Addr;
@@ -15,7 +21,7 @@ fn id_at(prefix: usize, n: u8) -> NodeId {
 fn node(id: NodeId, port: u16) -> NodeInfo {
     NodeInfo {
         id,
-        addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+        addr: sock(Ipv4Addr::LOCALHOST, port),
     }
 }
 
@@ -99,11 +105,7 @@ fn questionable_nodes_are_pinged_before_eviction() {
 
     let later = start + QUESTIONABLE_AFTER;
     // Node 3 was heard from since; node 0 is the least recently seen.
-    assert!(t.heard_from(
-        &id_at(0, 3),
-        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 3),
-        later
-    ));
+    assert!(t.heard_from(&id_at(0, 3), sock(Ipv4Addr::LOCALHOST, 3), later));
     let Insert::PingFirst(first) = t.insert(node(id_at(0, 51), 51), later) else {
         panic!("no ping asked for");
     };
@@ -159,7 +161,7 @@ fn bad_nodes_are_replaced() {
         t.insert(node(id_at(0, n), n.into()), now);
     }
     t.split(now);
-    let dead = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 2);
+    let dead = sock(Ipv4Addr::LOCALHOST, 2);
     t.failed(dead, now);
     assert!(
         t.closest(&id_at(0, 2), 1)[0].addr == dead,
@@ -178,7 +180,7 @@ fn bad_nodes_are_replaced() {
 
     // With a replacement waiting, a node going bad is swapped out at once.
     assert_eq!(t.insert(node(id_at(0, 61), 61), now), Insert::Full);
-    let flaky = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5);
+    let flaky = sock(Ipv4Addr::LOCALHOST, 5);
     t.failed(flaky, now);
     t.failed(flaky, now);
     assert!(
@@ -240,9 +242,9 @@ fn refresh_targets_fall_in_stale_buckets() {
 
 /// A node at a public address, with an id that is not valid for it.
 fn invalid(prefix: usize, n: u8) -> NodeInfo {
-    let addr = SocketAddrV4::new(Ipv4Addr::new(8, 8, prefix as u8, n), 6881);
+    let addr = sock(Ipv4Addr::new(8, 8, prefix as u8, n), 6881);
     let id = id_at(prefix, n);
-    assert!(!id.is_secure_v4(*addr.ip()));
+    assert!(!id.is_secure(addr.ip()));
     NodeInfo { id, addr }
 }
 
@@ -254,7 +256,7 @@ fn valid_in_bucket_0(n: u8) -> NodeInfo {
         .flat_map(|ip| (0..=255u8).map(move |r| (ip, r)))
         .map(|(ip, r)| NodeInfo {
             id: NodeId::secure_v4_with(ip, r, [0xff; 20]),
-            addr: SocketAddrV4::new(ip, 6881),
+            addr: sock(ip, 6881),
         })
         .find(|node| node.id.bit(0))
         .unwrap()
@@ -365,4 +367,77 @@ fn a_new_own_id_regroups_the_nodes() {
     let nearest = t.closest(&own, 1)[0];
     let best = nodes.iter().min_by_key(|n| n.id.distance(&own)).unwrap();
     assert_eq!(nearest.id, best.id);
+}
+
+/// An IPv6 node in bucket `prefix` (against our all-zero id), with an id
+/// that is valid for its address, or not. `n` tells nodes apart.
+fn node6(prefix: usize, n: u8, valid: bool) -> NodeInfo {
+    let ip = |host: u16| {
+        IpAddr::from(std::net::Ipv6Addr::new(
+            0x2a01,
+            0x4f8,
+            0,
+            u16::from(n) << 8 | host,
+            0,
+            0,
+            0,
+            1,
+        ))
+    };
+    if !valid {
+        let (ip, id) = (ip(0), id_at(prefix, n));
+        assert!(!id.is_secure(ip));
+        return NodeInfo {
+            id,
+            addr: sock(ip, 6881),
+        };
+    }
+    // Valid ids are hashes, so look for an address and a last byte that
+    // land in the bucket.
+    (0..=255u16)
+        .flat_map(|host| (0..8u8).map(move |r| (host, r)))
+        .map(|(host, r)| (ip(host), NodeId::secure_with(ip(host), r, [0x55; 20])))
+        .find(|(_, id)| NodeId([0; 20]).common_prefix(id) == prefix)
+        .map(|(ip, id)| NodeInfo {
+            id,
+            addr: sock(ip, 6881),
+        })
+        .unwrap()
+}
+
+#[test]
+fn the_table_holds_nodes_of_either_family() {
+    let now = Instant::now();
+    let mut t = table(now);
+    let six = node6(0, 1, true);
+    assert!(six.is_secure());
+    assert!(!node6(0, 2, false).is_secure());
+    assert_eq!(t.insert(six, now), Insert::Added);
+    assert_eq!(t.insert(node(id_at(0, 3), 3), now), Insert::Added);
+    assert_eq!(t.len(), 2);
+    let found = t.closest(&six.id, 2);
+    assert_eq!(found[0], six);
+    // The family is part of the address: the same id and port on the other
+    // family is another node, but a node moving address replaces itself.
+    let moved = NodeInfo {
+        addr: sock(Ipv4Addr::LOCALHOST, 6881),
+        ..six
+    };
+    assert_eq!(t.insert(moved, now), Insert::Updated);
+    assert_eq!(t.len(), 2);
+}
+
+#[test]
+fn a_valid_ipv6_node_displaces_an_invalid_one_in_a_full_bucket() {
+    let now = Instant::now();
+    let mut t = table(now);
+    for n in 0..K as u8 {
+        assert_eq!(t.insert(node6(0, 10 + n, false), now), Insert::Added);
+    }
+    assert_eq!(t.insert(node(id_at(3, 0), 100), now), Insert::Added);
+    let valid = node6(0, 50, true);
+    assert!(t.wants(&valid));
+    assert_eq!(t.insert(valid, now + Duration::from_secs(1)), Insert::Added);
+    assert!(t.buckets[0].entries.iter().any(|e| e.node == valid));
+    assert_eq!(t.buckets[0].entries.len(), K);
 }

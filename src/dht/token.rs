@@ -7,7 +7,7 @@
 //! token stays valid for 5 to 10 minutes.
 
 use sha1::Digest;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -46,23 +46,27 @@ impl Tokens {
     }
 
     /// The token for a node at `ip`.
-    pub fn issue(&mut self, ip: Ipv4Addr, now: Instant) -> Vec<u8> {
+    pub fn issue(&mut self, ip: impl Into<IpAddr>, now: Instant) -> Vec<u8> {
         self.rotate(now);
-        token(&self.current, ip).to_vec()
+        token(&self.current, ip.into()).to_vec()
     }
 
     /// Whether the `presented` token was issued to `ip` with the current or
     /// the previous secret.
-    pub fn check(&mut self, presented: &[u8], ip: Ipv4Addr, now: Instant) -> bool {
+    pub fn check(&mut self, presented: &[u8], ip: impl Into<IpAddr>, now: Instant) -> bool {
         self.rotate(now);
+        let ip = ip.into();
         presented == token(&self.current, ip) || presented == token(&self.previous, ip)
     }
 }
 
-fn token(secret: &[u8; 16], ip: Ipv4Addr) -> [u8; TOKEN_LEN] {
+fn token(secret: &[u8; 16], ip: IpAddr) -> [u8; TOKEN_LEN] {
     let mut hasher = sha1::Sha1::new();
     hasher.update(secret);
-    hasher.update(ip.octets());
+    match ip {
+        IpAddr::V4(ip) => hasher.update(ip.octets()),
+        IpAddr::V6(ip) => hasher.update(ip.octets()),
+    }
     let hash: [u8; 20] = hasher.finalize().into();
     let mut token = [0u8; TOKEN_LEN];
     token.copy_from_slice(&hash[..TOKEN_LEN]);
@@ -72,6 +76,7 @@ fn token(secret: &[u8; 16], ip: Ipv4Addr) -> [u8; TOKEN_LEN] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     const IP: Ipv4Addr = Ipv4Addr::new(1, 2, 3, 4);
 

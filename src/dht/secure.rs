@@ -7,14 +7,16 @@
 //! only believe it once several nodes agree: see [`IpVotes`].
 
 use super::routing::NodeId;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Distinct nodes that must report the same address before we trust it.
 const MIN_VOTES: usize = 4;
 /// Reports remembered; the oldest gives way to a new reporter.
 const MAX_VOTES: usize = 32;
-/// Bits of `ip` that go into the hash, for IPv4.
+/// Bits of `ip` that go into the hash, for IPv4, and for the first 64 bits
+/// of an IPv6 address.
 const V4_MASK: u32 = 0x030f_3fff;
+const V6_MASK: u64 = 0x0103_070f_1f3f_7fff;
 
 /// CRC-32C (Castagnoli), reflected, as BEP 42 uses.
 fn crc32c(data: &[u8]) -> u32 {
@@ -48,11 +50,44 @@ fn is_local(ip: Ipv4Addr) -> bool {
     ip.is_private() || ip.is_loopback() || ip.is_link_local()
 }
 
+/// The same for IPv6: loopback, link-local (fe80::/10) and unique local
+/// (fc00::/7) addresses.
+fn is_local_v6(ip: Ipv6Addr) -> bool {
+    let first = ip.segments()[0];
+    ip.is_loopback() || first & 0xffc0 == 0xfe80 || first & 0xfe00 == 0xfc00
+}
+
 /// Whether `ip` can be a public address of ours: not local, shared (carrier
 /// grade NAT, 100.64.0.0/10), unspecified, broadcast or multicast.
 pub fn is_public(ip: Ipv4Addr) -> bool {
     let shared = ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64;
     !(is_local(ip) || shared || ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast())
+}
+
+/// `is_public` for either family. Only tests use it until the node learns
+/// an IPv6 address of its own.
+#[cfg(test)]
+pub fn is_public_ip(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(ip) => is_public(ip),
+        IpAddr::V6(ip) => !(is_local_v6(ip) || ip.is_unspecified() || ip.is_multicast()),
+    }
+}
+
+/// The hash for the first 64 bits of an IPv6 address, which BEP 42 gives as
+/// `crc32c((ip & 0x0103070f1f3f7fff) | (r << 61))`.
+fn hash_v6(ip: Ipv6Addr, r: u8) -> u32 {
+    let high = u64::from_be_bytes(std::array::from_fn(|i| ip.octets()[i]));
+    let masked = (high & V6_MASK) | (u64::from(r & 7) << 61);
+    crc32c(&masked.to_be_bytes())
+}
+
+/// The hash for either family.
+fn hash(ip: IpAddr, r: u8) -> u32 {
+    match ip.to_canonical() {
+        IpAddr::V4(ip) => hash_v4(ip, r),
+        IpAddr::V6(ip) => hash_v6(ip, r),
+    }
 }
 
 /// The hash that fixes the first 21 bits of an id for `ip` and `r` (0..8).
@@ -65,8 +100,25 @@ impl NodeId {
     /// An id for a node at `ip`: the 21 bits and last byte that BEP 42
     /// fixes (`rand` is the last byte, of which the low 3 bits go into the
     /// hash), and the rest from `filler`, which should be random.
+    #[cfg(test)]
     pub fn secure_v4_with(ip: Ipv4Addr, rand: u8, filler: [u8; 20]) -> NodeId {
-        let hash = hash_v4(ip, rand);
+        Self::secure_with(ip.into(), rand, filler)
+    }
+
+    /// A random id that is valid for a node at `ip`.
+    pub fn secure_v4(ip: Ipv4Addr) -> NodeId {
+        Self::secure(ip.into())
+    }
+
+    /// Whether the id is valid for a node at `ip`. Nodes on the local
+    /// network always are.
+    pub fn is_secure_v4(&self, ip: Ipv4Addr) -> bool {
+        self.is_secure(ip.into())
+    }
+
+    /// Like `secure_v4_with`, for an address of either family.
+    pub fn secure_with(ip: IpAddr, rand: u8, filler: [u8; 20]) -> NodeId {
+        let hash = hash(ip, rand);
         let mut id = filler;
         id[0] = (hash >> 24) as u8;
         id[1] = (hash >> 16) as u8;
@@ -76,17 +128,21 @@ impl NodeId {
     }
 
     /// A random id that is valid for a node at `ip`.
-    pub fn secure_v4(ip: Ipv4Addr) -> NodeId {
-        Self::secure_v4_with(ip, rand::random(), rand::random())
+    pub fn secure(ip: IpAddr) -> NodeId {
+        Self::secure_with(ip, rand::random(), rand::random())
     }
 
-    /// Whether the id is valid for a node at `ip`. Nodes on the local
-    /// network always are.
-    pub fn is_secure_v4(&self, ip: Ipv4Addr) -> bool {
-        if is_local(ip) {
+    /// Whether the id is valid for a node at `ip`, of either family. Nodes
+    /// on the local network always are.
+    pub fn is_secure(&self, ip: IpAddr) -> bool {
+        let local = match ip.to_canonical() {
+            IpAddr::V4(ip) => is_local(ip),
+            IpAddr::V6(ip) => is_local_v6(ip),
+        };
+        if local {
             return true;
         }
-        let hash = hash_v4(ip, self.0[19]);
+        let hash = hash(ip, self.0[19]);
         self.0[0] == (hash >> 24) as u8
             && self.0[1] == (hash >> 16) as u8
             && self.0[2] & 0xf8 == (hash >> 8) as u8 & 0xf8

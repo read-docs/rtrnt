@@ -9,7 +9,7 @@ use super::bloom::Bloom;
 use super::routing::{NodeId, NodeInfo};
 use anyhow::{Result, anyhow, bail};
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 
 /// KRPC messages are three levels deep; anything much deeper is garbage.
 const MAX_DEPTH: usize = 8;
@@ -25,6 +25,8 @@ const MAX_VALUES: usize = 200;
 const MAX_TEXT: usize = 128;
 /// Compact node info: 20-byte id, IPv4 address and port.
 const COMPACT_NODE: usize = 26;
+/// The same for IPv6 (BEP 32), in `nodes6`.
+const COMPACT_NODE6: usize = 38;
 /// Compact peer info: IPv4 address and port.
 const COMPACT_PEER: usize = 6;
 /// Our client version, sent as `v`: "RT" and a version number.
@@ -186,9 +188,11 @@ pub enum Query {
     Ping,
     FindNode {
         target: NodeId,
+        want: Want,
     },
     GetPeers {
         info_hash: [u8; 20],
+        want: Want,
         /// We are a seed and want no seeds in the answer (BEP 33).
         noseed: bool,
         /// We want the bloom filters of seeds and peers (BEP 33).
@@ -206,6 +210,29 @@ pub enum Query {
     },
     /// A method we do not know, answered with error 204.
     Unknown(Vec<u8>),
+}
+
+/// Which families of nodes a query asks for, `want` of BEP 32. When it is
+/// not given (both false) the answer has nodes of the family it is sent over.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Want {
+    pub v4: bool,
+    pub v6: bool,
+}
+
+impl Want {
+    /// Both families.
+    #[cfg(test)]
+    pub const BOTH: Want = Want { v4: true, v6: true };
+
+    /// Whether nodes with address `ip` are wanted by a query that came over
+    /// `ip`'s own family.
+    pub fn includes(self, ip: IpAddr, came_over: IpAddr) -> bool {
+        match (self.v4, self.v6) {
+            (false, false) => ip.is_ipv4() == came_over.is_ipv4(),
+            (v4, v6) => (ip.is_ipv4() && v4) || (ip.is_ipv6() && v6),
+        }
+    }
 }
 
 impl Query {
@@ -226,7 +253,7 @@ pub struct Response {
     pub id: NodeId,
     pub nodes: Vec<NodeInfo>,
     /// Peers for the info hash of a `get_peers` query.
-    pub values: Vec<SocketAddrV4>,
+    pub values: Vec<SocketAddr>,
     /// Lets us `announce_peer` to the node that sent it.
     pub token: Option<Vec<u8>>,
     /// The IP addresses of the seeds the node stores for the torrent, and
@@ -297,14 +324,17 @@ fn query_args(id: &NodeId, query: &Query) -> Dict {
     args.insert(b"id".to_vec(), Value::Bytes(id.0.to_vec()));
     match query {
         Query::Ping | Query::Unknown(_) => {}
-        Query::FindNode { target } => {
+        Query::FindNode { target, want } => {
             args.insert(b"target".to_vec(), Value::Bytes(target.0.to_vec()));
+            insert_want(&mut args, *want);
         }
         Query::GetPeers {
             info_hash,
+            want,
             noseed,
             scrape,
         } => {
+            insert_want(&mut args, *want);
             args.insert(b"info_hash".to_vec(), Value::Bytes(info_hash.to_vec()));
             if *noseed {
                 args.insert(b"noseed".to_vec(), Value::Int(1));
@@ -337,15 +367,17 @@ fn query_args(id: &NodeId, query: &Query) -> Dict {
 fn response_fields(response: &Response) -> Dict {
     let mut fields = Dict::new();
     fields.insert(b"id".to_vec(), Value::Bytes(response.id.0.to_vec()));
-    if !response.nodes.is_empty() {
-        fields.insert(
-            b"nodes".to_vec(),
-            Value::Bytes(encode_nodes(&response.nodes)),
-        );
+    let (v4, v6): (Vec<NodeInfo>, Vec<NodeInfo>) =
+        response.nodes.iter().partition(|node| node.addr.is_ipv4());
+    if !v4.is_empty() {
+        fields.insert(b"nodes".to_vec(), Value::Bytes(encode_nodes(&v4)));
+    }
+    if !v6.is_empty() {
+        fields.insert(b"nodes6".to_vec(), Value::Bytes(encode_nodes(&v6)));
     }
     if !response.values.is_empty() {
         let values = response.values.iter();
-        let values = values.map(|&peer| Value::Bytes(encode_peer(peer).to_vec()));
+        let values = values.map(|&peer| Value::Bytes(encode_addr(peer)));
         fields.insert(b"values".to_vec(), Value::List(values.collect()));
     }
     if let Some(token) = &response.token {
@@ -370,9 +402,11 @@ fn decode_query(dict: &Dict) -> Result<Body> {
         b"ping" => Query::Ping,
         b"find_node" => Query::FindNode {
             target: NodeId(id20(args, b"target")?),
+            want: decode_want(args),
         },
         b"get_peers" => Query::GetPeers {
             info_hash: id20(args, b"info_hash")?,
+            want: decode_want(args),
             noseed: flag(args, b"noseed"),
             scrape: flag(args, b"scrape"),
         },
@@ -407,18 +441,28 @@ fn decode_query(dict: &Dict) -> Result<Body> {
 
 fn decode_response(fields: &Dict) -> Result<Response> {
     let id = NodeId(id20(fields, b"id")?);
-    let mut nodes = match fields.get(b"nodes".as_slice()) {
-        Some(Value::Bytes(bytes)) => decode_nodes(bytes)?,
-        Some(_) => bail!("`nodes` is not a string"),
-        None => Vec::new(),
-    };
-    nodes.truncate(MAX_NODES);
+    let mut nodes = Vec::new();
+    for (key, decode) in [
+        (
+            &b"nodes"[..],
+            decode_nodes as fn(&[u8]) -> Result<Vec<NodeInfo>>,
+        ),
+        (b"nodes6", decode_nodes6),
+    ] {
+        let mut found = match fields.get(key) {
+            Some(Value::Bytes(bytes)) => decode(bytes)?,
+            Some(_) => bail!("`{}` is not a string", String::from_utf8_lossy(key)),
+            None => Vec::new(),
+        };
+        found.truncate(MAX_NODES);
+        nodes.append(&mut found);
+    }
     let values = match fields.get(b"values".as_slice()) {
-        // IPv6 peers (18 bytes) are skipped: we only speak IPv4.
+        // Peers of either family: 6 bytes or 18.
         Some(Value::List(list)) => list
             .iter()
             .filter_map(|value| match value {
-                Value::Bytes(bytes) => decode_peer(bytes),
+                Value::Bytes(bytes) => decode_addr(bytes),
                 _ => None,
             })
             .take(MAX_VALUES)
@@ -503,20 +547,30 @@ fn id20(dict: &Dict, key: &[u8]) -> Result<[u8; 20]> {
         .map_err(|_| anyhow!("`{}` is not 20 bytes", String::from_utf8_lossy(key)))
 }
 
-/// Compact node info: 26 bytes per node.
+/// Compact node info: the id and the address, 26 bytes per IPv4 node and 38
+/// per IPv6 node. All `nodes` must be of one family.
 pub fn encode_nodes(nodes: &[NodeInfo]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(nodes.len() * COMPACT_NODE);
+    let mut out = Vec::with_capacity(nodes.len() * COMPACT_NODE6);
     for node in nodes {
         out.extend_from_slice(&node.id.0);
-        out.extend_from_slice(&encode_peer(node.addr));
+        out.extend_from_slice(&encode_addr(node.addr));
     }
     out
 }
 
 pub fn decode_nodes(bytes: &[u8]) -> Result<Vec<NodeInfo>> {
-    let (chunks, rest) = bytes.as_chunks::<COMPACT_NODE>();
+    decode_compact_nodes::<COMPACT_NODE>(bytes)
+}
+
+/// The IPv6 `nodes6`.
+pub fn decode_nodes6(bytes: &[u8]) -> Result<Vec<NodeInfo>> {
+    decode_compact_nodes::<COMPACT_NODE6>(bytes)
+}
+
+fn decode_compact_nodes<const N: usize>(bytes: &[u8]) -> Result<Vec<NodeInfo>> {
+    let (chunks, rest) = bytes.as_chunks::<N>();
     if !rest.is_empty() {
-        bail!("compact node info is not a multiple of {COMPACT_NODE} bytes");
+        bail!("compact node info is not a multiple of {N} bytes");
     }
     Ok(chunks
         .iter()
@@ -524,10 +578,37 @@ pub fn decode_nodes(bytes: &[u8]) -> Result<Vec<NodeInfo>> {
             let (id, addr) = chunk.split_at(20);
             NodeInfo {
                 id: NodeId(id.try_into().unwrap_or_default()),
-                addr: decode_peer(addr).unwrap_or(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+                addr: decode_addr(addr).unwrap_or(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)),
             }
         })
         .collect())
+}
+
+/// The `want` argument: a list of `n4` and `n6`.
+fn decode_want(args: &Dict) -> Want {
+    let Some(Value::List(list)) = args.get(b"want".as_slice()) else {
+        return Want::default();
+    };
+    let has = |name: &[u8]| {
+        list.iter()
+            .any(|v| matches!(v, Value::Bytes(b) if b == name))
+    };
+    Want {
+        v4: has(b"n4"),
+        v6: has(b"n6"),
+    }
+}
+
+fn insert_want(args: &mut Dict, want: Want) {
+    let names = [(want.v4, &b"n4"[..]), (want.v6, b"n6")];
+    let list: Vec<Value> = names
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, name)| Value::Bytes(name.to_vec()))
+        .collect();
+    if !list.is_empty() {
+        args.insert(b"want".to_vec(), Value::List(list));
+    }
 }
 
 /// Compact peer info: 4-byte IPv4 address and 2-byte port, big-endian.
