@@ -44,6 +44,13 @@ impl PeerPool {
         }
     }
 
+    /// Whether an introduced endpoint may be dialed, including one learned
+    /// by holepunch rather than through the ordinary ready queue.
+    pub(crate) fn allows(&self, addr: SocketAddr) -> bool {
+        !self.blocklist.refuses(addr.ip())
+            && !self.known.get(&addr).is_some_and(|state| state.banned)
+    }
+
     /// Adds peers not seen before. Known peers, including connected, retrying
     /// and banned ones, are left alone, and so are blocklisted ones.
     pub(crate) fn add(&mut self, peers: impl IntoIterator<Item = SocketAddr>) {

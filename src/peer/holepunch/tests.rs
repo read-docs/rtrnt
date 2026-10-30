@@ -188,3 +188,56 @@ fn disabled_or_unnegotiated_peers_cannot_trigger_udp_or_relay_commands() {
         assert_eq!(relay.try_next(), None);
     }
 }
+
+#[test]
+fn stale_provenance_and_disabled_negotiation_never_request_rendezvous() {
+    let (hub, _) = Hub::new(true);
+    let mut relay = hub.join([1; 20]);
+    relay.update(Some(addr(1)), true, None);
+    let now = Instant::now();
+    relay.learned([addr(2)], now);
+    hub.failed(addr(2), now + PROVENANCE_LIFETIME);
+    assert_eq!(relay.try_next(), None);
+    relay.learned([addr(2)], now + PROVENANCE_LIFETIME);
+    relay.update(Some(addr(1)), false, None);
+    hub.failed(addr(2), now + PROVENANCE_LIFETIME);
+    relay.received(
+        Message {
+            endpoint: addr(2),
+            kind: Kind::Rendezvous,
+        },
+        now + PROVENANCE_LIFETIME,
+    );
+    assert_eq!(relay.try_next(), None);
+}
+
+#[test]
+fn redundant_connects_and_repeated_relay_requests_are_ignored() {
+    let (hub, mut connections) = Hub::new(true);
+    let mut a = hub.join([1; 20]);
+    let mut b = hub.join([2; 20]);
+    a.update(Some(addr(1)), true, None);
+    b.update(Some(addr(2)), true, None);
+    let now = Instant::now();
+    a.received(
+        Message {
+            endpoint: addr(2),
+            kind: Kind::Connect,
+        },
+        now,
+    );
+    assert!(connections.try_recv().is_err());
+    for _ in 0..2 {
+        a.received(
+            Message {
+                endpoint: addr(2),
+                kind: Kind::Rendezvous,
+            },
+            now,
+        );
+    }
+    assert!(a.try_next().is_some());
+    assert_eq!(a.try_next(), None);
+    assert!(b.try_next().is_some());
+    assert_eq!(b.try_next(), None);
+}
