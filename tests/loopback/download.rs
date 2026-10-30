@@ -770,3 +770,66 @@ async fn runs_the_completion_hook_once_the_download_finishes() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(std::fs::read_to_string(&mark).unwrap(), expected);
 }
+
+/// A peer that corrects its own corrupt copy is still banned once the
+/// verified bytes identify it. Another seed must finish the remaining pieces.
+#[tokio::test]
+async fn smart_bans_a_corrupt_seeder_before_finishing_from_another() {
+    let data = Arc::new(test_data());
+    let (torrent, info_hash) = make_torrent(&data);
+    let num_pieces = torrent.num_pieces();
+    let bad = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bad_addr = bad.local_addr().unwrap();
+    let good = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let good_addr = good.local_addr().unwrap();
+    let (banned, banned_rx) = oneshot::channel();
+    let bad_data = Arc::clone(&data);
+    let bad_peer = tokio::spawn(async move {
+        let mut socket = accept_partial(&bad, info_hash, num_pieces, &[0]).await;
+        send(&mut socket, PeerMessage::Unchoke).await;
+        let mut corrupted = false;
+        while let Some(message) = read_message(&mut socket).await {
+            if let PeerMessage::Request(BlockRef {
+                index,
+                begin,
+                length,
+            }) = message
+            {
+                let mut reply = piece(&bad_data, index, begin, length);
+                if !corrupted && let PeerMessage::Piece { block, .. } = &mut reply {
+                    block[0] ^= 0xff;
+                    corrupted = true;
+                }
+                send(&mut socket, reply).await;
+            }
+        }
+        assert!(corrupted);
+        banned.send(()).unwrap();
+    });
+    let good_data = Arc::clone(&data);
+    tokio::spawn(async move {
+        let mut socket = accept_leecher(&good, info_hash, num_pieces).await;
+        // Only supply the remaining pieces after the corrupt peer is dropped.
+        banned_rx.await.unwrap();
+        send(&mut socket, PeerMessage::Unchoke).await;
+        serve(socket, &good_data).await;
+    });
+    let out = tempfile::tempdir().unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        download_from_peers(
+            session(torrent, info_hash, out.path()),
+            &vec![false; num_pieces],
+            &[bad_addr, good_addr],
+            2,
+            Vec::new(),
+            None,
+            pending(),
+        ),
+    )
+    .await
+    .expect("corrupt peer was not replaced")
+    .expect("download failed");
+    bad_peer.await.unwrap();
+    assert_files_match(out.path(), &data);
+}

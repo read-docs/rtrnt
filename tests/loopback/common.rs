@@ -212,7 +212,8 @@ pub(crate) async fn serve(mut socket: TcpStream, data: &[u8]) {
 }
 
 /// Serves `data` to one leecher. Chokes on the first request (dropping it)
-/// and corrupts the first block it sends for piece 1.
+/// so downloads exercise the choke/retry path. It always sends valid data: a
+/// corrupt shared fixture can be smart-banned before unrelated tests finish.
 pub(crate) async fn seeder(
     listener: TcpListener,
     data: Arc<Vec<u8>>,
@@ -223,7 +224,6 @@ pub(crate) async fn seeder(
     send(&mut socket, PeerMessage::Unchoke).await;
 
     let mut choked_once = false;
-    let mut corrupted_once = false;
     while let Some(message) = read_message(&mut socket).await {
         let PeerMessage::Request(BlockRef {
             index,
@@ -240,11 +240,7 @@ pub(crate) async fn seeder(
             continue;
         }
         let start = index as usize * PIECE_LENGTH as usize + begin as usize;
-        let mut block = data[start..start + length as usize].to_vec();
-        if index == 1 && !corrupted_once {
-            corrupted_once = true;
-            block[0] ^= 0xff;
-        }
+        let block = data[start..start + length as usize].to_vec();
         send(
             &mut socket,
             PeerMessage::Piece {
