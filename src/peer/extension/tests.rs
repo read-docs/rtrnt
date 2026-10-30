@@ -10,6 +10,7 @@ fn our_handshake_roundtrips() {
     let ours = ExtendedHandshake::ours(advertised, ip);
     assert_eq!(ours.id(pex::NAME), Some(pex::ID));
     assert_eq!(ours.id(UT_METADATA), Some(UT_METADATA_ID));
+    assert_eq!(ours.id(LT_DONTHAVE), Some(LT_DONTHAVE_ID));
     assert_eq!(ours.client.as_deref(), Some(CLIENT));
     assert!(CLIENT.starts_with("rtrnt "));
 
@@ -17,7 +18,7 @@ fn our_handshake_roundtrips() {
     assert_eq!(
         payload,
         format!(
-            "d1:md11:ut_metadatai2e6:ut_pexi1ee1:pi6881e4:reqqi500e1:v{}:{}6:yourip4:\x0a\x01\x02\x03e",
+            "d1:md11:lt_donthavei3e11:ut_metadatai2e6:ut_pexi1ee1:pi6881e4:reqqi500e1:v{}:{}6:yourip4:\x0a\x01\x02\x03e",
             CLIENT.len(),
             CLIENT
         )
@@ -71,6 +72,27 @@ fn private_torrents_do_not_offer_peer_exchange() {
         ours.extensions.len(),
         public.extensions.len() - PUBLIC_ONLY.len()
     );
+}
+
+#[test]
+fn donthave_is_offered_to_private_torrents_too() {
+    let ip: IpAddr = "10.1.2.3".parse().unwrap();
+    let private = Advertised {
+        private: true,
+        ..Advertised::default()
+    };
+    let ours = ExtendedHandshake::ours(private, ip);
+    assert_eq!(ours.id(LT_DONTHAVE), Some(LT_DONTHAVE_ID));
+}
+
+#[test]
+fn donthave_payload_is_exactly_one_piece_index() {
+    assert_eq!(parse_donthave(&[0, 0, 0, 0]), Some(0));
+    assert_eq!(parse_donthave(&[0, 0, 1, 2]), Some(258));
+    assert_eq!(parse_donthave(&[0xff; 4]), Some(u32::MAX));
+    assert_eq!(parse_donthave(&[]), None);
+    assert_eq!(parse_donthave(&[0, 0, 1]), None);
+    assert_eq!(parse_donthave(&[0, 0, 0, 0, 0]), None);
 }
 
 #[test]

@@ -68,7 +68,24 @@ struct DeferredPieces {
     /// The last Bitfield, Have All or Have None.
     pieces: Option<PeerMessage>,
     haves: Vec<u32>,
+    /// Pieces the peer took back with `lt_donthave`, applied last.
+    lost: Vec<u32>,
     allowed_fast: Vec<u32>,
+}
+
+/// The piece index of an `lt_donthave` message (BEP 54), which must be
+/// exactly 4 bytes.
+fn donthave_index(payload: &[u8]) -> Result<u32> {
+    extension::parse_donthave(payload)
+        .ok_or_else(|| anyhow::Error::new(ProtocolViolation("malformed lt_donthave message")))
+}
+
+/// The `lt_donthave` message for `piece_index`, as received.
+fn donthave(piece_index: u32) -> PeerMessage {
+    PeerMessage::Extended {
+        id: extension::LT_DONTHAVE_ID,
+        payload: piece_index.to_be_bytes().to_vec(),
+    }
 }
 
 impl PeerConnection {
@@ -245,6 +262,9 @@ impl PeerConnection {
         for piece_index in deferred.haves {
             self.apply(&PeerMessage::Have { piece_index })?;
         }
+        for piece_index in deferred.lost {
+            self.apply(&donthave(piece_index))?;
+        }
         for piece_index in deferred.allowed_fast {
             self.apply(&PeerMessage::AllowedFast { piece_index })?;
         }
@@ -410,6 +430,7 @@ impl PeerConnection {
                     return Ok(());
                 }
                 PeerMessage::Have { piece_index } => {
+                    deferred.lost.retain(|lost| lost != piece_index);
                     if deferred.haves.len() < MAX_DEFERRED_HAVES {
                         deferred.haves.push(*piece_index);
                     }
@@ -418,6 +439,19 @@ impl PeerConnection {
                 PeerMessage::AllowedFast { piece_index } => {
                     if deferred.allowed_fast.len() < MAX_DEFERRED_HAVES {
                         deferred.allowed_fast.push(*piece_index);
+                    }
+                    return Ok(());
+                }
+                PeerMessage::Extended {
+                    id: extension::LT_DONTHAVE_ID,
+                    payload,
+                } => {
+                    let index = donthave_index(payload)?;
+                    // Only the Haves can be taken back one by one; a later
+                    // Bitfield replaces them all, as it does on arrival.
+                    deferred.haves.retain(|&have| have != index);
+                    if deferred.lost.len() < MAX_DEFERRED_HAVES {
+                        deferred.lost.push(index);
                     }
                     return Ok(());
                 }
@@ -453,6 +487,16 @@ impl PeerConnection {
             }
             PeerMessage::HaveAll => self.peer_has.fill(true),
             PeerMessage::HaveNone => self.peer_has.fill(false),
+            PeerMessage::Extended {
+                id: extension::LT_DONTHAVE_ID,
+                payload,
+            } => {
+                // Like Have, an index past the end is ignored.
+                let index = donthave_index(payload)?;
+                if let Some(has) = self.peer_has.get_mut(index as usize) {
+                    *has = false;
+                }
+            }
             PeerMessage::AllowedFast { piece_index } => {
                 // Like Have, an index past the end is ignored.
                 if let Some(allowed) = self.allowed_fast.get_mut(*piece_index as usize) {
