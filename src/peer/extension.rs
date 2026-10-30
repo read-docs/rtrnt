@@ -64,6 +64,8 @@ pub struct Advertised {
     /// Whether the torrent is private (BEP 27), so that the extensions in
     /// `PUBLIC_ONLY` are not offered.
     pub private: bool,
+    /// Offer BEP 55 only when this public torrent has a usable shared uTP endpoint.
+    pub holepunch: bool,
 }
 
 /// An extension handshake. Every field is optional on the wire.
@@ -110,13 +112,18 @@ impl ExtendedHandshake {
             listen_port,
             metadata_size,
             private,
+            holepunch,
         } = advertised;
+        let mut extensions: BTreeMap<String, u8> = EXTENSIONS
+            .iter()
+            .filter(|(name, _)| !(private && PUBLIC_ONLY.contains(name)))
+            .map(|&(name, id)| (name.to_string(), id))
+            .collect();
+        if holepunch && !private {
+            extensions.insert(super::holepunch::NAME.to_string(), super::holepunch::ID);
+        }
         Self {
-            extensions: EXTENSIONS
-                .iter()
-                .filter(|(name, _)| !(private && PUBLIC_ONLY.contains(name)))
-                .map(|&(name, id)| (name.to_string(), id))
-                .collect(),
+            extensions,
             client: Some(CLIENT.to_string()),
             listen_port,
             request_queue: Some(MAX_QUEUED_REQUESTS),

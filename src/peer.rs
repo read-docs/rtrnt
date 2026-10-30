@@ -5,6 +5,7 @@ mod connection;
 pub mod extension;
 pub mod fast;
 mod handshake;
+pub mod holepunch;
 mod message;
 pub mod mse;
 pub mod pex;

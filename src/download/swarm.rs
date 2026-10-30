@@ -5,6 +5,7 @@ use crate::client::{ConnectionSlots, SlotPermit};
 use crate::dht::DhtSearch;
 use crate::listener::Registration;
 use crate::lsd::{LsdPeers, lsd_peers};
+use crate::peer::holepunch;
 use crate::peer::pex::PeerExchange;
 use crate::peer::{self, Incoming, PeerConnection};
 use crate::selection;
@@ -14,9 +15,9 @@ use crate::tracker::announcer::{Announcer, Transferred};
 use crate::webseed::WebSeed;
 use anyhow::{Result, bail};
 use indicatif::HumanBytes;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -111,6 +112,12 @@ pub(crate) async fn download_with(
     let stats = &session.stats;
     let priorities = session.piece_priorities();
     let (smart_ban, mut verdicts) = SmartBan::new();
+    let (holepunch, mut introduced) = holepunch::Hub::new(
+        !torrent.is_private()
+            && session.utp.is_some()
+            && session.utp_policy != crate::utp::Policy::Off
+            && !crate::network::global().proxied(),
+    );
     let swarm = Arc::new(Swarm {
         queue: PieceQueue::new(have, &priorities)
             .seeding(seed.enabled())
@@ -127,6 +134,7 @@ pub(crate) async fn download_with(
         pex,
         smart_ban,
         offers: Offers::new(num_pieces),
+        holepunch,
     });
     let Swarm {
         queue,
@@ -381,8 +389,18 @@ pub(crate) async fn download_with(
                         // peer came from.
                         if !inbound {
                             pool.failed(addr, pieces > 0, Instant::now());
+                            if encrypted.is_none() { swarm.holepunch.failed(addr, Instant::now()); }
                         }
                     }
+                }
+            }
+            Some(addr) = introduced.recv() => {
+                if workers.len() < max_peers && pool.allows(addr)
+                    && !banned_ips.contains(&addr.ip()) && !swarm.smart_ban.is_banned(addr)
+                    && let Some(permit) = slots.try_acquire()
+                {
+                    debug!(%addr, "connecting through a holepunch introduction");
+                    spawn(&mut workers, addr, Link::Holepunch, permit);
                 }
             }
             Some(joined) = web_workers.join_next() => {
@@ -545,6 +563,8 @@ pub(super) enum Link {
     /// By connecting to it, greeting it in plaintext before trying
     /// encryption if `plaintext_first` (see `Encryption::attempts`).
     Connect { plaintext_first: bool },
+    /// A negotiated relay introduction always uses the shared uTP endpoint.
+    Holepunch,
     /// Over a connection it opened to us, with its handshake read but not
     /// answered.
     Accepted(Incoming),
@@ -561,7 +581,7 @@ impl Link {
     /// Whether the peer connected to us, so we cannot connect back.
     pub(super) fn is_inbound(&self) -> bool {
         match self {
-            Link::Connect { .. } => false,
+            Link::Connect { .. } | Link::Holepunch => false,
             Link::Accepted(_) => true,
             Link::Open { inbound, .. } => *inbound,
         }
@@ -590,6 +610,8 @@ pub(super) struct Swarm {
     pub(super) smart_ban: SmartBan,
     /// How often each piece was offered while super-seeding.
     pub(super) offers: Offers,
+    /// Bounded public-torrent rendezvous coordination.
+    pub(super) holepunch: Arc<holepunch::Hub>,
 }
 
 impl PieceSource for Swarm {
@@ -613,29 +635,121 @@ struct WorkerExit {
 /// Ids of the peers we are connected to, so that a peer we connect to and
 /// that also connects to us is only downloaded from once.
 #[derive(Default)]
-pub(crate) struct ConnectedPeers(Mutex<HashSet<[u8; 20]>>);
+pub(crate) struct ConnectedPeers(Mutex<HashMap<[u8; 20], Arc<ConnectionChoice>>>);
+
+struct ConnectionChoice {
+    preferred: bool,
+    replaced: tokio::sync::watch::Sender<bool>,
+    done: AtomicBool,
+    finished: tokio::sync::Notify,
+}
 
 impl ConnectedPeers {
-    fn lock(&self) -> MutexGuard<'_, HashSet<[u8; 20]>> {
+    fn lock(&self) -> MutexGuard<'_, HashMap<[u8; 20], Arc<ConnectionChoice>>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Records a connection to the peer with id `id` until the returned
-    /// handle is dropped, or returns `None` if there already is one.
+    fn insert(
+        &self,
+        id: [u8; 20],
+        preferred: bool,
+        replace: bool,
+    ) -> Option<(Connected<'_>, Option<Arc<ConnectionChoice>>)> {
+        let mut peers = self.lock();
+        let old = peers.get(&id).cloned();
+        if old
+            .as_ref()
+            .is_some_and(|old| !replace || old.preferred || !preferred)
+        {
+            return None;
+        }
+        let connection = Arc::new(ConnectionChoice {
+            preferred,
+            replaced: tokio::sync::watch::Sender::new(false),
+            done: AtomicBool::new(false),
+            finished: tokio::sync::Notify::new(),
+        });
+        peers.insert(id, Arc::clone(&connection));
+        if let Some(old) = &old {
+            old.replaced.send_replace(true);
+        }
+        Some((
+            Connected {
+                peers: self,
+                id,
+                connection,
+                waiting_for: None,
+            },
+            old,
+        ))
+    }
+
+    /// Records a connection until the returned guard drops. Metadata fetches
+    /// use this form because their connections are not introduced in pairs.
     pub(crate) fn register(&self, id: [u8; 20]) -> Option<Connected<'_>> {
-        let new = self.lock().insert(id);
-        new.then_some(Connected { peers: self, id })
+        self.insert(id, false, false).map(|(guard, _)| guard)
+    }
+
+    /// Resolves crossed simultaneous connections consistently on both peers.
+    /// The smaller peer ID prefers outbound; the larger prefers inbound.
+    /// A preferred stream replaces a nonpreferred one, waiting for its guard
+    /// to drop before a new worker can register PEX and relay handles.
+    pub(crate) async fn register_directed(
+        &self,
+        id: [u8; 20],
+        preferred: bool,
+    ) -> Option<Connected<'_>> {
+        let (mut guard, old) = self.insert(id, preferred, true)?;
+        if let Some(old) = old {
+            guard.waiting_for = Some(Arc::clone(&old));
+            loop {
+                let mut finished = std::pin::pin!(old.finished.notified());
+                finished.as_mut().enable();
+                if old.done.load(Ordering::Acquire) {
+                    break;
+                }
+                finished.await;
+            }
+        }
+        guard.waiting_for = None;
+        Some(guard)
     }
 }
 
 pub(crate) struct Connected<'a> {
     peers: &'a ConnectedPeers,
     id: [u8; 20],
+    connection: Arc<ConnectionChoice>,
+    waiting_for: Option<Arc<ConnectionChoice>>,
+}
+
+impl Connected<'_> {
+    /// Watch state remembers a replacement even if it predates this wait.
+    pub(crate) async fn replacement(&self) {
+        let mut replaced = self.connection.replaced.subscribe();
+        let _ = replaced.wait_for(|&replaced| replaced).await;
+    }
 }
 
 impl Drop for Connected<'_> {
     fn drop(&mut self) {
-        self.peers.lock().remove(&self.id);
+        let mut peers = self.peers.lock();
+        if peers
+            .get(&self.id)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.connection))
+        {
+            if let Some(old) = &self.waiting_for
+                && !old.done.load(Ordering::Acquire)
+            {
+                // A canceled replacement must still exclude new workers
+                // until the old worker releases its PEX and relay handles.
+                peers.insert(self.id, Arc::clone(old));
+            } else {
+                peers.remove(&self.id);
+            }
+        }
+        self.connection.done.store(true, Ordering::Release);
+        self.connection.finished.notify_waiters();
     }
 }
 
@@ -679,5 +793,49 @@ mod tests {
         let _b = peers.register([2; 20]).unwrap();
         drop(a);
         assert!(peers.register([1; 20]).is_some());
+    }
+    #[tokio::test]
+    async fn crossed_connections_keep_the_same_stream_on_both_ends() {
+        let smaller = Arc::new(ConnectedPeers::default());
+        let larger = Arc::new(ConnectedPeers::default());
+        // Opposite ends each first select a different outbound stream.
+        let smaller_out = smaller.register_directed([2; 20], true).await.unwrap();
+        let larger_out = larger.register_directed([1; 20], false).await.unwrap();
+        assert!(smaller.register_directed([2; 20], false).await.is_none());
+        let accepting = Arc::clone(&larger);
+        let preferred = tokio::spawn(async move {
+            let guard = accepting.register_directed([1; 20], true).await.unwrap();
+            assert!(accepting.register([1; 20]).is_none());
+            drop(guard);
+        });
+        // Replacement state cannot be lost even when subscribed afterward.
+        larger_out.replacement().await;
+        assert!(
+            !preferred.is_finished(),
+            "new stream started before old PEX handles ended"
+        );
+        drop(larger_out);
+        preferred.await.unwrap();
+        // The smaller side's outbound stream and larger side's inbound are
+        // opposite ends of the same surviving connection.
+        assert!(smaller.register([2; 20]).is_none());
+        drop(smaller_out);
+        assert!(smaller.register([2; 20]).is_some());
+        assert!(larger.register([1; 20]).is_some());
+    }
+    #[tokio::test]
+    async fn canceling_a_replacement_still_waits_for_old_worker_cleanup() {
+        let peers = ConnectedPeers::default();
+        let old = peers.register_directed([2; 20], false).await.unwrap();
+        let replacement = peers.register_directed([2; 20], true);
+        assert!(
+            tokio::time::timeout(Duration::ZERO, replacement)
+                .await
+                .is_err()
+        );
+        old.replacement().await;
+        assert!(peers.register([2; 20]).is_none());
+        drop(old);
+        assert!(peers.register([2; 20]).is_some());
     }
 }

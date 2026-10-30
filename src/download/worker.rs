@@ -1,6 +1,7 @@
 use crate::magnet::metadata;
 use crate::peer::extension::{self, Advertised};
 use crate::peer::fast;
+use crate::peer::holepunch;
 use crate::peer::pex::{self};
 use crate::peer::{BlockRef, PeerConnection, PeerMessage};
 use crate::stats::{PeerFlags, PeerStats};
@@ -55,15 +56,6 @@ pub(super) async fn peer_worker(
     pieces_done: &mut usize,
     encrypted: &mut Option<bool>,
 ) -> Result<()> {
-    let Swarm {
-        queue,
-        progress,
-        connected,
-        choker,
-        pex,
-        smart_ban,
-        offers,
-    } = swarm;
     let torrent = &session.torrent;
     let (info_hash, peer_id, num_pieces) =
         (session.info_hash, session.peer_id, torrent.num_pieces());
@@ -78,6 +70,7 @@ pub(super) async fn peer_worker(
             .as_ref()
             .and_then(|metadata| u32::try_from(metadata.len()).ok()),
         private: torrent.is_private(),
+        holepunch: swarm.holepunch.enabled(),
     };
     let mut conn = match link {
         Link::Accepted(incoming) => {
@@ -97,16 +90,77 @@ pub(super) async fn peer_worker(
             )
             .await?
         }
+        Link::Holepunch => {
+            PeerConnection::connect_via(
+                addr,
+                info_hash,
+                peer_id,
+                num_pieces,
+                advertised,
+                session.encryption.attempts(false),
+                session.utp.as_deref(),
+                crate::utp::Policy::Require,
+            )
+            .await?
+        }
         Link::Open { conn, .. } => *conn,
     };
+    if reopened {
+        conn.send_extension_handshake(advertised).await?;
+    }
     *encrypted = Some(conn.is_encrypted());
     if conn.peer_id == peer_id {
         // A tracker listed our own address.
         bail!(Misbehaved("connected to ourselves"));
     }
-    let Some(_connected) = connected.register(conn.peer_id) else {
+    let preferred = (peer_id < conn.peer_id) != inbound;
+    let Some(connected_guard) = swarm
+        .connected
+        .register_directed(conn.peer_id, preferred)
+        .await
+    else {
         bail!("already connected to this peer");
     };
+    let transfer = exchange_peer(
+        session,
+        swarm,
+        conn,
+        inbound,
+        reopened,
+        listen_port,
+        pieces_done,
+    );
+    tokio::select! {
+        result = transfer => result,
+        () = connected_guard.replacement() => bail!("replaced by the preferred simultaneous connection"),
+    }
+}
+
+/// Transfers pieces on the chosen connection. Dropping this future promptly
+/// releases requests, PEX and relay handles before its registry guard ends.
+async fn exchange_peer(
+    session: &Session,
+    swarm: &Swarm,
+    mut conn: PeerConnection,
+    inbound: bool,
+    reopened: bool,
+    listen_port: Option<u16>,
+    pieces_done: &mut usize,
+) -> Result<()> {
+    let Swarm {
+        queue,
+        progress,
+        connected: _,
+        choker,
+        pex,
+        smart_ban,
+        offers,
+        holepunch,
+    } = swarm;
+    let torrent = &session.torrent;
+    let info_hash = session.info_hash;
+    let num_pieces = torrent.num_pieces();
+    let addr = conn.addr;
     // Whether both sides support the fast extension (BEP 6): then every
     // request gets a Piece or a Reject both ways, and a choke no longer
     // drops requests.
@@ -116,6 +170,7 @@ pub(super) async fn peer_worker(
     let stats = Arc::new(PeerStats::new(addr, inbound).with_encryption(is_encrypted));
     session.stats.add_peer(&stats);
     let mut pex = pex.join(conn.peer_id, addr, !inbound, is_encrypted);
+    let mut punch = holepunch.join(conn.peer_id);
 
     // Our pieces, first thing after the handshakes (see
     // `fast::have_message`), or one Have each on a connection that heard we
@@ -237,6 +292,26 @@ pub(super) async fn peer_worker(
                 }
                 announced = count;
                 super_seed = None;
+            }
+        }
+        let remote = conn.peer_extensions();
+        let supported = remote.is_some_and(|handshake| handshake.id(holepunch::NAME).is_some());
+        let endpoint = if conn.is_utp() || !inbound {
+            Some(addr)
+        } else {
+            remote
+                .and_then(|handshake| handshake.listen_port)
+                .map(|port| SocketAddr::new(addr.ip(), port))
+        };
+        let local = remote
+            .and_then(|handshake| handshake.your_ip)
+            .zip(listen_port)
+            .map(|(ip, port)| SocketAddr::new(ip, port));
+        punch.update(endpoint, supported, local);
+        while let Some(message) = punch.try_next() {
+            if supported {
+                conn.send_extended(holepunch::NAME, message.encode())
+                    .await?;
             }
         }
         pex.tick(&mut conn, Instant::now()).await?;
@@ -370,6 +445,10 @@ pub(super) async fn peer_worker(
             // for the queue to close, for the peer to announce a new piece or
             // ask for one of ours, or for the choker to (un)choke it.
             tokio::select! {
+                message = punch.next() => {
+                    conn.send_extended(holepunch::NAME, message.encode()).await?;
+                    None
+                }
                 () = &mut changed => None,
                 message = conn.receive_untimed() => Some(message?),
                 () = slot.changed() => None,
@@ -404,6 +483,10 @@ pub(super) async fn peer_worker(
             };
             tokio::select! {
                 message = receive => Some(message?),
+                message = punch.next() => {
+                    conn.send_extended(holepunch::NAME, message.encode()).await?;
+                    None
+                }
                 () = queue.wait_for(woken) => None,
                 () = slot.changed() => None,
                 () = sleep_until_some(unchoke_deadline) => None,
@@ -465,7 +548,25 @@ pub(super) async fn peer_worker(
             PeerMessage::Extended {
                 id: pex::ID,
                 payload,
-            } => pex.received(&payload, Instant::now(), queue.is_done())?,
+            } => {
+                let peers = pex.received(&payload, Instant::now(), queue.is_done())?;
+                punch.learned(peers, Instant::now());
+            }
+            PeerMessage::Extended {
+                id: holepunch::ID,
+                payload,
+            } => {
+                if holepunch.enabled()
+                    && conn
+                        .peer_extensions()
+                        .is_some_and(|handshake| handshake.id(holepunch::NAME).is_some())
+                {
+                    let message = holepunch::Message::decode(&payload).map_err(|_| {
+                        crate::peer::ProtocolViolation("malformed holepunch message")
+                    })?;
+                    punch.received(message, Instant::now());
+                }
+            }
             // Without the fast extension a choke drops our requests:
             // dropping the claims returns the pieces, and the next turn
             // waits for an unchoke. With it they stand until rejected (see

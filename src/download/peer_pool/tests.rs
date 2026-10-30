@@ -128,3 +128,15 @@ fn leaves_out_blocklisted_peers() {
     assert_eq!(drain(&mut pool, Instant::now()), [addr(1), addr(2)]);
     assert_eq!(pool.blocklist.blocked(), 2);
 }
+
+#[test]
+fn introduced_endpoints_obey_the_blocklist_and_existing_bans() {
+    let (list, _) = Blocklist::parse("10.0.0.0/8\n2001:db8::/32\n");
+    let mut pool = PeerPool::with_blocklist(Arc::new(list));
+    assert!(!pool.allows("10.0.0.1:6881".parse().unwrap()));
+    assert!(!pool.allows("[2001:db8::1]:6881".parse().unwrap()));
+    assert!(pool.allows(addr(1)));
+    pool.ban(addr(1));
+    assert!(!pool.allows(addr(1)));
+    assert!(pool.allows(addr(2)));
+}

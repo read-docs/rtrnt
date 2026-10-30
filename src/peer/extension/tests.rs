@@ -60,6 +60,7 @@ fn private_torrents_do_not_offer_peer_exchange() {
     let ip: IpAddr = "10.1.2.3".parse().unwrap();
     let private = Advertised {
         private: true,
+        holepunch: false,
         ..Advertised::default()
     };
     let ours = ExtendedHandshake::ours(private, ip);
@@ -79,6 +80,7 @@ fn donthave_is_offered_to_private_torrents_too() {
     let ip: IpAddr = "10.1.2.3".parse().unwrap();
     let private = Advertised {
         private: true,
+        holepunch: false,
         ..Advertised::default()
     };
     let ours = ExtendedHandshake::ours(private, ip);
@@ -188,4 +190,32 @@ fn later_handshakes_update_earlier_ones() {
     assert_eq!(handshake.id("ut_pex"), None);
     assert_eq!(handshake.request_queue, Some(32));
     assert_eq!(handshake.client.as_deref(), Some("a"));
+}
+
+#[test]
+fn holepunch_is_only_advertised_for_a_ready_public_transport() {
+    let public = Advertised {
+        holepunch: true,
+        ..Advertised::default()
+    };
+    let ip = "127.0.0.1".parse().unwrap();
+    assert_eq!(
+        ExtendedHandshake::ours(public, ip).id(crate::peer::holepunch::NAME),
+        Some(crate::peer::holepunch::ID)
+    );
+    assert_eq!(
+        ExtendedHandshake::ours(
+            Advertised {
+                private: true,
+                ..public
+            },
+            ip
+        )
+        .id(crate::peer::holepunch::NAME),
+        None
+    );
+    assert_eq!(
+        ExtendedHandshake::ours(Advertised::default(), ip).id(crate::peer::holepunch::NAME),
+        None
+    );
 }

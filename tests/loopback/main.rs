@@ -5,6 +5,7 @@ mod common;
 mod download;
 mod encryption;
 mod fast;
+mod holepunch;
 mod magnet;
 mod pause;
 mod pex;
