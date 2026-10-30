@@ -49,6 +49,8 @@ pub const MIN_RECEIVE_INTERVAL: Duration = Duration::from_secs(30);
 pub const FLAG_ENCRYPTION: u8 = 0x01;
 /// Flag: the peer is a seed (or only uploads).
 pub const FLAG_SEED: u8 = 0x02;
+/// Flag: the peer negotiated the BEP 55 holepunch extension.
+pub const FLAG_HOLEPUNCH: u8 = 0x08;
 /// Flag: the peer is reachable; we connected to it.
 pub const FLAG_CONNECTABLE: u8 = 0x10;
 
@@ -268,6 +270,7 @@ impl PeerExchange {
             outbound,
             encrypted,
             seed: false,
+            holepunch: false,
             advertised: Advertised::default(),
             sent: BTreeSet::new(),
             sent_any: false,
@@ -310,6 +313,7 @@ pub(crate) struct PexPeer<'a> {
     encrypted: bool,
     /// Whether the peer has every piece.
     seed: bool,
+    holepunch: bool,
     /// What the exchange holds about the peer.
     advertised: Advertised,
     /// The peers the peer has been told about, and not told are dropped.
@@ -347,6 +351,9 @@ impl PexPeer<'_> {
             (false, Some(port)) => Some(SocketAddr::new(self.addr.ip(), port)),
             (false, None) => None,
         };
+        self.holepunch = conn
+            .peer_extensions()
+            .is_some_and(|handshake| handshake.id(super::holepunch::NAME).is_some());
         self.advertise(addr, self.flags());
 
         if now < self.send_at
@@ -385,9 +392,14 @@ impl PexPeer<'_> {
     /// the last one taken is ignored, and so is every message for a private
     /// torrent. One that is not a bencoded dictionary is a protocol
     /// violation.
-    pub(crate) fn received(&mut self, payload: &[u8], now: Instant, seeding: bool) -> Result<()> {
+    pub(crate) fn received(
+        &mut self,
+        payload: &[u8],
+        now: Instant,
+        seeding: bool,
+    ) -> Result<Vec<SocketAddr>> {
         if !self.exchange.enabled {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let message = PexMessage::decode(payload)
             .context(ProtocolViolation("malformed peer exchange message"))?;
@@ -395,7 +407,7 @@ impl PexPeer<'_> {
             && now.saturating_duration_since(last) < MIN_RECEIVE_INTERVAL
         {
             debug!(addr = %self.addr, "ignoring peer exchange message: too soon after the last");
-            return Ok(());
+            return Ok(Vec::new());
         }
         self.last_received = Some(now);
         let peers = worth_trying(&message, seeding, &self.own_addrs());
@@ -407,9 +419,9 @@ impl PexPeer<'_> {
         );
         if !peers.is_empty() {
             // The download only stops listening once every worker is gone.
-            let _ = self.exchange.learned.send(peers);
+            let _ = self.exchange.learned.send(peers.clone());
         }
-        Ok(())
+        Ok(peers.into_iter().map(|(addr, _)| addr).collect())
     }
 
     /// The flags other peers are told about the peer.
@@ -418,6 +430,7 @@ impl PexPeer<'_> {
         flag(self.outbound, FLAG_CONNECTABLE)
             | flag(self.seed, FLAG_SEED)
             | flag(self.encrypted, FLAG_ENCRYPTION)
+            | flag(self.holepunch, FLAG_HOLEPUNCH)
     }
 
     /// The peer's addresses: where we are connected to it, and where it

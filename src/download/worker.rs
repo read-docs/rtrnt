@@ -55,15 +55,6 @@ pub(super) async fn peer_worker(
     pieces_done: &mut usize,
     encrypted: &mut Option<bool>,
 ) -> Result<()> {
-    let Swarm {
-        queue,
-        progress,
-        connected,
-        choker,
-        pex,
-        smart_ban,
-        offers,
-    } = swarm;
     let torrent = &session.torrent;
     let (info_hash, peer_id, num_pieces) =
         (session.info_hash, session.peer_id, torrent.num_pieces());
@@ -78,8 +69,9 @@ pub(super) async fn peer_worker(
             .as_ref()
             .and_then(|metadata| u32::try_from(metadata.len()).ok()),
         private: torrent.is_private(),
+        holepunch: false,
     };
-    let mut conn = match link {
+    let conn = match link {
         Link::Accepted(incoming) => {
             PeerConnection::answer(incoming, peer_id, num_pieces, advertised).await?
         }
@@ -104,9 +96,44 @@ pub(super) async fn peer_worker(
         // A tracker listed our own address.
         bail!(Misbehaved("connected to ourselves"));
     }
-    let Some(_connected) = connected.register(conn.peer_id) else {
+    let preferred = (peer_id < conn.peer_id) != inbound;
+    let Some(connected_guard) = swarm
+        .connected
+        .register_directed(conn.peer_id, preferred)
+        .await
+    else {
         bail!("already connected to this peer");
     };
+    let transfer = exchange_peer(session, swarm, conn, inbound, reopened, pieces_done);
+    tokio::select! {
+        result = transfer => result,
+        () = connected_guard.replacement() => bail!("replaced by the preferred simultaneous connection"),
+    }
+}
+
+/// Transfers pieces on the chosen connection. Dropping this future promptly
+/// releases requests, PEX and relay handles before its registry guard ends.
+async fn exchange_peer(
+    session: &Session,
+    swarm: &Swarm,
+    mut conn: PeerConnection,
+    inbound: bool,
+    reopened: bool,
+    pieces_done: &mut usize,
+) -> Result<()> {
+    let Swarm {
+        queue,
+        progress,
+        connected: _,
+        choker,
+        pex,
+        smart_ban,
+        offers,
+    } = swarm;
+    let torrent = &session.torrent;
+    let info_hash = session.info_hash;
+    let num_pieces = torrent.num_pieces();
+    let addr = conn.addr;
     // Whether both sides support the fast extension (BEP 6): then every
     // request gets a Piece or a Reject both ways, and a choke no longer
     // drops requests.
@@ -465,7 +492,9 @@ pub(super) async fn peer_worker(
             PeerMessage::Extended {
                 id: pex::ID,
                 payload,
-            } => pex.received(&payload, Instant::now(), queue.is_done())?,
+            } => {
+                pex.received(&payload, Instant::now(), queue.is_done())?;
+            }
             // Without the fast extension a choke drops our requests:
             // dropping the claims returns the pieces, and the next turn
             // waits for an unchoke. With it they stand until rejected (see

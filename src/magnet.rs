@@ -488,6 +488,7 @@ async fn fetch_and_download(
             .as_ref()
             .and_then(|metadata| u32::try_from(metadata.len()).ok()),
         private: session.torrent.is_private(),
+        holepunch: false,
     };
     let mut connections = Vec::new();
     for (mut conn, inbound, permit) in fetched.connections {
