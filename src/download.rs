@@ -29,6 +29,7 @@ mod progress;
 mod queue;
 mod requests;
 mod smart_ban;
+mod superseed;
 mod swarm;
 mod upload;
 mod web;
@@ -57,6 +58,10 @@ pub struct DownloadConfig {
     /// Whether a torrent that has not been told otherwise downloads its
     /// pieces in order (see `PieceQueue`) rather than the rarest first.
     pub sequential: bool,
+    /// Whether a torrent we have complete is super-seeded (BEP 16) to the
+    /// peers that connect while it is: each is told of one piece at a time
+    /// (see `superseed`).
+    pub super_seed: bool,
     /// Whether to ask the router to forward the listening port (see
     /// `portmap`).
     pub portmap: bool,
@@ -133,6 +138,9 @@ pub struct Session {
     /// Run when the download finishes this session (not for one complete
     /// from the start), if the settings give a command.
     pub completion: Option<Completion>,
+    /// Whether peers that connect while we have every piece are super-
+    /// seeded (see `superseed`).
+    pub super_seed: bool,
 }
 
 impl Session {
@@ -311,6 +319,7 @@ async fn download_loaded(
         resume,
         stats: Arc::clone(stats),
         completion,
+        super_seed: config.super_seed,
     });
 
     let mut shutdown = std::pin::pin!(shutdown);

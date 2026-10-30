@@ -160,6 +160,7 @@ async fn a_skipped_file_sharing_a_piece_is_created_but_not_filled() {
             std::path::Path::new("."),
         )),
         completion: None,
+        super_seed: false,
     });
     tokio::time::timeout(
         Duration::from_secs(30),

@@ -66,6 +66,7 @@ async fn two_torrents_share_one_listening_port() {
         seed: SeedLimits::default(),
         dht: false,
         sequential: false,
+        super_seed: false,
         portmap: false,
         max_download_rate: 0,
         max_upload_rate: 0,
@@ -121,6 +122,7 @@ async fn a_client_runs_a_torrent_once() {
         },
         dht: false,
         sequential: false,
+        super_seed: false,
         portmap: false,
         max_download_rate: 0,
         max_upload_rate: 0,
@@ -168,6 +170,7 @@ async fn a_magnet_link_for_a_running_torrent_gets_no_row() {
         seed: SeedLimits::default(),
         dht: false,
         sequential: false,
+        super_seed: false,
         portmap: false,
         max_download_rate: 0,
         max_upload_rate: 0,
@@ -209,6 +212,7 @@ async fn a_torrent_given_twice_gets_one_row() {
         seed: SeedLimits::default(),
         dht: false,
         sequential: false,
+        super_seed: false,
         portmap: false,
         max_download_rate: 0,
         max_upload_rate: 0,
@@ -459,6 +463,7 @@ async fn a_torrent_waits_its_turn_to_check_its_data() {
         resume: resume::Target::new(&config, info_hash),
         stats: Arc::new(TorrentStats::new(info_hash, "test", Path::new("."))),
         completion: None,
+        super_seed: false,
     });
     let hashing = Semaphore::new(1);
     let turn = hashing.acquire().await.unwrap();
@@ -538,6 +543,7 @@ async fn stats_follow_a_download() {
         seed: SeedLimits::default(),
         dht: false,
         sequential: false,
+        super_seed: false,
         portmap: false,
         max_download_rate: 0,
         max_upload_rate: 0,

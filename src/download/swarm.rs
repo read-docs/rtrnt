@@ -25,6 +25,7 @@ use tracing::{Instrument, debug, info, warn};
 use super::progress::Progress;
 use super::queue::PieceQueue;
 use super::smart_ban::SmartBan;
+use super::superseed::Offers;
 use super::web::web_seed_worker;
 use super::worker::peer_worker;
 use super::{Interrupted, Misbehaved, Session};
@@ -120,6 +121,7 @@ pub(crate) async fn download_with(
         choker: Choker::default(),
         pex,
         smart_ban,
+        offers: Offers::new(num_pieces),
     });
     let Swarm {
         queue,
@@ -533,6 +535,8 @@ pub(super) struct Swarm {
     /// Remembers which peers sent the blocks of pieces that failed their
     /// hash check, to ban them once the piece is completed elsewhere.
     pub(super) smart_ban: SmartBan,
+    /// How often each piece was offered while super-seeding.
+    pub(super) offers: Offers,
 }
 
 impl PieceSource for Swarm {

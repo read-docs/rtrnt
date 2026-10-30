@@ -409,6 +409,7 @@ async fn fetch_and_download(
             resume,
             stats: Arc::clone(stats),
             completion,
+            super_seed: config.super_seed,
         });
         let recheck = options.recheck != Recheck::No;
         let have =

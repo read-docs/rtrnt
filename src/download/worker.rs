@@ -17,6 +17,7 @@ use super::requests::{
     ActivePiece, Pipeline, drop_completed, expire_requests, release_choked, request_blocks,
 };
 use super::smart_ban::Sender;
+use super::superseed::{HEARING, Offers, PeerOffer};
 use super::swarm::{Link, Swarm, sleep_until_some};
 use super::upload::{Uploads, serve_block};
 use super::{Misbehaved, Session};
@@ -58,6 +59,7 @@ pub(super) async fn peer_worker(
         choker,
         pex,
         smart_ban,
+        offers,
     } = swarm;
     let torrent = &session.torrent;
     let (info_hash, peer_id, num_pieces) =
@@ -102,7 +104,18 @@ pub(super) async fn peer_worker(
     // Our pieces, first thing after the handshakes (see
     // `fast::have_message`), or one Have each on a connection that heard we
     // had none. Pieces completed from now on are announced with Have.
-    let (have, mut announced) = if reopened {
+    //
+    // Super-seeding (BEP 16) says we have nothing instead, and offers
+    // pieces one by one as the peer is ready for them (see `superseed`).
+    let mut super_seed = (session.super_seed && queue.has_all()).then(PeerOffer::default);
+    let (have, mut announced) = if super_seed.is_some() {
+        let none = if reopened {
+            None
+        } else {
+            fast::have_message(&vec![false; num_pieces], fast)
+        };
+        (none.into_iter().collect(), queue.completed_count())
+    } else if reopened {
         queue.have_messages()
     } else {
         let (have, announced) = queue.have_message(fast);
@@ -125,6 +138,10 @@ pub(super) async fn peer_worker(
     let mut active: Vec<ActivePiece<'_>> = Vec::new();
     let mut pipeline = Pipeline::new(Instant::now());
     let mut hash_failures = 0;
+    // For super-seeding: when the connection began, and whether the peer
+    // has told us its pieces.
+    let connected_at = Instant::now();
+    let mut heard = false;
     let mut last_useful = Instant::now();
     // Set while we are interested but choked.
     let mut unchoke_deadline = None;
@@ -177,7 +194,9 @@ pub(super) async fn peer_worker(
             ));
         }
         drop_completed(&mut conn, &mut active, fast.then_some(&mut cancelled)).await?;
-        announce_pieces(&mut conn, queue, &mut announced).await?;
+        if super_seed.is_none() {
+            announce_pieces(&mut conn, queue, &mut announced).await?;
+        }
         if queue.is_finished() {
             return Ok(());
         }
@@ -186,6 +205,21 @@ pub(super) async fn peer_worker(
             stats.set_pieces(conn.peer_has().iter().filter(|&&has| has).count());
             pex.set_seed(conn.peer_has().iter().all(|&has| has));
             has_changed = false;
+        }
+        if let Some(offer) = &mut super_seed {
+            if queue.has_all() {
+                let listened = heard || connected_at.elapsed() >= HEARING;
+                offer_piece(&mut conn, queue, offers, offer, listened).await?;
+            } else {
+                // No longer a seed: the peer hears of every piece we have.
+                debug!(%addr, "no longer a seed, ending super-seeding");
+                let (haves, count) = queue.have_messages();
+                if !haves.is_empty() {
+                    conn.send_all(&haves).await?;
+                }
+                announced = count;
+                super_seed = None;
+            }
         }
         pex.tick(&mut conn, Instant::now()).await?;
         if queue.is_done() && conn.peer_has().iter().all(|&has| has) {
@@ -366,9 +400,13 @@ pub(super) async fn peer_worker(
         messages_since_block += 1;
 
         match message {
-            PeerMessage::Have { .. } => has_changed = true,
+            PeerMessage::Have { .. } => {
+                has_changed = true;
+                heard = true;
+            }
             PeerMessage::Bitfield { .. } | PeerMessage::HaveAll | PeerMessage::HaveNone => {
                 has_changed = true;
+                heard = true;
                 // The peer's first word on its pieces: if it is just
                 // starting out, it gets our allowed fast set.
                 if fast && offered.is_none() {
@@ -558,6 +596,34 @@ async fn announce_pieces(
         conn.send_all(&haves).await?;
     }
     Ok(())
+}
+
+/// Super-seeding: offers the peer its next piece with a Have, if it is due
+/// one (see `PeerOffer::due`) and has been given the time to tell us what
+/// it has (`listened`).
+async fn offer_piece(
+    conn: &mut PeerConnection,
+    queue: &PieceQueue,
+    offers: &Offers,
+    state: &mut PeerOffer,
+    listened: bool,
+) -> Result<()> {
+    if !listened
+        || !state.due(Instant::now(), conn.peer_has(), |piece| {
+            queue.availability_of(piece)
+        })
+    {
+        return Ok(());
+    }
+    let have = queue.have_bitfield();
+    let availability = queue.availability();
+    let Some(piece) = offers.offer(conn.peer_has(), &have, &availability, &mut rand::rng()) else {
+        return Ok(());
+    };
+    let piece_index = u32::try_from(piece).map_err(|_| anyhow!("piece index too large"))?;
+    state.offered(piece);
+    debug!(addr = %conn.addr, piece, "super-seeding: offering a piece");
+    conn.send(&PeerMessage::Have { piece_index }).await
 }
 
 /// Sends the peer our allowed fast set (fast extension) if it is just

@@ -284,6 +284,22 @@ impl PieceQueue {
         }
     }
 
+    /// Whether every piece of the torrent, wanted or not, is verified and on
+    /// disk.
+    pub(super) fn has_all(&self) -> bool {
+        self.lock().have.iter().all(|&have| have)
+    }
+
+    /// How many connected peers have each piece.
+    pub(super) fn availability(&self) -> Vec<u32> {
+        self.lock().availability.clone()
+    }
+
+    /// How many connected peers have piece `index`.
+    pub(super) fn availability_of(&self, index: usize) -> u32 {
+        self.lock().availability.get(index).copied().unwrap_or(0)
+    }
+
     /// Which pieces are verified and on disk.
     pub(super) fn have_bitfield(&self) -> Vec<bool> {
         self.lock().have.clone()
@@ -425,7 +441,7 @@ impl Drop for PeerPieces<'_> {
 /// Picks the `(piece, key)` candidate in `has` with the lowest key. Ties
 /// are broken uniformly at random (reservoir sampling) so that peers spread
 /// out over equally good pieces instead of all fetching the lowest index.
-fn pick_least<K: Ord + Copy>(
+pub(super) fn pick_least<K: Ord + Copy>(
     candidates: impl IntoIterator<Item = (usize, K)>,
     has: &[bool],
     rng: &mut impl Rng,

@@ -36,6 +36,7 @@ pub async fn check_file(torrent_path: &Path, output_dir: &Path) -> Result<()> {
         resume: None,
         stats,
         completion: None,
+        super_seed: false,
     });
     // Nothing else is hashing, and nothing stops the check.
     let have = hash_pieces(
