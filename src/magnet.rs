@@ -387,7 +387,7 @@ async fn fetch_and_download(
                 &torrent.info,
                 &config.output_dir,
                 &selection,
-                config.preallocate,
+                config.storage_options(),
             )
             .await?,
         );

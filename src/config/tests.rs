@@ -23,6 +23,52 @@ fn defaults_when_nothing_is_set() {
     assert_eq!(config.max_download_rate, 0);
     assert_eq!(config.max_upload_rate, 0);
     assert_eq!(config.preallocate, Preallocate::Sparse);
+    assert_eq!(config.disk_cache, 16 * 1024 * 1024);
+}
+
+#[test]
+fn sizes_take_bytes_and_binary_suffixes() {
+    let size = |text: &str| text.parse::<ByteSize>().map(|size| size.0);
+    assert_eq!(size("0"), Ok(0));
+    assert_eq!(size("4096"), Ok(4096));
+    assert_eq!(size("64k"), Ok(64 * 1024));
+    assert_eq!(size("16m"), Ok(16 * 1024 * 1024));
+    assert_eq!(size("16MiB"), Ok(16 * 1024 * 1024));
+    assert_eq!(size(" 2 GiB "), Ok(2 * 1024 * 1024 * 1024));
+    assert_eq!(size("8kb"), Ok(8 * 1024));
+    for bad in [
+        "",
+        "m",
+        "-1",
+        "1.5m",
+        "12x",
+        "99999999999999999999",
+        "17179869184g",
+    ] {
+        assert!(size(bad).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn a_size_is_written_in_the_unit_that_reads_back() {
+    for bytes in [0, 1, 1000, 1024, 1536, 16 << 20, 3 << 30, (16 << 20) + 1] {
+        let size = ByteSize(bytes);
+        let text = size.to_string();
+        assert_eq!(text.parse::<ByteSize>(), Ok(size), "{text}");
+        let file = parse(&format!("disk-cache = {}", size.to_toml()), None).unwrap();
+        assert_eq!(file.disk_cache, Some(size), "{}", size.to_toml());
+    }
+    assert_eq!(ByteSize(16 << 20).to_string(), "16MiB");
+}
+
+#[test]
+fn disk_cache_comes_from_a_number_or_a_string_in_the_file() {
+    let size = |text: &str| resolve(Options::default(), parse(text, None).unwrap()).disk_cache;
+    assert_eq!(size("disk-cache = \"32MiB\""), 32 << 20);
+    assert_eq!(size("disk-cache = 65536"), 65536);
+    assert_eq!(size("disk-cache = 0"), 0);
+    assert!(parse("disk-cache = \"lots\"", None).is_err());
+    assert!(parse("disk-cache = -1", None).is_err());
 }
 
 #[test]
@@ -285,6 +331,7 @@ fn describe_names_each_source() {
          sequential = false  # default\n\
          super-seed = false  # default\n\
          preallocate = \"sparse\"  # default\n\
+         disk-cache = \"16MiB\"  # default\n\
          alt-speed-download = 50  # default\n\
          alt-speed-upload = 50  # default\n\
          # alt-speed-schedule: only by hand  # default\n\
@@ -311,6 +358,7 @@ fn describe_names_each_source() {
             sequential: Some(false),
             super_seed: Some(false),
             preallocate: Some(Preallocate::Sparse),
+            disk_cache: Some(DEFAULT_DISK_CACHE),
             alt_speed_download: Some(50),
             alt_speed_upload: Some(50),
             ..options(Some("/data"), Some(5), Some(6881))

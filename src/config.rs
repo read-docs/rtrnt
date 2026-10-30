@@ -53,6 +53,8 @@ pub const DEFAULT_SEQUENTIAL: bool = false;
 pub const DEFAULT_SUPER_SEED: bool = false;
 /// How files get their disk space: as data arrives (sparse).
 pub const DEFAULT_PREALLOCATE: Preallocate = Preallocate::Sparse;
+/// Memory each torrent may hold verified pieces in before writing them out.
+pub const DEFAULT_DISK_CACHE: ByteSize = ByteSize(16 * 1024 * 1024);
 /// Download limit in KiB/s: none.
 pub const DEFAULT_MAX_DOWNLOAD_RATE: u64 = 0;
 /// Upload limit in KiB/s: none.
@@ -96,6 +98,16 @@ impl ToToml for f64 {
 impl ToToml for Preallocate {
     fn to_toml(&self) -> String {
         toml::Value::from(self.as_str()).to_string()
+    }
+}
+
+impl ToToml for ByteSize {
+    fn to_toml(&self) -> String {
+        match self.0 {
+            0 => "0".to_string(),
+            n if n % KIB == 0 => toml::Value::from(self.to_string()).to_string(),
+            n => n.to_string(),
+        }
     }
 }
 
@@ -306,6 +318,13 @@ options! {
     /// [default: sparse]
     #[arg(long, value_enum, value_name = "MODE")]
     preallocate: Preallocate = Value(DEFAULT_PREALLOCATE);
+    /// Memory each torrent holds verified pieces in before writing them to
+    /// disk together, in offset order: a size in bytes, or with a `k`, `m`
+    /// or `g` suffix (KiB, MiB, GiB; `16MiB` works too). The cache is
+    /// flushed when full, every few seconds, and when the torrent stops or
+    /// is rechecked (0: write each piece at once) [default: 16MiB]
+    #[arg(long, value_name = "SIZE")]
+    disk_cache: ByteSize = Value(DEFAULT_DISK_CACHE);
     /// Download limit in KiB per second while the alternative speed mode
     /// ("turtle mode", `t` in the terminal UI) is on (0: unlimited)
     /// [default: 50]
@@ -337,6 +356,69 @@ options! {
     /// `seed-time`, each applying unless the torrent sets its own.
     #[arg(skip)]
     tags: TagTable = Unset("none");
+}
+
+const KIB: u64 = 1024;
+const MIB: u64 = 1024 * KIB;
+const GIB: u64 = 1024 * MIB;
+
+/// A size in bytes, written as a number of bytes or with a `k`, `m` or `g`
+/// suffix (also `kb`, `kib` and so on), all powers of 1024.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteSize(pub u64);
+
+impl std::str::FromStr for ByteSize {
+    type Err = String;
+
+    fn from_str(arg: &str) -> Result<Self, String> {
+        let lower = arg.trim().to_ascii_lowercase();
+        let digits_end = lower
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(lower.len());
+        let (digits, unit) = lower.split_at(digits_end);
+        let unit = match unit.trim() {
+            "" | "b" => 1,
+            "k" | "kb" | "kib" => KIB,
+            "m" | "mb" | "mib" => MIB,
+            "g" | "gb" | "gib" => GIB,
+            _ => return Err(format!("{arg:?} is not a size such as 16MiB or 4096")),
+        };
+        digits
+            .parse::<u64>()
+            .ok()
+            .and_then(|n| n.checked_mul(unit))
+            .map(ByteSize)
+            .ok_or_else(|| format!("{arg:?} is not a size such as 16MiB or 4096"))
+    }
+}
+
+/// The size as `from_str` reads it back: in the largest unit that divides
+/// it.
+impl std::fmt::Display for ByteSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            n if n != 0 && n % GIB == 0 => write!(f, "{}GiB", n / GIB),
+            n if n != 0 && n % MIB == 0 => write!(f, "{}MiB", n / MIB),
+            n if n != 0 && n % KIB == 0 => write!(f, "{}KiB", n / KIB),
+            n => write!(f, "{n}"),
+        }
+    }
+}
+
+/// In the config file, a number of bytes or a string like `"16MiB"`.
+impl<'de> Deserialize<'de> for ByteSize {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bytes(u64),
+            Text(String),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Bytes(n) => Ok(ByteSize(n)),
+            Raw::Text(text) => text.parse().map_err(D::Error::custom),
+        }
+    }
 }
 
 /// Whether `ratio` is a valid seed ratio: a finite number, 0 or more.
@@ -420,6 +502,7 @@ impl Options {
             super_seed: self.super_seed.unwrap_or(DEFAULT_SUPER_SEED),
             portmap: self.portmap.unwrap_or(DEFAULT_PORTMAP),
             preallocate: self.preallocate.unwrap_or(DEFAULT_PREALLOCATE),
+            disk_cache: self.disk_cache.unwrap_or(DEFAULT_DISK_CACHE).0,
             max_download_rate: self.max_download_rate.unwrap_or(DEFAULT_MAX_DOWNLOAD_RATE),
             max_upload_rate: self.max_upload_rate.unwrap_or(DEFAULT_MAX_UPLOAD_RATE),
             completion_hook: self.completion_hook,

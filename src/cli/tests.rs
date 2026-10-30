@@ -119,6 +119,7 @@ fn help_shows_the_defaults() {
             "preallocate",
             config::DEFAULT_PREALLOCATE.as_str().to_string(),
         ),
+        ("disk_cache", config::DEFAULT_DISK_CACHE.to_string()),
         ("seed_ratio", config::DEFAULT_SEED_RATIO.to_string()),
         ("seed_time", config::DEFAULT_SEED_TIME.to_string()),
         (

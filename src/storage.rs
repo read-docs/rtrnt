@@ -1,15 +1,18 @@
 use crate::selection::{FileSelection, Priority, priorities_of};
 use crate::torrent::Info;
 use anyhow::{Context, Result, bail};
+use cache::WriteCache;
 use sha1::{Digest, Sha1};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
+use tracing::warn;
 use unicode_normalization::UnicodeNormalization;
 
 mod alloc;
+mod cache;
 pub mod verify;
 
 pub use alloc::Preallocate;
@@ -57,7 +60,24 @@ impl FileSpan {
     }
 }
 
+/// How `Storage::with_options` lays out and writes the files.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StorageOptions {
+    /// Whether files get their disk space when created.
+    pub preallocate: Preallocate,
+    /// Bytes of verified pieces held in memory before they are written
+    /// out, for this torrent; 0 writes each piece at once.
+    pub cache_bytes: u64,
+}
+
 /// Maps the torrent's byte stream onto files on disk.
+///
+/// With a write cache, a verified piece is held in memory (see
+/// `write_verified`) until a flush, which writes the pieces in file-offset
+/// order. A flush is due when the cache is full, and is made by whoever
+/// owns the storage: periodically, and when the torrent stops or is
+/// rechecked (`flush`). What the cache holds is not lost to a reader (see
+/// `read_at`), and the last flush is made when the storage is dropped.
 #[derive(Debug)]
 pub struct Storage {
     files: Vec<FileSpan>,
@@ -67,6 +87,7 @@ pub struct Storage {
     /// Which files are wanted, as the files were created by.
     selection: FileSelection,
     handles: Mutex<HandleCache>,
+    cache: WriteCache,
 }
 
 /// Open handles by index into `Storage::files`, least recently used first.
@@ -142,6 +163,25 @@ impl Storage {
         selection: &FileSelection,
         preallocate: Preallocate,
     ) -> Result<Self> {
+        let options = StorageOptions {
+            preallocate,
+            ..StorageOptions::default()
+        };
+        Self::with_options(info, out_dir, selection, options)
+    }
+
+    /// Like `new`, laid out and written as `options` say. See
+    /// `with_preallocate` for `Full`.
+    pub fn with_options(
+        info: &Info,
+        out_dir: &Path,
+        selection: &FileSelection,
+        options: StorageOptions,
+    ) -> Result<Self> {
+        let StorageOptions {
+            preallocate,
+            cache_bytes,
+        } = options;
         let mut files = layout(info, out_dir)?;
         if !selection.is_empty() && selection.priorities().len() != files.len() {
             bail!(
@@ -189,6 +229,7 @@ impl Storage {
         }
         let mut storage = Self::with_files(info, files, true);
         storage.selection = selection.clone();
+        storage.cache = WriteCache::new(usize::try_from(cache_bytes).unwrap_or(usize::MAX));
         Ok(storage)
     }
 
@@ -224,11 +265,11 @@ impl Storage {
         info: &Info,
         out_dir: &Path,
         selection: &FileSelection,
-        preallocate: Preallocate,
+        options: StorageOptions,
     ) -> Result<Self> {
         let (info, out_dir, selection) = (info.clone(), out_dir.to_path_buf(), selection.clone());
         tokio::task::spawn_blocking(move || {
-            Self::with_preallocate(&info, &out_dir, &selection, preallocate)
+            Self::with_options(&info, &out_dir, &selection, options)
         })
         .await?
     }
@@ -248,6 +289,7 @@ impl Storage {
             writable,
             selection: FileSelection::default(),
             handles: Mutex::default(),
+            cache: WriteCache::new(0),
         }
     }
 
@@ -270,8 +312,8 @@ impl Storage {
     }
 
     /// Checks the data of piece `index` against its `hash`, and writes it to
-    /// disk if it matches, all on the blocking thread pool. Returns false,
-    /// writing nothing, if it does not.
+    /// disk (or the write cache) if it matches, all on the blocking thread
+    /// pool. Returns false, writing nothing, if it does not.
     pub async fn verify_and_write(
         self: &Arc<Self>,
         index: usize,
@@ -297,7 +339,7 @@ impl Storage {
                 return Ok(Err(data));
             }
             storage
-                .write_at(offset, &data)
+                .store(offset, data)
                 .map(|()| Ok(()))
                 .context(StorageError)
         })
@@ -319,7 +361,70 @@ impl Storage {
             .context(StorageError)
     }
 
+    /// Writes verified `data` at `offset`: into the write cache if there is
+    /// one, which is flushed if that fills it, else to the files.
+    fn store(&self, offset: u64, data: Vec<u8>) -> Result<()> {
+        if !self.cache.enabled() {
+            return self.write_at(offset, &data);
+        }
+        if !self.writable {
+            bail!("storage was opened read-only");
+        }
+        self.check_range(offset, data.len())?;
+        if self.cache.insert(offset, data) {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Whether there is a write cache.
+    pub fn cache_enabled(&self) -> bool {
+        self.cache.enabled()
+    }
+
+    /// Bytes of verified pieces held in the write cache, not yet on disk.
+    pub fn cached_bytes(&self) -> usize {
+        self.cache.bytes()
+    }
+
+    /// Writes what the write cache holds to the files, in offset order, and
+    /// empties it. An entry that fails to write stays in the cache, and the
+    /// next flush tries it again.
+    pub fn flush(&self) -> Result<()> {
+        if !self.cache.enabled() {
+            return Ok(());
+        }
+        let _flushing = self.cache.begin_flush();
+        for run in self.cache.runs() {
+            match run.as_slice() {
+                [(offset, data)] => self.write_to_disk(*offset, data)?,
+                [(offset, _), ..] => self.write_to_disk(*offset, &cache::join(&run))?,
+                [] => continue,
+            }
+            for entry in &run {
+                self.cache.retire(entry);
+            }
+        }
+        Ok(())
+    }
+
+    /// `flush` on the blocking thread pool.
+    pub async fn flush_async(self: &Arc<Self>) -> Result<()> {
+        if !self.cache.enabled() || self.cache.bytes() == 0 {
+            return Ok(());
+        }
+        let storage = Arc::clone(self);
+        tokio::task::spawn_blocking(move || storage.flush().context(StorageError)).await?
+    }
+
+    /// Writes `data` at `offset` to the files at once, after whatever the
+    /// write cache holds, so that an older piece does not land on top.
     pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
+        self.flush()?;
+        self.write_to_disk(offset, data)
+    }
+
+    fn write_to_disk(&self, offset: u64, data: &[u8]) -> Result<()> {
         if !self.writable {
             bail!("storage was opened read-only");
         }
@@ -333,14 +438,30 @@ impl Storage {
         Ok(())
     }
 
+    /// Reads `offset..offset + len`, with what the write cache holds in
+    /// place of what is on disk.
     pub fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
         self.check_range(offset, len)?;
+        // Before the files are read, so that a flush between the two cannot
+        // leave the data in neither: what was in the cache now is held here.
+        let cached = if self.cache.enabled() {
+            self.cache.overlapping(offset..offset + len as u64)
+        } else {
+            Vec::new()
+        };
         let mut data = vec![0u8; len];
         for (index, file_offset, range) in self.segments(offset, len) {
             let path = &self.files[index].path;
             let handle = self.handle(index)?;
             read_exact_at(&handle, &mut data[range], file_offset)
                 .with_context(|| format!("failed to read {}", path.display()))?;
+        }
+        let end = offset + len as u64;
+        for (start, held) in cached {
+            let from = start.max(offset);
+            let to = (start + held.len() as u64).min(end);
+            data[(from - offset) as usize..(to - offset) as usize]
+                .copy_from_slice(&held[(from - start) as usize..(to - start) as usize]);
         }
         Ok(data)
     }
@@ -403,6 +524,16 @@ impl Storage {
                 (index, start - file.offset, buf_start..buf_end)
             })
         })
+    }
+}
+
+impl Drop for Storage {
+    /// Writes what the write cache still holds: a write that was under way
+    /// when the torrent stopped lands after its last flush.
+    fn drop(&mut self) {
+        if let Err(e) = self.flush() {
+            warn!("cannot write the cached pieces: {e:#}");
+        }
     }
 }
 

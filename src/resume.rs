@@ -71,6 +71,9 @@ impl Target {
         let target = self.clone();
         let storage = Arc::clone(storage);
         let saved = tokio::task::spawn_blocking(move || {
+            // The file vouches for pieces that must be on disk, and its
+            // stamps are of the files as they are.
+            storage.flush()?;
             let saved = Saved {
                 version: VERSION,
                 info_hash: ByteBuf::from(target.info_hash.to_vec()),
