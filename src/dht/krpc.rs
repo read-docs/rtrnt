@@ -222,7 +222,6 @@ pub struct Want {
 
 impl Want {
     /// Both families.
-    #[cfg(test)]
     pub const BOTH: Want = Want { v4: true, v6: true };
 
     /// Whether nodes with address `ip` are wanted by a query that came over

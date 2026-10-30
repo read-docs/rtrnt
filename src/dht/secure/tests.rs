@@ -100,7 +100,7 @@ fn votes_need_several_distinct_reporters() {
     }
     assert_eq!(votes.vote(reporter(2), ip), None);
     assert_eq!(votes.vote(reporter(3), ip), None);
-    assert_eq!(votes.vote(reporter(4), ip), Some(ip));
+    assert_eq!(votes.vote(reporter(4), ip), Some(ip.into()));
 }
 
 #[test]
@@ -117,7 +117,7 @@ fn votes_need_a_majority() {
     }
     // Five against five is a tie, six against five wins.
     assert_eq!(votes.vote(reporter(14), a), None);
-    assert_eq!(votes.vote(reporter(15), a), Some(a));
+    assert_eq!(votes.vote(reporter(15), a), Some(a.into()));
 }
 
 #[test]

@@ -179,7 +179,7 @@ fn own_id_follows_the_address_nodes_agree_on() {
     let id = state.learn_external(public(4), ours, now).unwrap();
     assert!(id.is_secure_v4(ours));
     assert_eq!(state.table.own(), id);
-    assert_eq!(state.external, Some(ours));
+    assert_eq!(state.external, Some(ours.into()));
     assert_eq!(state.table.len(), 1, "known nodes are kept");
     // Once the id is valid, more reports change nothing.
     assert_eq!(state.learn_external(public(5), ours, now), None);
@@ -386,10 +386,212 @@ fn a_peer_of_either_family_may_announce_and_be_found() {
         token,
     };
     response(ask(&mut state, announce, six, now).0);
-    let found = response(ask(&mut state, get_peers(false, true), addr(1), now).0);
+    let other_family = response(ask(&mut state, get_peers(false, true), addr(1), now).0);
+    assert!(
+        other_family.values.is_empty(),
+        "values stay in the querying family"
+    );
+    let found = response(ask(&mut state, get_peers(false, true), six, now).0);
     assert_eq!(
         found.values,
         ["[2001:db8::7]:6881".parse::<SocketAddr>().unwrap()]
     );
     assert_eq!(found.seed_filter.unwrap().count(), 1);
+}
+
+#[tokio::test]
+async fn dual_stack_bootstraps_ipv6_through_ipv4_and_announces() {
+    let Ok(router6) = bind_ipv6(Ipv6Addr::LOCALHOST, 0) else {
+        return;
+    };
+    let router_port = router6.local_addr().unwrap().port();
+    let router4 = UdpSocket::bind((Ipv4Addr::LOCALHOST, router_port))
+        .await
+        .unwrap();
+    let router = Dht::start_sockets(router4, Some(router6), Vec::new()).unwrap();
+    let peer_socket = bind_ipv6(Ipv6Addr::LOCALHOST, 0).unwrap();
+    let peer = Dht::start(peer_socket, Vec::new()).unwrap();
+    let peer_addr = peer.local_addr();
+    router.0.node6.as_ref().unwrap().lock().table.insert(
+        NodeInfo {
+            id: NodeId(peer.node_id()),
+            addr: peer_addr,
+        },
+        Instant::now(),
+    );
+    let advertised = sock(Ipv6Addr::LOCALHOST, 54321);
+    peer.0
+        .node
+        .lock()
+        .store
+        .announce(INFO_HASH, advertised, true, Instant::now());
+
+    let client6 = bind_ipv6(Ipv6Addr::LOCALHOST, 0).unwrap();
+    let client_port = client6.local_addr().unwrap().port();
+    let client4 = UdpSocket::bind((Ipv4Addr::LOCALHOST, client_port))
+        .await
+        .unwrap();
+    // There is deliberately no IPv6 bootstrap router in this list.
+    let client = Dht::start_sockets(
+        client4,
+        Some(client6),
+        vec![router.local_addr().to_string()],
+    )
+    .unwrap();
+    let found = timeout(
+        Duration::from_secs(5),
+        client.lookup_peers(INFO_HASH, Some(client_port), false),
+    )
+    .await
+    .unwrap();
+    assert!(found.peers.contains(&advertised));
+    let node6 = client.0.node6.as_ref().unwrap();
+    assert!(!node6.lock().table.is_empty());
+    assert!(
+        client
+            .0
+            .node
+            .lock()
+            .table
+            .closest(&OWN, K)
+            .iter()
+            .all(|n| n.addr.is_ipv4())
+    );
+    assert!(
+        node6
+            .lock()
+            .table
+            .closest(&OWN, K)
+            .iter()
+            .all(|n| n.addr.is_ipv6())
+    );
+    let stored = peer
+        .0
+        .node
+        .lock()
+        .store
+        .get(&INFO_HASH, false, Instant::now());
+    assert!(
+        stored.contains(&node6.addr),
+        "IPv6 announce uses the IPv6 socket and shared port"
+    );
+}
+
+#[tokio::test]
+async fn ipv6_port_message_verifies_a_node() {
+    let Ok(socket) = bind_ipv6(Ipv6Addr::LOCALHOST, 0) else {
+        return;
+    };
+    let peer = Dht::start(socket, Vec::new()).unwrap();
+    let client6 = bind_ipv6(Ipv6Addr::LOCALHOST, 0).unwrap();
+    let client4 = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let client = Dht::start_sockets(client4, Some(client6), Vec::new()).unwrap();
+    client.add_node(peer.local_addr());
+    timeout(Duration::from_secs(3), async {
+        while client.node_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(client.0.node.lock().table.len(), 0);
+    assert_eq!(client.0.node6.as_ref().unwrap().lock().table.len(), 1);
+}
+
+#[tokio::test]
+async fn unavailable_ipv6_port_keeps_ipv4_working() {
+    let Ok(blocker) = bind_ipv6(Ipv6Addr::UNSPECIFIED, 0) else {
+        return;
+    };
+    let port = blocker.local_addr().unwrap().port();
+    let dht = Dht::bind(port).await.unwrap();
+    assert_eq!(dht.port(), port);
+    assert_eq!(dht.local_addr_v6(), None);
+    let peer = Dht::start(
+        UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap(),
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(
+        dht.0
+            .node
+            .query(peer.local_addr(), Query::Ping)
+            .await
+            .is_ok()
+    );
+}
+
+#[test]
+fn ipv6_id_adopts_only_same_family_votes() {
+    let mut state = State::new(OWN, Instant::now());
+    let ours: IpAddr = "2a01:4f8:1c1e:9a42::1".parse().unwrap();
+    for n in 1..=5 {
+        assert_eq!(state.learn_external(public(n), ours, Instant::now()), None);
+    }
+    for n in 1..=4 {
+        let reporter: IpAddr = format!("2606:4700::{n}").parse().unwrap();
+        state.learn_external(reporter, ours, Instant::now());
+    }
+    assert_eq!(state.external, Some(ours));
+    assert!(state.table.own().is_secure(ours));
+}
+
+#[test]
+fn large_ipv6_answers_fit_bep32_packet_limit() {
+    let reply = Message {
+        tid: vec![1, 2],
+        ip: None,
+        body: Body::Response(Response {
+            id: OWN,
+            values: (1..=50)
+                .map(|port| sock(Ipv6Addr::LOCALHOST, port))
+                .collect(),
+            nodes: (1..=K)
+                .map(|port| NodeInfo {
+                    id: NodeId([port as u8; 20]),
+                    addr: sock(Ipv6Addr::LOCALHOST, port as u16),
+                })
+                .collect(),
+            seed_filter: Some(Bloom::default()),
+            peer_filter: Some(Bloom::default()),
+            ..Response::default()
+        }),
+    };
+    let packet = bounded_reply(reply).unwrap();
+    assert!(packet.len() <= 1024);
+    let decoded = Message::decode(&packet).unwrap();
+    let response = response(decoded.body);
+    assert!(response.seed_filter.is_some());
+    assert!(!response.values.is_empty());
+}
+
+#[tokio::test]
+async fn an_oversized_remote_token_is_not_sent_back() {
+    let dht = Dht::start(
+        UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap(),
+        Vec::new(),
+    )
+    .unwrap();
+    let remote = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let result = dht
+        .0
+        .node
+        .query(
+            remote.local_addr().unwrap(),
+            Query::AnnouncePeer {
+                info_hash: INFO_HASH,
+                port: 6881,
+                implied_port: false,
+                seed: false,
+                token: vec![0; 1024],
+            },
+        )
+        .await;
+    assert!(matches!(result, Err(QueryError::Local(_))));
+    assert!(dht.0.node.lock().pending.is_empty());
+    let mut buf = [0; 2048];
+    assert_eq!(
+        remote.try_recv_from(&mut buf).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }
