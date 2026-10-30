@@ -184,6 +184,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     let metrics_listen = effective.metrics_listen;
     let rss_feeds = effective.rss.clone().unwrap_or_default();
     let tag_settings = effective.tag_settings();
+    let tag_directories = effective.tag_directories();
     let config = effective.into_download_config();
     if args.check || args.scrape {
         let (config, check_mode) = (&config, args.check);
@@ -220,7 +221,8 @@ async fn main() -> anyhow::Result<ExitCode> {
     })
     .with_alt_speed(alt_limits, alt_schedule)
     .with_queue_limits(queue_limits)
-    .with_tag_settings(tag_settings);
+    .with_tag_settings(tag_settings)
+    .with_tag_directories(tag_directories);
     let mut sources = args.torrents;
     // The watch directory keeps its copies of .torrent files in the
     // session's store, or else in the state directory even though the
