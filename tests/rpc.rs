@@ -2,6 +2,7 @@
 
 use rtrnt::manager::Command;
 use rtrnt::rpc::{self, Action, Response};
+use rtrnt::tui::Feed;
 use std::time::Duration;
 
 #[tokio::test]
@@ -65,6 +66,29 @@ async fn headless_daemon_stays_alive_empty_and_stops_over_rpc() {
         serde_json::from_slice::<Response>(&cli.stdout).unwrap(),
         Response::Snapshot(_)
     ));
+    let (mut attached, _) = rpc::RemoteFeed::connect(&socket).await.unwrap();
+    assert!(attached.command(Command::SetRateLimits(123, 45)));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Response::Snapshot(next) =
+                rpc::request(&socket, Action::Snapshot { selected: None })
+                    .await
+                    .unwrap()
+                && next.session.rate_limits == (123, 45)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("attached command did not reach the engine");
+    assert!(!attached.command(Command::Stop));
+    drop(attached);
+    assert!(
+        daemon.try_wait().unwrap().is_none(),
+        "detaching stopped daemon"
+    );
     assert!(matches!(
         rpc::request(
             &socket,

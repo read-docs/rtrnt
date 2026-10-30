@@ -59,7 +59,7 @@ pub(crate) struct Args {
     #[arg(long, conflicts_with_all = ["tui", "check", "scrape", "print_config"])]
     pub(crate) json: bool,
     /// Run headless until stopped, keeping the session and serving local RPC
-    #[arg(long, conflicts_with_all = ["attach", "tui", "check", "scrape", "print_config", "rpc_request"])]
+    #[arg(long, conflicts_with_all = ["attach", "tui", "check", "scrape", "print_config", "rpc_request", "json"])]
     pub(crate) daemon: bool,
     /// Attach the terminal UI to an existing daemon; q detaches
     #[arg(long, conflicts_with_all = ["daemon", "torrents", "check", "scrape", "print_config", "json", "rpc_request"])]
