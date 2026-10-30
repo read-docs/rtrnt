@@ -13,6 +13,7 @@ use crate::download::{DownloadConfig, SeedLimits};
 use crate::peer;
 use crate::queue::QueueLimits;
 use crate::resume;
+use crate::rss::{self, Subscription};
 use anyhow::{Context, Result, bail};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer};
@@ -86,6 +87,12 @@ impl ToToml for f64 {
 impl ToToml for SocketAddr {
     fn to_toml(&self) -> String {
         toml::Value::from(self.to_string()).to_string()
+    }
+}
+
+impl ToToml for Vec<Subscription> {
+    fn to_toml(&self) -> String {
+        rss::to_toml(self)
     }
 }
 
@@ -282,6 +289,12 @@ options! {
     /// or private address [default: off]
     #[arg(long, value_name = "ADDR")]
     metrics_listen: SocketAddr = Unset("off");
+    /// The RSS and Atom feeds to add torrents from: a list of `[[rss]]`
+    /// tables with `url`, `match` (regular expressions on the title),
+    /// and optionally `interval` (minutes, at least 5, default 15),
+    /// `exclude` and `paused`.
+    #[arg(skip)]
+    rss: Vec<Subscription> = Unset("none");
 }
 
 /// Whether `ratio` is a valid seed ratio: a finite number, 0 or more.

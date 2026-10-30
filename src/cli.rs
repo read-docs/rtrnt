@@ -226,7 +226,7 @@ impl Args {
         if self.torrents.is_empty() && !use_tui && !watching && !self.print_config {
             return Err(Self::command().error(
                 ErrorKind::MissingRequiredArgument,
-                "a torrent is needed, unless the terminal UI is on or a watch directory is set to add one",
+                "a torrent is needed, unless the terminal UI is on or a watch directory or RSS feed is set to add one",
             ));
         }
         Ok(())

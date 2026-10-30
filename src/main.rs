@@ -14,6 +14,7 @@ use rtrnt::download::{self, DownloadConfig};
 use rtrnt::magnet;
 use rtrnt::manager::{Command, EXIT_INTERRUPTED, Manager, Recheck, StartOptions};
 use rtrnt::metrics;
+use rtrnt::rss::{self, HttpFetcher, Poller, Seen};
 use rtrnt::session::{self, SavedSession, SessionStore};
 use rtrnt::source::Source;
 use rtrnt::tui::log_buffer::LogBuffer;
@@ -56,9 +57,9 @@ async fn main() -> anyhow::Result<ExitCode> {
     let file = config::load(args.config.as_deref());
     let terminals = || std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
     let file_tui = file.as_ref().ok().and_then(|file| file.options.tui);
-    let file_watches = file
-        .as_ref()
-        .is_ok_and(|file| file.options.watch_dir.is_some());
+    let file_watches = file.as_ref().is_ok_and(|file| {
+        file.options.watch_dir.is_some() || file.options.rss.as_ref().is_some_and(|f| !f.is_empty())
+    });
     let use_tui = args.use_tui(file_tui, terminals);
     let watching = args.settings.watch_dir.is_some() || file_watches;
     if let Err(e) = args.check_torrents(use_tui, watching) {
@@ -150,6 +151,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     let (alt_limits, alt_schedule) = effective.alt_speed();
     let queue_limits = effective.queue_limits();
     let metrics_listen = effective.metrics_listen;
+    let rss_feeds = effective.rss.clone().unwrap_or_default();
     let config = effective.into_download_config();
     if args.check || args.scrape {
         let (config, check_mode) = (&config, args.check);
@@ -191,6 +193,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     // session's store, or else in the state directory even though the
     // session is not kept, so the renamed original is not needed.
     let watch_store = store.clone().or_else(SessionStore::in_state_dir);
+    let rss_store = watch_store.clone();
     if let Some(store) = store {
         manager = manager.with_session(store);
         // The session's torrents first, then the command line's.
@@ -209,7 +212,7 @@ async fn main() -> anyhow::Result<ExitCode> {
             })
             .await;
     }
-    if use_tui || watch_dir.is_some() {
+    if use_tui || watch_dir.is_some() || !rss_feeds.is_empty() {
         manager.expect_more();
     }
     let options = StartOptions {
@@ -236,9 +239,25 @@ async fn main() -> anyhow::Result<ExitCode> {
         // It lets go of its sender when Ctrl-C comes, so the run can end.
         tokio::spawn(watcher.run(Arc::clone(&shutdown).signal()));
     }
+    if !rss_feeds.is_empty() {
+        info!(feeds = rss_feeds.len(), "following RSS feeds");
+        if rss_store.is_none() {
+            warn!("no state directory, so RSS items that are .torrent files are skipped");
+        }
+        let poller = Poller::new(
+            rss_feeds,
+            HttpFetcher,
+            rss_store,
+            Seen::load(rss::seen_path()),
+            commands.clone(),
+            Arc::clone(client.stats()),
+        );
+        // It lets go of its sender when Ctrl-C comes, so the run can end.
+        tokio::spawn(poller.run(Arc::clone(&shutdown).signal()));
+    }
     if !use_tui {
-        // Only the watcher, if there is one, sends commands: without it the
-        // run ends with the last torrent.
+        // Only the watcher and the RSS poller, if there are any, send
+        // commands: without them the run ends with the last torrent.
         drop(commands);
         let report = args.json.then(|| {
             let (done, stop) = oneshot::channel::<()>();

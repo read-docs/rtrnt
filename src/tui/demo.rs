@@ -650,7 +650,7 @@ impl Feed for DemoFeed {
             Command::MoveUp(_) | Command::MoveDown(_) => {
                 self.notice = Some((Instant::now(), "the demo has no queue".into()));
             }
-            Command::Add(source) => {
+            Command::Add(source) | Command::AddPaused(source) => {
                 let text = format!("cannot add {}: the demo adds nothing", source.label());
                 self.notice = Some((Instant::now(), text));
             }
