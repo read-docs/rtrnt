@@ -179,10 +179,13 @@ impl Session {
 
 /// The selection a run of a torrent of `file_count` files starts with:
 /// the one in `options`, else the one made of the files picked on the
-/// command line, else the one in the resume file, else all `Normal`.
+/// command line, else the one in the resume file, else the one made of the
+/// files a magnet link's `so` names (BEP 53, `link_picks`), else all
+/// `Normal`.
 pub(crate) fn initial_selection(
     options: &StartOptions,
     resume: Option<&Target>,
+    link_picks: Option<&selection::FilePicks>,
     file_count: usize,
 ) -> FileSelection {
     options
@@ -192,25 +195,33 @@ pub(crate) fn initial_selection(
             options
                 .picks
                 .as_ref()
-                .and_then(|picks| picked(picks, file_count))
+                .and_then(|picks| picked(picks, "--select-file", 1, file_count))
         })
         .or_else(|| resume.and_then(|target| resume::load_selection(target, file_count)))
+        .or_else(|| link_picks.and_then(|picks| picked(picks, "so=", 0, file_count)))
         .unwrap_or_default()
 }
 
 /// The selection that downloads the files `picks` names of a torrent of
-/// `file_count` files. A number past the last file is warned of; if none
-/// is left, so is that every file is downloaded, and there is no selection.
-fn picked(picks: &selection::FilePicks, file_count: usize) -> Option<FileSelection> {
+/// `file_count` files; `origin` says where they were named, and `base` is
+/// the number of the first file there. A number past the last file is warned
+/// of; if none is left, so is that every file is downloaded, and there is no
+/// selection.
+fn picked(
+    picks: &selection::FilePicks,
+    origin: &str,
+    base: usize,
+    file_count: usize,
+) -> Option<FileSelection> {
     if picks.last() > file_count {
         warn!(
-            "--select-file names file {}, but the torrent has {file_count}",
-            picks.last()
+            "{origin} names file {}, but the torrent has {file_count}",
+            picks.last() - 1 + base
         );
     }
     let selection = picks.selection(file_count);
     if selection.is_all_skipped() {
-        warn!("--select-file names none of the files; downloading all of them");
+        warn!("{origin} names none of the files; downloading all of them");
         return None;
     }
     Some(selection)
@@ -302,6 +313,7 @@ async fn download_loaded(
     let selection = initial_selection(
         options,
         resume.as_ref(),
+        None,
         selection::file_count(&torrent.info),
     );
     let storage =
@@ -574,7 +586,7 @@ mod tests {
             ..StartOptions::default()
         };
         assert_eq!(
-            initial_selection(&options, None, 3).priorities(),
+            initial_selection(&options, None, None, 3).priorities(),
             [Skip, Normal, Skip]
         );
         // Picks past the last file leave nothing to download, so all of it.
@@ -582,12 +594,40 @@ mod tests {
             picks: Some(selection::FilePicks::parse("7").unwrap()),
             ..StartOptions::default()
         };
-        assert!(initial_selection(&none, None, 3).is_empty());
+        assert!(initial_selection(&none, None, None, 3).is_empty());
         // An explicit selection wins.
         let both = StartOptions {
             selection: Some(FileSelection::all_normal(3)),
             ..options
         };
-        assert!(initial_selection(&both, None, 3).is_all_normal());
+        assert!(initial_selection(&both, None, None, 3).is_all_normal());
+    }
+
+    #[test]
+    fn a_magnet_links_files_are_the_last_resort() {
+        use crate::selection::Priority::{Normal, Skip};
+        let (so, _) = selection::FilePicks::parse_indices("0,2");
+        let plain = StartOptions::default();
+        assert_eq!(
+            initial_selection(&plain, None, Some(&so), 3).priorities(),
+            [Normal, Skip, Normal]
+        );
+        // The command line's picks and an explicit selection win.
+        let picks = StartOptions {
+            picks: Some(selection::FilePicks::parse("2").unwrap()),
+            ..StartOptions::default()
+        };
+        assert_eq!(
+            initial_selection(&picks, None, Some(&so), 3).priorities(),
+            [Skip, Normal, Skip]
+        );
+        let explicit = StartOptions {
+            selection: Some(FileSelection::all_normal(3)),
+            ..picks
+        };
+        assert!(initial_selection(&explicit, None, Some(&so), 3).is_all_normal());
+        // Indices past the last file pick nothing, so all of it.
+        let (far, _) = selection::FilePicks::parse_indices("9");
+        assert!(initial_selection(&plain, None, Some(&far), 3).is_empty());
     }
 }

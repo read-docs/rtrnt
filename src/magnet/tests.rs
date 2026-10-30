@@ -50,6 +50,7 @@ fn parses_name_trackers_and_peers() {
                 "10.0.0.1:6881".parse().unwrap(),
                 "[2001:db8::1]:51413".parse().unwrap(),
             ],
+            select_only: None,
         }
     );
     assert_eq!(
@@ -126,4 +127,51 @@ fn tells_magnet_links_from_paths() {
     assert!(!is_magnet("./magnet:x"));
     assert!(!is_magnet("file.torrent"));
     assert!(!is_magnet("mägnet:"));
+}
+
+#[test]
+fn reads_the_files_of_so_from_0_with_ranges() {
+    let so = |value: &str| {
+        MagnetLink::parse(&format!("magnet:?xt=urn:btih:{HEX}&so={value}"))
+            .unwrap()
+            .select_only
+    };
+    let picked = so("0,2,4-6").unwrap();
+    // Counted from 0 in the link, from 1 in a `FilePicks`.
+    assert_eq!(picked, FilePicks::parse("1,3,5-7").unwrap());
+    // Junk items are left out, the rest is kept.
+    assert_eq!(
+        so("1,x,-,3-2,,-4,2-").unwrap(),
+        FilePicks::parse("2").unwrap()
+    );
+    assert_eq!(
+        so("99999999999999999999999,1").unwrap(),
+        FilePicks::parse("2").unwrap()
+    );
+    // Nothing valid is no selection; no `so` is none either.
+    assert_eq!(so("junk"), None);
+    assert_eq!(so(""), None);
+    let bare = MagnetLink::parse(&format!("magnet:?xt=urn:btih:{HEX}")).unwrap();
+    assert_eq!(bare.select_only, None);
+    // An index past the last file is kept; the torrent's file count
+    // decides at the metadata (see `download::initial_selection`).
+    assert_eq!(so("500").unwrap().last(), 501);
+    // Repeated `so` parameters add up.
+    let twice = MagnetLink::parse(&format!("magnet:?xt=urn:btih:{HEX}&so=0&so=2-3")).unwrap();
+    assert_eq!(twice.select_only.unwrap().to_indices(), "0,2-3");
+}
+
+#[test]
+fn writes_so_back_merged_and_in_order() {
+    let uri = format!("magnet:?xt=urn:btih:{HEX}&so=5,0,1,2,7-9,8");
+    let link = MagnetLink::parse(&uri).unwrap();
+    assert!(
+        link.to_uri().ends_with("&so=0-2%2C5%2C7-9"),
+        "{}",
+        link.to_uri()
+    );
+    let again = MagnetLink::parse(&link.to_uri()).unwrap();
+    assert_eq!(again.to_uri(), link.to_uri());
+    let plain = MagnetLink::parse(&format!("magnet:?xt=urn:btih:{HEX}")).unwrap();
+    assert!(!plain.to_uri().contains("so="));
 }

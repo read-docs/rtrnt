@@ -213,3 +213,14 @@ fn sequential_ranks_are_a_permutation() {
     sorted.sort();
     assert_eq!(sorted, (0..6).collect::<Vec<_>>());
 }
+
+#[test]
+fn indices_count_from_0_and_report_what_they_reject() {
+    let (picks, rejected) = FilePicks::parse_indices("0,2,4-6,x,5-3");
+    assert_eq!(rejected, ["x", "5-3"]);
+    assert_eq!(
+        picks.selection(8).priorities(),
+        [Normal, Skip, Normal, Skip, Normal, Normal, Normal, Skip]
+    );
+    assert_eq!(picks.to_indices(), "0,2,4-6");
+}
