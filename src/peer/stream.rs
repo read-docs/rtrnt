@@ -146,6 +146,12 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PeerStream<S> {
         }
         let room = MAX_UNSENT - (this.unsent.len() - this.unsent_pos);
         let n = data.len().min(room);
+        // Keep the allocation bounded even if the transport repeatedly
+        // writes only part of the buffered ciphertext.
+        if this.unsent_pos > 0 {
+            this.unsent.drain(..this.unsent_pos);
+            this.unsent_pos = 0;
+        }
         let start = this.unsent.len();
         this.unsent.extend_from_slice(&data[..n]);
         if let Some(cipher) = &mut this.cipher {
@@ -188,7 +194,7 @@ mod tests {
         let (a_to_b_too, b_to_a_too) = pair();
         let mut a = PeerStream::encrypted(a, Vec::new(), b_to_a, a_to_b);
         let mut b = PeerStream::encrypted(b, b"early ".to_vec(), a_to_b_too, b_to_a_too);
-        let message: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
+        let message: Vec<u8> = (0..256_000u32).map(|i| i as u8).collect();
         let sent = message.clone();
         let writer = tokio::spawn(async move {
             a.write_all(&sent).await.unwrap();
@@ -201,6 +207,44 @@ mod tests {
         assert_eq!(&received[6..], &message[..]);
         let a = writer.await.unwrap();
         assert!(a.is_encrypted());
+    }
+
+    /// Makes progress without ever draining an entire encrypted buffer.
+    #[derive(Default)]
+    struct PartialWriter(bool);
+
+    impl AsyncWrite for PartialWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.0 = !self.0;
+            if self.0 {
+                Poll::Ready(Ok(data.len().min(1)))
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_writes_keep_the_ciphertext_buffer_bounded() {
+        let (read, write) = pair();
+        let mut stream = PeerStream::encrypted(PartialWriter::default(), Vec::new(), read, write);
+        for _ in 0..300 {
+            let _ = stream.write(&[0xab; 1024]).await.unwrap();
+            assert!(stream.unsent.len() <= MAX_UNSENT);
+        }
     }
 
     #[tokio::test]
