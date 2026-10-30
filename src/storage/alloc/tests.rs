@@ -126,3 +126,42 @@ fn preallocate_is_named_as_in_the_config_file() {
     assert_eq!(Preallocate::Sparse.as_str(), "sparse");
     assert_eq!(Preallocate::Full.as_str(), "full");
 }
+
+#[cfg(unix)]
+#[test]
+fn full_preallocation_materializes_an_existing_sparse_file_without_losing_data() {
+    let dir = tempfile::tempdir().unwrap();
+    // Larger than the filesystem's speculative allocation after a tiny write.
+    let length = 16 * 1024 * 1024;
+    let mut info = info_of(&[BIG]);
+    info.files.as_mut().unwrap()[0].length = length;
+    info.piece_length = BIG;
+    info.pieces = ByteBuf::from(vec![0; (length / BIG) as usize * 20]);
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("f0");
+    std::fs::write(&path, b"verified").unwrap();
+    OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(length)
+        .unwrap();
+    assert!(
+        allocated(&path) < length,
+        "filesystem did not create a sparse fixture"
+    );
+    let full = Storage::with_preallocate(
+        &info,
+        dir.path(),
+        &FileSelection::default(),
+        Preallocate::Full,
+    )
+    .unwrap();
+    assert!(
+        allocated(&path) >= length,
+        "existing holes were not reserved"
+    );
+    assert_eq!(full.read_at(0, 8).unwrap(), b"verified");
+    assert_eq!(full.read_at(length / 2, 8).unwrap(), [0; 8]);
+}

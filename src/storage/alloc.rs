@@ -36,11 +36,22 @@ impl Preallocate {
 /// exactly that long. `current` is its size now. Data already in the file
 /// is kept. A disk without room fails with `ErrorKind::StorageFull`.
 pub(super) fn reserve(file: &File, current: u64, length: u64) -> io::Result<()> {
-    if current < length && !reserve_natively(file, current, length)? {
-        // Zeros only over the new tail: what was there before may be data
-        // from an earlier run.
+    if length > 0 && !reserve_natively(file, current, length)? {
         file.set_len(length)?;
-        zero_fill(file, current, length)?;
+        if current == 0 {
+            zero_fill(file, 0, length)?;
+        } else {
+            // An existing sparse file can already have its final logical
+            // length. Materialize its holes without changing verified data.
+            let mut buffer = vec![0; ZERO_CHUNK];
+            let mut offset = 0;
+            while offset < length {
+                let count = (length - offset).min(ZERO_CHUNK as u64) as usize;
+                super::read_exact_at(file, &mut buffer[..count], offset)?;
+                super::write_all_at(file, &buffer[..count], offset)?;
+                offset += count as u64;
+            }
+        }
     }
     if file.metadata()?.len() != length {
         file.set_len(length)?;
@@ -67,7 +78,15 @@ fn reserve_natively(file: &File, _current: u64, length: u64) -> io::Result<bool>
 #[cfg(target_os = "macos")]
 fn reserve_natively(file: &File, current: u64, length: u64) -> io::Result<bool> {
     use std::os::fd::AsRawFd;
-    // Reserves past the end of the file, which is where `current` is.
+    if current > 0 {
+        // F_PREALLOCATE reserves beyond physical EOF, rather than filling
+        // existing holes. Skip work only when the file is already allocated;
+        // otherwise use the data-preserving fallback above.
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        return Ok(current <= length && metadata.blocks().saturating_mul(512) >= length);
+    }
+    // The empty file's entire extent can be reserved natively.
     let want =
         libc::off_t::try_from(length - current).map_err(|_| io::Error::other("file too large"))?;
     let mut store = libc::fstore_t {

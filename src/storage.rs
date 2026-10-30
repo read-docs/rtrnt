@@ -207,6 +207,7 @@ impl Storage {
             // Keep existing contents so a resume can reuse them.
             let handle = OpenOptions::new()
                 .create(true)
+                .read(preallocate == Preallocate::Full)
                 .write(true)
                 .truncate(false)
                 .open(&file.path)
