@@ -44,7 +44,8 @@ const MAX_MESSAGES_PER_BLOCK: usize = 16;
 /// until the torrent is complete, the queue is closed or the peer fails.
 /// Reaches the peer at `addr` over `link`. `listen_port` is where we accept
 /// peers, if anywhere. `pieces_done` counts the pieces this peer delivered
-/// first, even on error.
+/// first, even on error, and `encrypted` is set to whether the connection
+/// is encrypted once the handshake is done.
 pub(super) async fn peer_worker(
     session: &Session,
     swarm: &Swarm,
@@ -52,6 +53,7 @@ pub(super) async fn peer_worker(
     link: Link,
     listen_port: Option<u16>,
     pieces_done: &mut usize,
+    encrypted: &mut Option<bool>,
 ) -> Result<()> {
     let Swarm {
         queue,
@@ -81,11 +83,14 @@ pub(super) async fn peer_worker(
         Link::Accepted(incoming) => {
             PeerConnection::answer(incoming, peer_id, num_pieces, advertised).await?
         }
-        Link::Connect => {
-            PeerConnection::connect(addr, info_hash, peer_id, num_pieces, advertised).await?
+        Link::Connect { plaintext_first } => {
+            let attempts = session.encryption.attempts(plaintext_first);
+            PeerConnection::connect(addr, info_hash, peer_id, num_pieces, advertised, attempts)
+                .await?
         }
         Link::Open { conn, .. } => *conn,
     };
+    *encrypted = Some(conn.is_encrypted());
     if conn.peer_id == peer_id {
         // A tracker listed our own address.
         bail!(Misbehaved("connected to ourselves"));
@@ -97,10 +102,11 @@ pub(super) async fn peer_worker(
     // request gets a Piece or a Reject both ways, and a choke no longer
     // drops requests.
     let fast = conn.supports_fast();
-    debug!(%addr, inbound, fast, "connected");
-    let stats = Arc::new(PeerStats::new(addr, inbound));
+    let is_encrypted = conn.is_encrypted();
+    debug!(%addr, inbound, fast, encrypted = is_encrypted, "connected");
+    let stats = Arc::new(PeerStats::new(addr, inbound).with_encryption(is_encrypted));
     session.stats.add_peer(&stats);
-    let mut pex = pex.join(conn.peer_id, addr, !inbound);
+    let mut pex = pex.join(conn.peer_id, addr, !inbound, is_encrypted);
 
     // Our pieces, first thing after the handshakes (see
     // `fast::have_message`), or one Have each on a connection that heard we

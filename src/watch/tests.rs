@@ -27,6 +27,7 @@ fn client() -> Arc<Client> {
         max_download_rate: 0,
         max_upload_rate: 0,
         completion_hook: None,
+        encryption: crate::peer::Encryption::Off,
         resume_dir: None,
     };
     Arc::new(Client::new(

@@ -3,6 +3,7 @@ use crate::dht::Dht;
 use crate::hook::Completion;
 use crate::listener::Listener;
 use crate::manager::{Recheck, StartOptions};
+use crate::peer::Encryption;
 use crate::rate_limit::RateLimits;
 use crate::resume::{self, Target};
 use crate::selection::{self, FileSelection, Priority};
@@ -92,6 +93,8 @@ pub struct DownloadConfig {
     /// Command to run when a torrent finishes downloading: the program and
     /// its arguments (see `hook`); `None` for none.
     pub completion_hook: Option<Vec<String>>,
+    /// Whether connections to peers are encrypted (see `peer::mse`).
+    pub encryption: Encryption,
     /// Directory the resume files (see `resume`) are kept in, or `None` to
     /// keep none.
     pub resume_dir: Option<PathBuf>,
@@ -159,6 +162,8 @@ pub struct Session {
     /// Whether peers that connect while we have every piece are super-
     /// seeded (see `superseed`).
     pub super_seed: bool,
+    /// Whether connections to peers are encrypted (see `peer::mse`).
+    pub encryption: Encryption,
 }
 
 impl Session {
@@ -357,6 +362,7 @@ async fn download_loaded(
         stats: Arc::clone(stats),
         completion,
         super_seed: config.super_seed,
+        encryption: config.encryption,
     });
 
     let mut shutdown = std::pin::pin!(shutdown);
@@ -506,7 +512,8 @@ pub async fn download_from_peers(
 ) -> Result<()> {
     let mut start = StartPeers::default();
     start.pool.add(peers.iter().copied());
-    let incoming = Listener::start(listeners, Arc::default()).register(session.info_hash)?;
+    let incoming = Listener::start(listeners, Arc::default(), session.encryption)
+        .register(session.info_hash)?;
     // Slots of its own, as many as the peers it may have.
     let limits = Limits {
         max_peers,

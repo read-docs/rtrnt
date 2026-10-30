@@ -7,7 +7,7 @@ use crate::download::{self, ConnectedPeers, Misbehaved};
 use crate::listener::Registration;
 use crate::magnet::FetchInterrupted;
 use crate::peer::extension::{Advertised, UT_METADATA, UT_METADATA_ID};
-use crate::peer::{Incoming, PeerConnection, PeerMessage, ProtocolViolation};
+use crate::peer::{Encryption, Incoming, PeerConnection, PeerMessage, ProtocolViolation, Wire};
 use crate::stats::{PeerSource, TorrentState, TorrentStats};
 use crate::tracker::announcer::{Announcer, Transferred};
 use anyhow::{Context, Result, anyhow, bail};
@@ -82,6 +82,8 @@ pub(crate) struct MetadataFetch<'a> {
     pub dht: Option<DhtSearch>,
     /// Told how the fetch is going, and where peers come from.
     pub stats: Arc<TorrentStats>,
+    /// Whether connections to peers are encrypted.
+    pub encryption: Encryption,
 }
 
 /// A fetched info dictionary, and the peers to carry on downloading from.
@@ -96,6 +98,14 @@ pub(crate) struct Fetched {
     pub pool: PeerPool,
     /// Addresses of incoming peers that misbehaved.
     pub banned_ips: HashSet<IpAddr>,
+}
+
+/// How a metadata worker reaches its peer.
+enum Reach {
+    /// By answering the handshake of a peer that connected to us.
+    Answer(Incoming),
+    /// By connecting to it, greeting it in each of these ways in turn.
+    Connect(&'static [Wire]),
 }
 
 /// How a metadata worker ended: with the connection, ready for the
@@ -182,6 +192,7 @@ impl MetadataFetch<'_> {
             announcer,
             mut dht,
             stats,
+            encryption,
         } = self;
         let shared = Arc::new(Shared {
             assembly: Mutex::new(Assembly::new(info_hash)),
@@ -197,12 +208,9 @@ impl MetadataFetch<'_> {
             outbound: HashSet::new(),
         };
         let mut workers = JoinSet::new();
-        let spawn = |workers: &mut JoinSet<WorkerExit>,
-                     addr,
-                     peer: Option<Incoming>,
-                     permit: SlotPermit| {
+        let spawn = |workers: &mut JoinSet<WorkerExit>, addr, peer: Reach, permit: SlotPermit| {
             let shared = Arc::clone(&shared);
-            let inbound = peer.is_some();
+            let inbound = matches!(peer, Reach::Answer(_));
             let worker = async move {
                 // Kept for the download if the worker succeeds, and given
                 // back at once if it fails.
@@ -239,7 +247,8 @@ impl MetadataFetch<'_> {
                 };
                 asked = None;
                 peers.outbound.insert(addr);
-                spawn(&mut workers, addr, None, permit);
+                let attempts = encryption.attempts(peers.pool.plaintext_first(addr));
+                spawn(&mut workers, addr, Reach::Connect(attempts), permit);
             }
             let retry_at = peers
                 .pool
@@ -283,7 +292,7 @@ impl MetadataFetch<'_> {
                     } else if let Some(permit) = slots.try_acquire() {
                         asked = None;
                         stats.add_source(PeerSource::Incoming, 1);
-                        spawn(&mut workers, addr, Some(peer), permit);
+                        spawn(&mut workers, addr, Reach::Answer(peer), permit);
                     } else {
                         debug!(%addr, "turning away incoming peer: no free connection slot");
                     }
@@ -354,7 +363,7 @@ impl MetadataFetch<'_> {
 }
 
 /// Connects to `addr`, or, given the connection the peer opened to us,
-/// answers its handshake, and fetches metadata pieces from it until the
+/// answers its handshake, as `peer` says, and fetches metadata pieces from it until the
 /// metadata is complete. Returns the connection then, for the download to
 /// carry on with.
 async fn fetch_from_peer(
@@ -362,10 +371,10 @@ async fn fetch_from_peer(
     info_hash: [u8; 20],
     peer_id: [u8; 20],
     addr: SocketAddr,
-    peer: Option<Incoming>,
+    peer: Reach,
     listen_port: Option<u16>,
 ) -> Result<PeerConnection> {
-    let inbound = peer.is_some();
+    let inbound = matches!(peer, Reach::Answer(_));
     // Whether the torrent is private is not known yet, but magnet links for
     // private torrents are not a thing in practice.
     let advertised = Advertised {
@@ -374,8 +383,10 @@ async fn fetch_from_peer(
     };
     // With 0 pieces for now; their number comes with the metadata.
     let mut conn = match peer {
-        Some(peer) => PeerConnection::answer(peer, peer_id, 0, advertised).await?,
-        None => PeerConnection::connect(addr, info_hash, peer_id, 0, advertised).await?,
+        Reach::Answer(peer) => PeerConnection::answer(peer, peer_id, 0, advertised).await?,
+        Reach::Connect(attempts) => {
+            PeerConnection::connect(addr, info_hash, peer_id, 0, advertised, attempts).await?
+        }
     };
     conn.defer_pieces();
     if conn.peer_id == peer_id {

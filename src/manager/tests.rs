@@ -29,6 +29,7 @@ fn client_in(output_dir: &std::path::Path) -> Arc<Client> {
         max_download_rate: 0,
         max_upload_rate: 0,
         completion_hook: None,
+        encryption: crate::peer::Encryption::Off,
         resume_dir: None,
     };
     Arc::new(Client::new(
@@ -1217,6 +1218,7 @@ async fn a_paused_torrent_keeps_the_choice_of_files_in_its_resume_file() {
             max_download_rate: 0,
             max_upload_rate: 0,
             completion_hook: None,
+            encryption: crate::peer::Encryption::Off,
             resume_dir: Some(state.path().to_path_buf()),
         },
         MultiProgress::with_draw_target(ProgressDrawTarget::hidden()),

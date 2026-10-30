@@ -97,6 +97,27 @@ fn due_retries_queue_behind_fresh_peers_in_due_order() {
 }
 
 #[test]
+fn remembers_peers_reached_in_plaintext_until_pex_says_they_encrypt() {
+    let mut pool = PeerPool::default();
+    pool.add([addr(1), addr(2)]);
+    assert!(!pool.plaintext_first(addr(1)));
+    pool.reached(addr(1), false);
+    pool.reached(addr(2), false);
+    assert!(pool.plaintext_first(addr(1)));
+    pool.reached(addr(2), true);
+    assert!(!pool.plaintext_first(addr(2)));
+    // Peer exchange flags addr(1) as encrypting, and adds addr(3).
+    pool.add_with_encryption([(addr(1), true), (addr(3), false)]);
+    assert!(!pool.plaintext_first(addr(1)));
+    assert!(!pool.plaintext_first(addr(3)));
+    assert_eq!(pool.len(), 3);
+    // An unflagged mention changes nothing.
+    pool.reached(addr(1), false);
+    pool.add_with_encryption([(addr(1), false)]);
+    assert!(pool.plaintext_first(addr(1)));
+}
+
+#[test]
 fn leaves_out_blocklisted_peers() {
     let (list, _) = Blocklist::parse("10.0.0.0/8\n2001:db8::/32\n");
     let mut pool = PeerPool::with_blocklist(Arc::new(list));

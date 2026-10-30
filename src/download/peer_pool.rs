@@ -30,6 +30,9 @@ struct PeerState {
     /// Failures since the peer last delivered a piece.
     failures: u32,
     banned: bool,
+    /// Whether the peer was last reached in plain BitTorrent, though
+    /// encryption was tried (see `Encryption::attempts`).
+    plaintext: bool,
 }
 
 impl PeerPool {
@@ -53,6 +56,32 @@ impl PeerPool {
                 self.ready.push_back(addr);
             }
         }
+    }
+
+    /// Adds peers as `add` does, each with whether peer exchange says it
+    /// supports encryption: those that do are tried encrypted first again,
+    /// even if last reached in plaintext, as libtorrent does.
+    pub(crate) fn add_with_encryption(
+        &mut self,
+        peers: impl IntoIterator<Item = (SocketAddr, bool)>,
+    ) {
+        for (addr, encryption) in peers {
+            self.add([addr]);
+            if encryption && let Some(state) = self.known.get_mut(&addr) {
+                state.plaintext = false;
+            }
+        }
+    }
+
+    /// Whether to greet `addr` in plaintext before trying encryption: it
+    /// was last reached that way.
+    pub(crate) fn plaintext_first(&self, addr: SocketAddr) -> bool {
+        self.known.get(&addr).is_some_and(|state| state.plaintext)
+    }
+
+    /// Records how we last reached `addr`: encrypted or not.
+    pub(crate) fn reached(&mut self, addr: SocketAddr, encrypted: bool) {
+        self.known.entry(addr).or_default().plaintext = !encrypted;
     }
 
     /// Takes the next peer to connect to, if any is ready at `now`.

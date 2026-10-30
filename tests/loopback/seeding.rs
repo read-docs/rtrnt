@@ -378,6 +378,7 @@ async fn seeds_a_download_that_is_already_complete() {
         max_download_rate: 0,
         max_upload_rate: 0,
         completion_hook: None,
+        encryption: rtrnt::peer::Encryption::Off,
         resume_dir: None,
     };
     tokio::time::timeout(

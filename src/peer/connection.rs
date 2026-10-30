@@ -8,8 +8,8 @@ use tokio::time::{Duration, Instant, timeout};
 use tracing::debug;
 
 use super::{
-    HANDSHAKE_TIMEOUT, Handshake, Incoming, KEEPALIVE_INTERVAL, MAX_FRAME, PeerMessage,
-    handshake_bytes, parse_handshake,
+    Encryption, HANDSHAKE_TIMEOUT, Handshake, Incoming, KEEPALIVE_INTERVAL, MAX_FRAME, PeerMessage,
+    PeerStream, Transport, Wire, handshake_bytes, mse, parse_handshake,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -34,7 +34,7 @@ impl std::fmt::Display for ProtocolViolation {
 impl std::error::Error for ProtocolViolation {}
 
 pub struct PeerConnection {
-    socket: TcpStream,
+    socket: PeerStream<Transport>,
     read_buf: BytesMut,
     pub addr: SocketAddr,
     pub peer_id: [u8; 20],
@@ -95,28 +95,39 @@ impl PeerConnection {
     /// the metadata we can send (BEP 9), and whether the torrent is private,
     /// which leaves out the extensions such torrents must not use (see
     /// `extension::PUBLIC_ONLY`).
+    ///
+    /// The handshake is tried each way in `attempts` in turn (see
+    /// `Encryption::attempts`), on a new connection each time, until one
+    /// works. A peer that cannot be connected to at all is not tried again.
     pub async fn connect(
         addr: SocketAddr,
         info_hash: [u8; 20],
         peer_id: [u8; 20],
         num_pieces: usize,
         advertised: Advertised,
+        attempts: &[Wire],
     ) -> Result<Self> {
-        let mut socket = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
-            .await
-            .context("connection timed out")?
-            .context("connection failed")?;
-
-        let mut response = [0u8; 68];
-        timeout(HANDSHAKE_TIMEOUT, async {
-            socket
-                .write_all(&handshake_bytes(&info_hash, &peer_id))
-                .await?;
-            socket.read_exact(&mut response).await
-        })
-        .await
-        .context("handshake timed out")??;
-        let handshake = parse_handshake(&response, &info_hash)?;
+        let mut attempts = attempts.iter().peekable();
+        let (socket, handshake) = loop {
+            let Some(&wire) = attempts.next() else {
+                bail!("no way to greet the peer");
+            };
+            let socket = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+                .await
+                .context("connection timed out")?
+                .context("connection failed")?;
+            let result = timeout(HANDSHAKE_TIMEOUT, greet(socket, wire, &info_hash, &peer_id))
+                .await
+                .context("handshake timed out")
+                .and_then(|result| result);
+            match result {
+                Ok(greeted) => break greeted,
+                Err(e) if attempts.peek().is_some() => {
+                    debug!(%addr, ?wire, "handshake failed, trying the next way: {e:#}");
+                }
+                Err(e) => return Err(e),
+            }
+        };
         let mut conn = Self::new(socket, addr, handshake, num_pieces);
         conn.send_extension_handshake(advertised).await?;
         Ok(conn)
@@ -124,16 +135,18 @@ impl PeerConnection {
 
     /// Performs the handshake on a connection that the peer at `addr` opened
     /// to us. The peer speaks first, and we answer only if it asks for our
-    /// torrent. The extension handshake follows as in `connect`.
+    /// torrent, and greets us in a way `encryption` accepts. The extension
+    /// handshake follows as in `connect`.
     pub async fn accept(
-        socket: TcpStream,
+        socket: Transport,
         addr: SocketAddr,
         info_hash: [u8; 20],
         peer_id: [u8; 20],
         num_pieces: usize,
         advertised: Advertised,
+        encryption: Encryption,
     ) -> Result<Self> {
-        let incoming = Incoming::read(socket, addr).await?;
+        let incoming = Incoming::read(socket, addr, encryption, || vec![info_hash]).await?;
         if incoming.info_hash != info_hash {
             bail!("info hash mismatch");
         }
@@ -155,10 +168,12 @@ impl PeerConnection {
             info_hash,
             handshake,
         } = incoming;
-        timeout(
-            HANDSHAKE_TIMEOUT,
-            socket.write_all(&handshake_bytes(&info_hash, &peer_id)),
-        )
+        timeout(HANDSHAKE_TIMEOUT, async {
+            socket
+                .write_all(&handshake_bytes(&info_hash, &peer_id))
+                .await?;
+            socket.flush().await
+        })
         .await
         .context("handshake timed out")??;
         // Our own outgoing connection, to an address a tracker listed. Having
@@ -171,7 +186,12 @@ impl PeerConnection {
         Ok(conn)
     }
 
-    fn new(socket: TcpStream, addr: SocketAddr, handshake: Handshake, num_pieces: usize) -> Self {
+    fn new(
+        socket: PeerStream<Transport>,
+        addr: SocketAddr,
+        handshake: Handshake,
+        num_pieces: usize,
+    ) -> Self {
         Self {
             socket,
             read_buf: BytesMut::with_capacity(32 * 1024),
@@ -271,6 +291,11 @@ impl PeerConnection {
         Ok(())
     }
 
+    /// Whether the connection is encrypted (MSE with RC4).
+    pub fn is_encrypted(&self) -> bool {
+        self.socket.is_encrypted()
+    }
+
     /// Whether the peer runs a DHT node, and so wants our `Port` message.
     pub fn supports_dht(&self) -> bool {
         self.dht
@@ -328,9 +353,12 @@ impl PeerConnection {
     /// Sends several messages in one write.
     pub async fn send_all(&mut self, messages: &[PeerMessage]) -> Result<()> {
         let bytes: Vec<u8> = messages.iter().flat_map(PeerMessage::encode).collect();
-        timeout(WRITE_TIMEOUT, self.socket.write_all(&bytes))
-            .await
-            .context("write timed out")??;
+        timeout(WRITE_TIMEOUT, async {
+            self.socket.write_all(&bytes).await?;
+            self.socket.flush().await
+        })
+        .await
+        .context("write timed out")??;
         self.last_sent = Instant::now();
         Ok(())
     }
@@ -526,4 +554,30 @@ impl PeerConnection {
         }
         Ok(())
     }
+}
+
+/// Greets the peer at the other end of `socket`, a connection we opened, in
+/// the way `wire` says, with our handshake for the torrent `info_hash`, and
+/// reads its handshake back.
+async fn greet(
+    socket: Transport,
+    wire: Wire,
+    info_hash: &[u8; 20],
+    peer_id: &[u8; 20],
+) -> Result<(PeerStream<Transport>, Handshake)> {
+    let ours = handshake_bytes(info_hash, peer_id);
+    let mut socket = match wire {
+        // Our handshake goes in the encryption handshake's initial payload.
+        Wire::Encrypted => mse::initiate(socket, info_hash, &ours).await?,
+        Wire::Plaintext => {
+            let mut socket = PeerStream::plain(socket);
+            socket.write_all(&ours).await?;
+            socket.flush().await?;
+            socket
+        }
+    };
+    let mut response = [0u8; 68];
+    socket.read_exact(&mut response).await?;
+    let handshake = parse_handshake(&response, info_hash)?;
+    Ok((socket, handshake))
 }

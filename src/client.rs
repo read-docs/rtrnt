@@ -149,8 +149,12 @@ impl Client {
     /// `Listener::bind`) from the first call on.
     pub async fn listener(&self) -> &Arc<Listener> {
         let bind = async {
-            let listener =
-                Listener::bind(self.config.listen_port, Arc::clone(&self.blocklist)).await;
+            let listener = Listener::bind(
+                self.config.listen_port,
+                Arc::clone(&self.blocklist),
+                self.config.encryption,
+            )
+            .await;
             self.stats.set_port(listener.port());
             if let Some(port) = listener.port() {
                 self.portmap.map(Protocol::Tcp, port);

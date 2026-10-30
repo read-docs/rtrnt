@@ -1,9 +1,10 @@
 use super::extension;
 use super::fast;
+use super::mse::{self, Encryption};
+use super::stream::{PeerStream, Transport};
 use anyhow::{Context, Result, bail};
 use std::net::SocketAddr;
 use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use super::HANDSHAKE_TIMEOUT;
@@ -76,7 +77,8 @@ pub fn parse_handshake(handshake: &[u8; 68], info_hash: &[u8; 20]) -> Result<Han
 /// answered yet.
 #[derive(Debug)]
 pub struct Incoming {
-    pub socket: TcpStream,
+    /// The connection, encrypted if the peer opened it with MSE.
+    pub socket: PeerStream<Transport>,
     pub addr: SocketAddr,
     /// The torrent the peer asked for.
     pub info_hash: [u8; 20],
@@ -85,15 +87,53 @@ pub struct Incoming {
 
 impl Incoming {
     /// Reads the handshake of the peer that connected to us from `addr`,
-    /// which says which torrent it wants.
-    pub async fn read(mut socket: TcpStream, addr: SocketAddr) -> Result<Self> {
+    /// which says which torrent it wants. A peer that starts with the plain
+    /// handshake's `19 "BitTorrent protocol"` speaks plain BitTorrent,
+    /// refused if `encryption` is `Require`; any other peer is taken to
+    /// start an MSE handshake, refused if `encryption` is `Off`, for one of
+    /// `torrents` (see `mse::respond`).
+    pub async fn read(
+        socket: Transport,
+        addr: SocketAddr,
+        encryption: Encryption,
+        torrents: impl FnOnce() -> Vec<[u8; 20]>,
+    ) -> Result<Self> {
+        timeout(
+            HANDSHAKE_TIMEOUT,
+            Self::read_untimed(socket, addr, encryption, torrents),
+        )
+        .await
+        .context("handshake timed out")?
+    }
+
+    async fn read_untimed(
+        mut socket: Transport,
+        addr: SocketAddr,
+        encryption: Encryption,
+        torrents: impl FnOnce() -> Vec<[u8; 20]>,
+    ) -> Result<Self> {
+        let mut first = vec![0u8; 1 + PROTOCOL.len()];
+        socket.read_exact(&mut first).await?;
+        let plaintext = usize::from(first[0]) == PROTOCOL.len() && first[1..] == PROTOCOL[..];
+        let (mut socket, encrypted_for) = match (plaintext, encryption) {
+            (true, Encryption::Require) => bail!("refusing a peer that does not encrypt"),
+            (true, _) => (PeerStream::with_unread(socket, first), None),
+            (false, Encryption::Off) => bail!("peer does not speak the BitTorrent protocol"),
+            (false, _) => {
+                let (socket, info_hash) = mse::respond(socket, first, encryption, torrents).await?;
+                (socket, Some(info_hash))
+            }
+        };
         let mut bytes = [0u8; 68];
-        timeout(HANDSHAKE_TIMEOUT, socket.read_exact(&mut bytes))
-            .await
-            .context("handshake timed out")??;
+        socket.read_exact(&mut bytes).await?;
         let mut info_hash = [0u8; 20];
         info_hash.copy_from_slice(&bytes[28..48]);
         let handshake = parse_handshake(&bytes, &info_hash)?;
+        // The torrent the encryption handshake named must be the one the
+        // handshake inside it asks for.
+        if encrypted_for.is_some_and(|encrypted_for| encrypted_for != info_hash) {
+            bail!("info hash mismatch");
+        }
         Ok(Self {
             socket,
             addr,

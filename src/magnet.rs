@@ -370,6 +370,7 @@ async fn fetch_and_download(
             .clone()
             .map(|dht| DhtSearch::new(dht, info_hash, listen_port)),
         stats: Arc::clone(stats),
+        encryption: config.encryption,
     };
     let fetched = match fetch.run(pool, &mut shutdown).await {
         Ok(fetched) => fetched,
@@ -437,6 +438,7 @@ async fn fetch_and_download(
             stats: Arc::clone(stats),
             completion,
             super_seed: config.super_seed,
+            encryption: config.encryption,
         });
         let recheck = options.recheck != Recheck::No;
         let have =
