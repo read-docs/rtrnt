@@ -40,6 +40,8 @@ pub async fn check_file(torrent_path: &Path, output_dir: &Path) -> Result<()> {
         super_seed: false,
         // No peers are connected to.
         encryption: Encryption::default(),
+        utp_policy: Default::default(),
+        utp: None,
     });
     // Nothing else is hashing, and nothing stops the check.
     let have = hash_pieces(

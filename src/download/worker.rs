@@ -85,8 +85,17 @@ pub(super) async fn peer_worker(
         }
         Link::Connect { plaintext_first } => {
             let attempts = session.encryption.attempts(plaintext_first);
-            PeerConnection::connect(addr, info_hash, peer_id, num_pieces, advertised, attempts)
-                .await?
+            PeerConnection::connect_via(
+                addr,
+                info_hash,
+                peer_id,
+                num_pieces,
+                advertised,
+                attempts,
+                session.utp.as_deref(),
+                session.utp_policy,
+            )
+            .await?
         }
         Link::Open { conn, .. } => *conn,
     };

@@ -140,8 +140,8 @@ struct VirtualSocket<T, Env> {
     // Triggers delay-based operations
     timers: Timers,
 
-    // The last seen value of uTP's "last_remote_timestamp"
-    last_remote_timestamp: u32,
+    // One-way delay measured at receipt, echoed without including ACK delay.
+    last_remote_delay: u32,
     last_remote_window: u32,
 
     // The seq_nr to use in outgoing packets. It gets incremented AFTER the
@@ -259,9 +259,7 @@ macro_rules! send_data {
             $header.seq_nr = $segment_iter_item.seq_nr();
             $header.timestamp_microseconds =
                 ($self.env.now() - $self.socket_created).as_micros() as u32;
-            $header.timestamp_difference_microseconds = $header
-                .timestamp_microseconds
-                .wrapping_sub($self.last_remote_timestamp);
+            $header.timestamp_difference_microseconds = $self.last_remote_delay;
 
             let mut h = [0u8; UTP_HEADER as usize];
             let hlen = $header.serialize(&mut h)?;
@@ -339,9 +337,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let mut header = UtpHeader::default();
         header.connection_id = self.conn_id_send;
         header.timestamp_microseconds = self.timestamp_microseconds();
-        header.timestamp_difference_microseconds = header
-            .timestamp_microseconds
-            .wrapping_sub(self.last_remote_timestamp);
+        header.timestamp_difference_microseconds = self.last_remote_delay;
         header.seq_nr = self.seq_nr;
         header.ack_nr = self.last_consumed_remote_seq_nr;
         header.wnd_size = self.rx_window();
@@ -1197,12 +1193,18 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
         self.congestion_controller
             .set_remote_window(msg.header.wnd_size as usize);
+        self.congestion_controller.on_delay(
+            self.this_poll.now,
+            msg.header.timestamp_difference_microseconds,
+        );
         self.congestion_controller.on_ack(
             self.this_poll.now,
             result.on_ack_result.acked_bytes,
             &self.rtte,
         );
-        self.last_remote_timestamp = msg.header.timestamp_microseconds;
+        self.last_remote_delay = self
+            .timestamp_microseconds()
+            .wrapping_sub(msg.header.timestamp_microseconds);
         self.last_remote_window = msg.header.wnd_size;
         #[cfg(feature = "per-connection-metrics")]
         {
@@ -1575,7 +1577,7 @@ impl<T, E> Drop for VirtualSocket<T, E> {
 pub struct StreamArgs {
     conn_id_recv: SeqNr,
     conn_id_send: SeqNr,
-    last_remote_timestamp: u32,
+    last_remote_delay: u32,
 
     seq_nr: SeqNr,
     last_sent_seq_nr: SeqNr,
@@ -1599,7 +1601,7 @@ impl StreamArgs {
         Self {
             conn_id_recv: conn_id,
             conn_id_send: conn_id + 1,
-            last_remote_timestamp: remote_ack.timestamp_microseconds,
+            last_remote_delay: 0,
             remote_window: remote_ack.wnd_size,
 
             // The next ST_DATA must be +1 from initial SYN.
@@ -1623,7 +1625,7 @@ impl StreamArgs {
         Self {
             conn_id_recv: remote_syn.connection_id + 1,
             conn_id_send: remote_syn.connection_id,
-            last_remote_timestamp: remote_syn.timestamp_microseconds,
+            last_remote_delay: 0,
             remote_window: 0, // remote_syn.wnd_size should be 0 anyway. We can't send anything first.
 
             seq_nr: next_seq_nr,
@@ -1676,7 +1678,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
         let StreamArgs {
             conn_id_recv,
             conn_id_send,
-            last_remote_timestamp,
+            last_remote_delay,
             seq_nr,
             last_sent_seq_nr,
             last_consumed_remote_seq_nr,
@@ -1739,7 +1741,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                     timer
                 },
             },
-            last_remote_timestamp,
+            last_remote_delay,
             last_remote_window: remote_window,
             seq_nr,
             last_sent_seq_nr,

@@ -50,6 +50,8 @@ type StreamRecvKey = (SocketAddr, ConnectionId);
 pub enum CongestionControllerKind {
     #[default]
     Cubic,
+    /// BEP 29 delay-based congestion control.
+    Ledbat,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -64,6 +66,9 @@ impl CongestionConfig {
         use crate::congestion::tracing::TracingController;
 
         match (self.kind, self.tracing) {
+            (CongestionControllerKind::Ledbat, _) => {
+                Box::new(crate::congestion::ledbat::Ledbat::new(now, rmss))
+            }
             (CongestionControllerKind::Cubic, true) => {
                 tracing::debug!("enabling congestion tracing");
                 Box::new(TracingController::new(Cubic::new(now, rmss)))
@@ -436,7 +441,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 let header = UtpHeader {
                     htype: Type::ST_SYN,
                     connection_id: conn_id,
-                    timestamp_microseconds: (self.env.now() - self.socket.created).as_millis()
+                    timestamp_microseconds: (self.env.now() - self.socket.created).as_micros()
                         as u32,
                     timestamp_difference_microseconds: 0,
                     wnd_size: 0,
@@ -699,6 +704,15 @@ impl<T: Transport, E: UtpEnvironment> std::fmt::Debug for UtpSocket<T, E> {
 }
 
 pub type UtpSocketUdp = UtpSocket<UdpSocket, DefaultUtpEnvironment>;
+/// A uTP socket on a custom datagram transport and the standard environment.
+pub type UtpSocketCustom<T> = UtpSocket<T, DefaultUtpEnvironment>;
+
+impl<T: Transport> UtpSocket<T, DefaultUtpEnvironment> {
+    /// Starts a dispatcher without allocating or binding a UDP socket.
+    pub fn new_custom(transport: T, opts: SocketOpts) -> crate::Result<Arc<Self>> {
+        Self::new_with_opts(transport, DefaultUtpEnvironment::default(), opts)
+    }
+}
 
 fn try_set_udp_rcvbuf(sock: &tokio::net::UdpSocket, bufsize: usize) {
     let sock = socket2::SockRef::from(&sock);

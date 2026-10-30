@@ -27,6 +27,7 @@ mod token;
 
 pub use search::DhtSearch;
 
+use crate::udp::Datagram;
 use anyhow::{Context, Result, anyhow};
 use bloom::Bloom;
 use krpc::{Body, ERROR_METHOD_UNKNOWN, ERROR_PROTOCOL, Message, Query, Response, Want};
@@ -146,6 +147,19 @@ impl Dht {
     fn start_sockets(
         socket: UdpSocket,
         socket6: Option<UdpSocket>,
+        routers: Vec<String>,
+    ) -> Result<Dht> {
+        Self::start_datagrams(
+            Datagram::direct(socket)?,
+            socket6.map(Datagram::direct).transpose()?,
+            routers,
+        )
+    }
+
+    /// Starts DHT receivers on datagrams dispatched by the shared UDP mux.
+    pub(crate) fn start_datagrams(
+        socket: Datagram,
+        socket6: Option<Datagram>,
         routers: Vec<String>,
     ) -> Result<Dht> {
         let mut tasks = Vec::new();
@@ -312,7 +326,7 @@ pub struct SwarmEstimate {
 }
 
 struct Node {
-    socket: UdpSocket,
+    socket: Datagram,
     sibling: OnceLock<Weak<Node>>,
     addr: SocketAddr,
     routers: Vec<String>,
@@ -462,11 +476,11 @@ impl Found {
 
 impl Node {
     fn start(
-        socket: UdpSocket,
+        socket: Datagram,
         routers: Vec<String>,
         tasks: &mut Vec<AbortHandle>,
     ) -> Result<Arc<Self>> {
-        let addr = socket.local_addr().context("DHT socket has no address")?;
+        let addr = socket.local_addr();
         let (verify, verify_rx) = mpsc::channel(VERIFY_QUEUE);
         let node = Arc::new(Self {
             socket,

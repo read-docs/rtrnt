@@ -13,7 +13,70 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 /// What a peer connection runs over.
-pub type Transport = TcpStream;
+pub enum Transport {
+    Tcp(TcpStream),
+    Utp(Box<librqbit_utp::UtpStream>),
+}
+
+impl std::fmt::Debug for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tcp(stream) => f.debug_tuple("Tcp").field(stream).finish(),
+            Self::Utp(stream) => f.debug_tuple("Utp").field(&stream.remote_addr()).finish(),
+        }
+    }
+}
+impl From<TcpStream> for Transport {
+    fn from(stream: TcpStream) -> Self {
+        Self::Tcp(stream)
+    }
+}
+impl From<librqbit_utp::UtpStream> for Transport {
+    fn from(stream: librqbit_utp::UtpStream) -> Self {
+        Self::Utp(Box::new(stream))
+    }
+}
+impl Transport {
+    pub fn is_utp(&self) -> bool {
+        matches!(self, Self::Utp(_))
+    }
+}
+impl AsyncRead for Transport {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Utp(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+impl AsyncWrite for Transport {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            Self::Utp(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_flush(cx),
+            Self::Utp(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Utp(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
 
 /// Most encrypted bytes kept waiting to be written before a write waits.
 const MAX_UNSENT: usize = 64 * 1024;
@@ -49,6 +112,11 @@ impl std::fmt::Debug for Ciphers {
 }
 
 impl<S> PeerStream<S> {
+    /// The underlying TCP or uTP stream.
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+
     /// A plain stream over `inner`.
     pub fn plain(inner: S) -> Self {
         Self::with_unread(inner, Vec::new())

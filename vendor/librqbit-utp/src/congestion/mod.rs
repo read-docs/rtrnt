@@ -1,4 +1,5 @@
 pub mod cubic;
+pub mod ledbat;
 pub mod tracing;
 
 use std::time::Instant;
@@ -17,6 +18,10 @@ pub trait CongestionController: Send + Sync + core::fmt::Debug {
     fn smss(&self) -> usize;
 
     fn on_recovered(&mut self, new_cwnd_bytes: usize, new_sshthresh: usize);
+
+    /// A peer's one-way-delay measurement (microseconds, modulo 2^32).
+    /// Controllers that do not use delay leave this as a no-op.
+    fn on_delay(&mut self, now: Instant, delay: u32) {}
 
     /// Increase the window on ACK
     fn on_ack(&mut self, now: Instant, len: usize, rtt: &RttEstimator);

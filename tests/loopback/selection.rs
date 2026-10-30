@@ -162,6 +162,8 @@ async fn a_skipped_file_sharing_a_piece_is_created_but_not_filled() {
         completion: None,
         super_seed: false,
         encryption: rtrnt::peer::Encryption::Off,
+        utp_policy: Default::default(),
+        utp: None,
     });
     tokio::time::timeout(
         Duration::from_secs(30),

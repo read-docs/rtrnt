@@ -17,6 +17,7 @@ use crate::resume;
 use crate::rss::{self, Subscription};
 use crate::storage::Preallocate;
 use crate::tags::{TagDirectories, TagSettings, TagTable};
+use crate::utp::Policy as UtpPolicy;
 use anyhow::{Context, Result, bail};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer};
@@ -127,6 +128,12 @@ impl ToToml for std::net::IpAddr {
 }
 
 impl ToToml for SocketAddr {
+    fn to_toml(&self) -> String {
+        toml::Value::from(self.to_string()).to_string()
+    }
+}
+
+impl ToToml for UtpPolicy {
     fn to_toml(&self) -> String {
         toml::Value::from(self.to_string()).to_string()
     }
@@ -329,6 +336,10 @@ options! {
     /// refuses encrypted ones [default: prefer]
     #[arg(long, value_name = "POLICY")]
     encryption: Encryption = Value(DEFAULT_ENCRYPTION);
+    /// Peer transport: off uses TCP, prefer tries uTP before TCP, require
+    /// accepts only uTP. uTP shares the DHT UDP port; unavailable through SOCKS5
+    #[arg(long, value_name = "POLICY")]
+    utp: UtpPolicy = Value(UtpPolicy::Off);
     /// Run a command when a torrent finishes downloading, with the name,
     /// path and info hash in $RTRNT_NAME, $RTRNT_PATH and
     /// $RTRNT_INFO_HASH. The command is run directly, not through a shell:
@@ -551,6 +562,7 @@ impl Options {
             max_upload_rate: self.max_upload_rate.unwrap_or(DEFAULT_MAX_UPLOAD_RATE),
             completion_hook: self.completion_hook,
             encryption: self.encryption.unwrap_or(DEFAULT_ENCRYPTION),
+            utp_policy: self.utp.unwrap_or_default(),
             resume_dir: resume::default_dir(
                 std::env::var_os("XDG_STATE_HOME"),
                 std::env::home_dir().as_deref(),

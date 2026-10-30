@@ -10,5 +10,7 @@ This pinned copy supports rtrnt's shared DHT/uTP UDP sockets. Local changes:
 - Public custom-transport constructor using the standard environment.
 - LEDBAT congestion control with one-way-delay samples from received headers.
 - Fixed sampled timestamp differences: record at receive time, echo unchanged.
+- SYN timestamps use microseconds, matching the other packet types.
+- Removed a deprecated module import for current Rust compiler compatibility.
 
 Upstream CUBIC remains available. rtrnt explicitly selects LEDBAT.

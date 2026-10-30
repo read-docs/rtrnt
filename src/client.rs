@@ -38,6 +38,7 @@ pub struct Client {
     hashing: Semaphore,
     bars: MultiProgress,
     listener: OnceCell<Arc<Listener>>,
+    utp: OnceCell<Option<Arc<crate::utp::Endpoint>>>,
     /// Keeps the listening ports mapped on the router.
     portmap: Portmapper,
     /// `None` if the DHT is off or could not be started.
@@ -81,6 +82,7 @@ impl Client {
             hashing: Semaphore::new(1),
             bars,
             listener: OnceCell::new(),
+            utp: OnceCell::new(),
             portmap,
             dht: OnceCell::new(),
             lsd: OnceCell::new(),
@@ -149,21 +151,59 @@ impl Client {
     /// `Listener::bind`) from the first call on.
     pub async fn listener(&self) -> &Arc<Listener> {
         let bind = async {
-            let listener = Listener::bind(
-                self.config.listen_port,
+            let tcp = if self.config.utp_policy == crate::utp::Policy::Require {
+                Vec::new()
+            } else {
+                crate::listener::listen(self.config.listen_port).await
+            };
+            let port = tcp
+                .first()
+                .and_then(|socket| socket.local_addr().ok())
+                .map_or(self.config.listen_port, |addr| addr.port());
+            let utp = self
+                .utp
+                .get_or_init(|| async {
+                    if self.config.utp_policy == crate::utp::Policy::Off
+                        || crate::network::global().proxied()
+                    {
+                        return None;
+                    }
+                    crate::utp::Endpoint::bind(
+                        port,
+                        self.config.max_connections,
+                        Arc::clone(&self.blocklist),
+                    )
+                    .await
+                    .inspect_err(|e| warn!("cannot start uTP: {e:#}"))
+                    .ok()
+                })
+                .await
+                .clone();
+            let has_tcp = !tcp.is_empty();
+            let listener = Listener::start_with_utp(
+                tcp,
                 Arc::clone(&self.blocklist),
                 self.config.encryption,
-            )
-            .await;
+                utp.clone(),
+            );
             self.stats.set_port(listener.port());
-            if let Some(port) = listener.port() {
+            if has_tcp && let Some(port) = listener.port() {
                 self.portmap.map(Protocol::Tcp, port);
+            }
+            if let Some(endpoint) = utp {
+                self.portmap.map(Protocol::Udp, endpoint.port());
             }
             listener
         };
         self.listener
             .get_or_init(|| bind.instrument(session_span()))
             .await
+    }
+
+    /// Shared uTP endpoint, initialized with the peer listener when enabled.
+    pub async fn utp(&self) -> Option<Arc<crate::utp::Endpoint>> {
+        self.listener().await;
+        self.utp.get().cloned().flatten()
     }
 
     /// Our DHT node, started on the first call (trying the port the
@@ -182,8 +222,12 @@ impl Client {
         let stats = &self.stats;
         let portmap = &self.portmap;
         let start = async move {
-            let dht = Dht::bind(port)
-                .await
+            let result = if let Some(utp) = self.utp.get().and_then(Option::as_ref) {
+                utp.dht()
+            } else {
+                Dht::bind(port).await
+            };
+            let dht = result
                 .inspect_err(|e| warn!("cannot start the DHT: {e:#}"))
                 .ok();
             if let Some(dht) = &dht {

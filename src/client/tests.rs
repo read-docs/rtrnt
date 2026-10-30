@@ -19,6 +19,7 @@ fn client(dht: bool) -> Client {
         max_upload_rate: 0,
         completion_hook: None,
         encryption: crate::peer::Encryption::Off,
+        utp_policy: Default::default(),
         resume_dir: None,
     };
     Client::new(config, MultiProgress::new())
@@ -166,4 +167,23 @@ async fn the_dht_uses_the_port_the_listener_got() {
 #[tokio::test]
 async fn no_dht_when_it_is_off() {
     assert!(client(false).dht().await.is_none());
+}
+
+#[tokio::test]
+async fn utp_and_dht_share_the_listening_udp_port() {
+    let config = crate::config::Options {
+        port: Some(0),
+        portmap: Some(false),
+        lsd: Some(false),
+        utp: Some(crate::utp::Policy::Require),
+        ..Default::default()
+    }
+    .into_download_config();
+    let client = Client::new(config, MultiProgress::new());
+    let endpoint = client.utp().await.expect("uTP unavailable");
+    assert_eq!(client.listener().await.port(), Some(endpoint.port()));
+    let dht = client.dht().await.expect("DHT unavailable");
+    assert_eq!(dht.port(), endpoint.port());
+    assert!(Arc::ptr_eq(&endpoint, &client.utp().await.unwrap()));
+    assert_eq!(client.dht().await.unwrap().port(), endpoint.port());
 }

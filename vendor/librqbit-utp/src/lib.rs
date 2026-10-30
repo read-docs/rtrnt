@@ -6,7 +6,7 @@
 //
 // rfc8985 (draft, 2021) - RACK algorithm
 
-// TODO: LEDBAT congestion control
+// LEDBAT support is maintained in rtrnt's narrow vendored patch.
 
 #[macro_use]
 mod macros;
@@ -37,8 +37,8 @@ mod utils;
 pub use error::{Error, Result};
 pub use librqbit_dualstack_sockets::BindDevice;
 pub use socket::{
-    CongestionConfig, CongestionControllerKind, SocketOpts, UtpSocket, UtpSocketUdp,
-    UtpSocketUdpOpts,
+    CongestionConfig, CongestionControllerKind, SocketOpts, UtpSocket, UtpSocketCustom,
+    UtpSocketUdp, UtpSocketUdpOpts,
 };
 pub use stream::UtpStream;
 pub use stream_rx::UtpStreamReadHalf;

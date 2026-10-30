@@ -376,6 +376,8 @@ async fn fetch_and_download(
             .map(|dht| DhtSearch::new(dht, info_hash, listen_port)),
         stats: Arc::clone(stats),
         encryption: config.encryption,
+        utp: client.utp().await,
+        utp_policy: config.utp_policy,
     };
     let fetched = match fetch.run(pool, &mut shutdown).await {
         Ok(fetched) => fetched,
@@ -445,6 +447,8 @@ async fn fetch_and_download(
             completion,
             super_seed: config.super_seed,
             encryption: config.encryption,
+            utp: client.utp().await,
+            utp_policy: config.utp_policy,
         });
         let recheck = options.recheck != Recheck::No;
         let have =

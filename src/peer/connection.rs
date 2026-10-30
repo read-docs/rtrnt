@@ -39,6 +39,7 @@ pub struct PeerConnection {
     pub peer_id: [u8; 20],
     /// Whether the peer runs a DHT node.
     dht: bool,
+    utp: bool,
     peer_choking: bool,
     peer_has: Vec<bool>,
     am_interested: bool,
@@ -106,30 +107,83 @@ impl PeerConnection {
         advertised: Advertised,
         attempts: &[Wire],
     ) -> Result<Self> {
-        let mut attempts = attempts.iter().peekable();
-        let (socket, handshake) = loop {
-            let Some(&wire) = attempts.next() else {
-                bail!("no way to greet the peer");
-            };
-            let socket = timeout(CONNECT_TIMEOUT, crate::network::global().connect(addr))
-                .await
-                .context("connection timed out")?
-                .context("connection failed")?;
-            let result = timeout(HANDSHAKE_TIMEOUT, greet(socket, wire, &info_hash, &peer_id))
-                .await
-                .context("handshake timed out")
-                .and_then(|result| result);
-            match result {
-                Ok(greeted) => break greeted,
-                Err(e) if attempts.peek().is_some() => {
-                    debug!(%addr, ?wire, "handshake failed, trying the next way: {e:#}");
-                }
-                Err(e) => return Err(e),
-            }
+        Self::connect_via(
+            addr,
+            info_hash,
+            peer_id,
+            num_pieces,
+            advertised,
+            attempts,
+            None,
+            crate::utp::Policy::Off,
+        )
+        .await
+    }
+
+    /// Connects over the requested transport policy, carrying the same
+    /// plaintext or MSE handshakes over either stream. Prefer retries TCP
+    /// only after all uTP handshake attempts fail; require never uses TCP.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_via(
+        addr: SocketAddr,
+        info_hash: [u8; 20],
+        peer_id: [u8; 20],
+        num_pieces: usize,
+        advertised: Advertised,
+        attempts: &[Wire],
+        utp: Option<&crate::utp::Endpoint>,
+        policy: crate::utp::Policy,
+    ) -> Result<Self> {
+        use crate::utp::Policy;
+        let mut last_error = None;
+        let transports: &[bool] = match policy {
+            Policy::Off => &[false],
+            Policy::Prefer => &[true, false],
+            Policy::Require => &[true],
         };
-        let mut conn = Self::new(socket, addr, handshake, num_pieces);
-        conn.send_extension_handshake(advertised).await?;
-        Ok(conn)
+        for &over_utp in transports {
+            if over_utp && utp.is_none() {
+                last_error = Some(anyhow!("uTP is required but its endpoint is unavailable"));
+                continue;
+            }
+            for &wire in attempts {
+                let socket = timeout(CONNECT_TIMEOUT, async {
+                    if over_utp {
+                        utp.context("uTP endpoint unavailable")?.connect(addr).await
+                    } else {
+                        Ok(Transport::from(
+                            crate::network::global().connect(addr).await?,
+                        ))
+                    }
+                })
+                .await
+                .context("connection timed out")
+                .and_then(|result| result);
+                let socket = match socket {
+                    Ok(socket) => socket,
+                    Err(e) => {
+                        last_error = Some(e);
+                        break;
+                    }
+                };
+                match timeout(HANDSHAKE_TIMEOUT, greet(socket, wire, &info_hash, &peer_id))
+                    .await
+                    .context("handshake timed out")
+                    .and_then(|result| result)
+                {
+                    Ok((socket, handshake)) => {
+                        let mut conn = Self::new(socket, addr, handshake, num_pieces);
+                        conn.send_extension_handshake(advertised).await?;
+                        return Ok(conn);
+                    }
+                    Err(e) => {
+                        debug!(%addr, ?wire, over_utp, "peer handshake failed: {e:#}");
+                        last_error = Some(e);
+                    }
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("no way to greet the peer")))
     }
 
     /// Performs the handshake on a connection that the peer at `addr` opened
@@ -137,7 +191,7 @@ impl PeerConnection {
     /// torrent, and greets us in a way `encryption` accepts. The extension
     /// handshake follows as in `connect`.
     pub async fn accept(
-        socket: Transport,
+        socket: impl Into<Transport>,
         addr: SocketAddr,
         info_hash: [u8; 20],
         peer_id: [u8; 20],
@@ -191,8 +245,10 @@ impl PeerConnection {
         handshake: Handshake,
         num_pieces: usize,
     ) -> Self {
+        let utp = socket.inner().is_utp();
         Self {
             socket,
+            utp,
             read_buf: BytesMut::with_capacity(32 * 1024),
             addr,
             peer_id: handshake.peer_id,
@@ -288,6 +344,11 @@ impl PeerConnection {
             self.apply(&PeerMessage::AllowedFast { piece_index })?;
         }
         Ok(())
+    }
+
+    /// Whether this peer connection uses the uTP transport.
+    pub fn is_utp(&self) -> bool {
+        self.utp
     }
 
     /// Whether the connection is encrypted (MSE with RC4).

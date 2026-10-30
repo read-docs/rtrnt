@@ -140,6 +140,8 @@ fn resumable_session(
         completion: None,
         super_seed: false,
         encryption: rtrnt::peer::Encryption::Off,
+        utp_policy: Default::default(),
+        utp: None,
     })
 }
 

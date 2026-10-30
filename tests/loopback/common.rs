@@ -325,6 +325,8 @@ pub(crate) fn encrypting_session(
         completion: None,
         super_seed: false,
         encryption,
+        utp_policy: Default::default(),
+        utp: None,
     })
 }
 
@@ -366,6 +368,7 @@ pub(crate) fn resume_config(out: &Path, state: &Path) -> DownloadConfig {
         max_upload_rate: 0,
         completion_hook: None,
         encryption: Encryption::Off,
+        utp_policy: Default::default(),
         resume_dir: Some(state.to_path_buf()),
     }
 }
