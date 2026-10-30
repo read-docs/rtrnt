@@ -75,6 +75,9 @@ pub enum Command {
     Remove { info_hash: [u8; 20], delete: bool },
     /// Start the torrent from this source too, unless the session has it.
     Add(Source),
+    /// Add the torrent from this source as `Add` does, but paused: it is
+    /// listed, and starts when it is resumed.
+    AddPaused(Source),
     /// Move the torrent with this info hash one place earlier in the queue
     /// and the table, which is the order torrents get a free slot in.
     MoveUp([u8; 20]),
@@ -1101,8 +1104,9 @@ where
     ///
     /// The file is loaded here rather than in a task of its own: it is
     /// small, and the check for a torrent the session has is then never
-    /// raced by another `Add` of it. The torrents run on meanwhile.
-    async fn add(&mut self, source: Source) {
+    /// raced by another `Add` of it. The torrents run on meanwhile. With
+    /// `paused` the torrent is listed paused rather than started.
+    async fn add(&mut self, source: Source, paused: bool) {
         let span = self.span(&source);
         let torrent = match load(&source, &span).await {
             Ok(torrent) => torrent,
@@ -1120,7 +1124,12 @@ where
         }
         span.in_scope(|| info!("added"));
         let source = self.keep_copy(source, info_hash).await;
-        let state = self.place(torrent, &source, StartOptions::default(), span);
+        let state = if paused {
+            self.show_row(&torrent, &source, TorrentState::Paused);
+            State::Paused
+        } else {
+            self.place(torrent, &source, StartOptions::default(), span)
+        };
         self.entries.push(Entry {
             source,
             info_hash,
@@ -1413,7 +1422,8 @@ where
                 settings,
             } => self.set_torrent_limits(info_hash, settings),
             Command::Remove { info_hash, delete } => self.remove(info_hash, delete).await,
-            Command::Add(source) => self.add(source).await,
+            Command::Add(source) => self.add(source, false).await,
+            Command::AddPaused(source) => self.add(source, true).await,
             Command::MoveUp(info_hash) => self.move_in_queue(info_hash, true),
             Command::MoveDown(info_hash) => self.move_in_queue(info_hash, false),
             // The feed stops the torrents itself.

@@ -451,6 +451,34 @@ async fn an_added_magnet_link_starts_with_the_others() {
 }
 
 #[tokio::test]
+async fn a_torrent_added_paused_is_listed_and_does_not_run() {
+    let client = client();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut manager = Manager::with_runner(Arc::clone(&client), never, counting(&runs));
+    manager.expect_more();
+    manager.start(Vec::new(), StartOptions::default()).await;
+
+    manager
+        .command(Command::AddPaused(magnet(UNTIL_STOPPED)))
+        .await;
+    assert_eq!(manager.entries().len(), 1);
+    assert!(matches!(manager.entries()[0].state, State::Paused));
+    assert_eq!(runs.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        client.stats().torrents()[0].state(),
+        TorrentState::Paused,
+        "the row shows the pause"
+    );
+
+    // It starts when resumed.
+    manager.command(Command::Resume([UNTIL_STOPPED; 20])).await;
+    assert!(matches!(manager.entries()[0].state, State::Running { .. }));
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+    manager.command(Command::Pause([UNTIL_STOPPED; 20])).await;
+    manager.run(closed()).await.unwrap();
+}
+
+#[tokio::test]
 async fn a_torrent_the_session_has_is_not_added_again() {
     let client = client();
     let runs = Arc::new(AtomicUsize::new(0));
