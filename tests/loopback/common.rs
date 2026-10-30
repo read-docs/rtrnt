@@ -347,6 +347,8 @@ pub(crate) fn resume_config(out: &Path, state: &Path) -> DownloadConfig {
         sequential: false,
         super_seed: false,
         portmap: false,
+        preallocate: Default::default(),
+        disk_cache: 1 << 20,
         max_download_rate: 0,
         max_upload_rate: 0,
         completion_hook: None,

@@ -102,6 +102,12 @@ pub(crate) async fn hash_pieces(
             bail!(interrupted());
         }
     };
+    // What is checked is what is on disk, not the part of it still cached.
+    if let Err(e) = session.storage.flush_async().await {
+        bar.finish_and_clear();
+        session.bars.remove(&bar);
+        return Err(e);
+    }
     let style = ProgressStyle::with_template(
         "checking {prefix} {bar:40.cyan/blue} {bytes}/{total_bytes} eta {eta}",
     );

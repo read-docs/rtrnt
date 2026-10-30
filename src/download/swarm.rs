@@ -47,6 +47,8 @@ const DHT_LOOKUPS_WHEN_OUT: u8 = 2;
 const MAX_PEX_BACKLOG: usize = 500;
 /// How often the resume file is saved while pieces complete.
 const RESUME_SAVE_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the write cache is flushed to disk even if it is not full.
+const CACHE_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The peers a download starts with.
 #[derive(Default)]
@@ -229,6 +231,7 @@ pub(crate) async fn download_with(
     // and when the next one is due.
     let mut saved = 0;
     let mut next_save = Instant::now() + RESUME_SAVE_INTERVAL;
+    let mut next_flush = Instant::now() + CACHE_FLUSH_INTERVAL;
     loop {
         // Made before the seed settings are read, so that a change meanwhile
         // is not missed.
@@ -431,6 +434,14 @@ pub(crate) async fn download_with(
                 save_resume(&session, queue, &mut saved).await;
                 next_save = Instant::now() + RESUME_SAVE_INTERVAL;
             }
+            () = tokio::time::sleep_until(next_flush), if session.storage.cache_enabled() => {
+                next_flush = Instant::now() + CACHE_FLUSH_INTERVAL;
+                if let Err(e) = session.storage.flush_async().await {
+                    warn!("stopping: {e:#}");
+                    disk_error = Some(e);
+                    break;
+                }
+            }
             () = &mut shutdown => {
                 info!("interrupted, stopping");
                 interrupted = true;
@@ -456,7 +467,12 @@ pub(crate) async fn download_with(
     }
     stats.set_web_seeds(Vec::new());
 
-    // Every finished write is in the files now.
+    // Every finished write is in the files now (and with a write cache,
+    // flushed there).
+    if let Err(e) = session.storage.flush_async().await {
+        warn!("cannot write the cached pieces: {e:#}");
+        disk_error.get_or_insert(e);
+    }
     save_resume(&session, queue, &mut saved).await;
     stats.set_final_pieces(queue.snapshot());
 
