@@ -5,6 +5,7 @@ use crate::client::{ConnectionSlots, SlotPermit};
 use crate::dht::DhtSearch;
 use crate::listener::Registration;
 use crate::lsd::{LsdPeers, lsd_peers};
+use crate::peer::holepunch;
 use crate::peer::pex::PeerExchange;
 use crate::peer::{self, Incoming, PeerConnection};
 use crate::selection;
@@ -111,6 +112,12 @@ pub(crate) async fn download_with(
     let stats = &session.stats;
     let priorities = session.piece_priorities();
     let (smart_ban, mut verdicts) = SmartBan::new();
+    let (holepunch, mut introduced) = holepunch::Hub::new(
+        !torrent.is_private()
+            && session.utp.is_some()
+            && session.utp_policy != crate::utp::Policy::Off
+            && !crate::network::global().proxied(),
+    );
     let swarm = Arc::new(Swarm {
         queue: PieceQueue::new(have, &priorities)
             .seeding(seed.enabled())
@@ -127,6 +134,7 @@ pub(crate) async fn download_with(
         pex,
         smart_ban,
         offers: Offers::new(num_pieces),
+        holepunch,
     });
     let Swarm {
         queue,
@@ -381,8 +389,18 @@ pub(crate) async fn download_with(
                         // peer came from.
                         if !inbound {
                             pool.failed(addr, pieces > 0, Instant::now());
+                            if encrypted.is_none() { swarm.holepunch.failed(addr, Instant::now()); }
                         }
                     }
+                }
+            }
+            Some(addr) = introduced.recv() => {
+                if workers.len() < max_peers && pool.allows(addr)
+                    && !banned_ips.contains(&addr.ip()) && !swarm.smart_ban.is_banned(addr)
+                    && let Some(permit) = slots.try_acquire()
+                {
+                    debug!(%addr, "connecting through a holepunch introduction");
+                    spawn(&mut workers, addr, Link::Holepunch, permit);
                 }
             }
             Some(joined) = web_workers.join_next() => {
@@ -545,6 +563,8 @@ pub(super) enum Link {
     /// By connecting to it, greeting it in plaintext before trying
     /// encryption if `plaintext_first` (see `Encryption::attempts`).
     Connect { plaintext_first: bool },
+    /// A negotiated relay introduction always uses the shared uTP endpoint.
+    Holepunch,
     /// Over a connection it opened to us, with its handshake read but not
     /// answered.
     Accepted(Incoming),
@@ -561,7 +581,7 @@ impl Link {
     /// Whether the peer connected to us, so we cannot connect back.
     pub(super) fn is_inbound(&self) -> bool {
         match self {
-            Link::Connect { .. } => false,
+            Link::Connect { .. } | Link::Holepunch => false,
             Link::Accepted(_) => true,
             Link::Open { inbound, .. } => *inbound,
         }
@@ -590,6 +610,8 @@ pub(super) struct Swarm {
     pub(super) smart_ban: SmartBan,
     /// How often each piece was offered while super-seeding.
     pub(super) offers: Offers,
+    /// Bounded public-torrent rendezvous coordination.
+    pub(super) holepunch: Arc<holepunch::Hub>,
 }
 
 impl PieceSource for Swarm {
@@ -656,6 +678,7 @@ impl ConnectedPeers {
                 peers: self,
                 id,
                 connection,
+                waiting_for: None,
             },
             old,
         ))
@@ -676,8 +699,9 @@ impl ConnectedPeers {
         id: [u8; 20],
         preferred: bool,
     ) -> Option<Connected<'_>> {
-        let (guard, old) = self.insert(id, preferred, true)?;
+        let (mut guard, old) = self.insert(id, preferred, true)?;
         if let Some(old) = old {
+            guard.waiting_for = Some(Arc::clone(&old));
             loop {
                 let mut finished = std::pin::pin!(old.finished.notified());
                 finished.as_mut().enable();
@@ -687,6 +711,7 @@ impl ConnectedPeers {
                 finished.await;
             }
         }
+        guard.waiting_for = None;
         Some(guard)
     }
 }
@@ -695,6 +720,7 @@ pub(crate) struct Connected<'a> {
     peers: &'a ConnectedPeers,
     id: [u8; 20],
     connection: Arc<ConnectionChoice>,
+    waiting_for: Option<Arc<ConnectionChoice>>,
 }
 
 impl Connected<'_> {
@@ -712,7 +738,15 @@ impl Drop for Connected<'_> {
             .get(&self.id)
             .is_some_and(|current| Arc::ptr_eq(current, &self.connection))
         {
-            peers.remove(&self.id);
+            if let Some(old) = &self.waiting_for
+                && !old.done.load(Ordering::Acquire)
+            {
+                // A canceled replacement must still exclude new workers
+                // until the old worker releases its PEX and relay handles.
+                peers.insert(self.id, Arc::clone(old));
+            } else {
+                peers.remove(&self.id);
+            }
         }
         self.connection.done.store(true, Ordering::Release);
         self.connection.finished.notify_waiters();
@@ -788,5 +822,20 @@ mod tests {
         drop(smaller_out);
         assert!(smaller.register([2; 20]).is_some());
         assert!(larger.register([1; 20]).is_some());
+    }
+    #[tokio::test]
+    async fn canceling_a_replacement_still_waits_for_old_worker_cleanup() {
+        let peers = ConnectedPeers::default();
+        let old = peers.register_directed([2; 20], false).await.unwrap();
+        let replacement = peers.register_directed([2; 20], true);
+        assert!(
+            tokio::time::timeout(Duration::ZERO, replacement)
+                .await
+                .is_err()
+        );
+        old.replacement().await;
+        assert!(peers.register([2; 20]).is_none());
+        drop(old);
+        assert!(peers.register([2; 20]).is_some());
     }
 }
