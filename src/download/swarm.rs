@@ -4,6 +4,7 @@ use crate::blocklist::Blocklist;
 use crate::client::{ConnectionSlots, SlotPermit};
 use crate::dht::DhtSearch;
 use crate::listener::Registration;
+use crate::lsd::{LsdPeers, lsd_peers};
 use crate::peer::pex::PeerExchange;
 use crate::peer::{self, Incoming, PeerConnection};
 use crate::selection;
@@ -54,6 +55,8 @@ pub(crate) struct StartPeers {
     pub(crate) pool: PeerPool,
     /// Addresses of incoming peers that misbehaved.
     pub(crate) banned_ips: HashSet<IpAddr>,
+    /// Peers on the local network, if we look for them.
+    pub(crate) lsd: Option<LsdPeers>,
     /// Connections already open, such as those the metadata of a magnet
     /// link came over, each with whether the peer connected to us and the
     /// connection slot it holds.
@@ -140,6 +143,7 @@ pub(crate) async fn download_with(
     let StartPeers {
         mut pool,
         mut banned_ips,
+        mut lsd,
         connections,
     } = start;
 
@@ -394,6 +398,10 @@ pub(crate) async fn download_with(
                 if let Some(asked) = &mut asked {
                     asked.dht_lookups = asked.dht_lookups.saturating_sub(1);
                 }
+            }
+            peers = lsd_peers(&mut lsd) => {
+                stats.add_source(PeerSource::Lsd, peers.len());
+                pool.add(peers);
             }
             Some(peers) = pex_peers.recv() => {
                 if pool.ready_len() < MAX_PEX_BACKLOG {

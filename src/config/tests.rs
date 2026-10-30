@@ -72,6 +72,14 @@ fn parses_every_key() {
 }
 
 #[test]
+fn lsd_is_on_unless_the_file_says_otherwise() {
+    assert!(resolve(Options::default(), Options::default()).lsd);
+    let off = parse("lsd = false\n", None).unwrap();
+    assert_eq!(off.lsd, Some(false));
+    assert!(!resolve(Options::default(), off).lsd);
+}
+
+#[test]
 fn parses_seeding_dht_and_rate_keys() {
     let text = "seed-ratio = 1.5\nseed-time = 90\ndht = false\n\
                 max-download-rate = 500\nmax-upload-rate = 64\ntui = true\n";
@@ -251,6 +259,7 @@ fn describe_names_each_source() {
          seed-ratio = 1.5  # config file\n\
          seed-time = 0  # default\n\
          dht = false  # command line\n\
+         lsd = true  # default\n\
          portmap = true  # default\n\
          max-download-rate = 0  # default\n\
          max-upload-rate = 64  # command line\n\

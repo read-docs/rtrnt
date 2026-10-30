@@ -369,6 +369,7 @@ async fn seeds_a_download_that_is_already_complete() {
         },
         // Tests stay off the real internet.
         dht: false,
+        lsd: false,
         sequential: false,
         super_seed: false,
         portmap: false,

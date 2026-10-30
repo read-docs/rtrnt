@@ -46,6 +46,7 @@ fn config(output: &Path, resume: &Path) -> DownloadConfig {
         listen_port: 0,
         seed: Default::default(),
         dht: false,
+        lsd: false,
         sequential: false,
         super_seed: false,
         portmap: false,
