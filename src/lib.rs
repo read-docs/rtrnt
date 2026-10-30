@@ -20,6 +20,7 @@ pub mod portmap;
 pub mod queue;
 pub mod rate_limit;
 pub mod resume;
+pub mod rss;
 pub mod selection;
 pub mod session;
 pub mod source;

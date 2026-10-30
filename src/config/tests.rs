@@ -266,7 +266,8 @@ fn describe_names_each_source() {
          alt-speed-download = 50  # default\n\
          alt-speed-upload = 50  # default\n\
          # alt-speed-schedule: only by hand  # default\n\
-         # metrics-listen: off  # default\n"
+         # metrics-listen: off  # default\n\
+         # rss: none  # default\n"
     );
     // The settings part is valid TOML that parses to the same values.
     let reparsed = parse(&text, None).unwrap();
@@ -603,5 +604,54 @@ fn metrics_listen_is_off_unless_an_address_is_set() {
     assert!(
         text.contains("# metrics-listen: off  # default\n"),
         "{text}"
+    );
+}
+
+#[test]
+fn rss_feeds_come_from_the_file_and_are_shown_as_it_spells_them() {
+    let text = r#"
+        [[rss]]
+        url = "https://a.example/rss"
+        match = ["Show", "Other"]
+        exclude = "CAM"
+        interval = 30
+        paused = true
+
+        [[rss]]
+        url = "https://b.example/atom"
+        match = ["x"]
+    "#;
+    let options = parse(text, None).unwrap();
+    let feeds = options.rss.clone().unwrap();
+    assert_eq!(feeds.len(), 2);
+    assert!(feeds[0].paused);
+
+    let file = ConfigFile {
+        path: None,
+        options,
+    };
+    let shown = describe(&Options::default(), &Options::default(), &file);
+    assert!(
+        shown.contains("rss = [{ url = \"https://a.example/rss\""),
+        "{shown}"
+    );
+    assert_eq!(parse(&shown, None).unwrap().rss, Some(feeds));
+
+    // Unknown keys and bad values stop the start, naming the problem.
+    let e = format!(
+        "{:#}",
+        parse(
+            "[[rss]]\nurl = \"https://a.example/\"\nmatch = [\"(\"]",
+            None
+        )
+        .unwrap_err()
+    );
+    assert!(e.contains("invalid `match`"), "{e}");
+    assert!(
+        parse(
+            "[[rss]]\nurl = \"https://a.example/\"\nmatch = [\"a\"]\nbogus = 1",
+            None
+        )
+        .is_err()
     );
 }
