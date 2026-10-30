@@ -103,13 +103,13 @@ fn torrents() -> Vec<Torrent> {
     ]
 }
 
-/// Address, client, flags (`D`/`d`, `U`/`u`, `I`, `F`, `X`), rates in
+/// Address, client, flags (`D`/`d`, `U`/`u`, `I`, `F`, `X`, `E`), rates in
 /// KiB/s, and the fraction of pieces had: the mockup's peers.
 const PEERS: &[(&str, &str, &str, f64, f64, f64)] = &[
     (
         "185.21.216.143:51413",
         "Transmission 4.0.6",
-        "DUFX",
+        "DUFXE",
         1126.0,
         48.0,
         1.0,
@@ -117,7 +117,7 @@ const PEERS: &[(&str, &str, &str, f64, f64, f64)] = &[
     (
         "[2a01:4f8:c17::9]:6881",
         "qBittorrent 5.1.2",
-        "DuFX",
+        "DuFXE",
         812.0,
         0.0,
         1.0,
@@ -133,7 +133,7 @@ const PEERS: &[(&str, &str, &str, f64, f64, f64)] = &[
     (
         "73.92.10.211:42069",
         "Deluge 2.2.0",
-        "dUIF",
+        "dUIFE",
         0.0,
         96.0,
         0.41,
@@ -529,6 +529,7 @@ impl DemoFeed {
                     |(i, &(addr, client, letters, down, up, has))| PeerSnapshot {
                         addr: addr.parse::<SocketAddr>().expect("demo address"),
                         inbound: letters.contains('I'),
+                        encrypted: letters.contains('E'),
                         client: Some(client.to_string()),
                         flags: flags(letters),
                         downloaded: (down * KIB * (t + 60.0)) as u64,

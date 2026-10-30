@@ -11,7 +11,7 @@
 
 use crate::altspeed::{Limits, Schedule};
 use crate::download::{DownloadConfig, SeedLimits};
-use crate::peer;
+use crate::peer::{self, Encryption};
 use crate::queue::QueueLimits;
 use crate::resume;
 use crate::rss::{self, Subscription};
@@ -68,6 +68,9 @@ pub const DEFAULT_ALT_SPEED_UPLOAD: u64 = 50;
 pub const DEFAULT_MAX_ACTIVE_DOWNLOADS: usize = 0;
 /// Torrents seeding at once: no limit.
 pub const DEFAULT_MAX_ACTIVE_SEEDS: usize = 0;
+/// Encrypt where the peer can, as libtorrent, Transmission and qBittorrent
+/// do by default.
+pub const DEFAULT_ENCRYPTION: Encryption = Encryption::Prefer;
 
 /// What a setting is when nothing sets it.
 enum Fallback<T> {
@@ -112,6 +115,12 @@ impl ToToml for ByteSize {
 }
 
 impl ToToml for SocketAddr {
+    fn to_toml(&self) -> String {
+        toml::Value::from(self.to_string()).to_string()
+    }
+}
+
+impl ToToml for Encryption {
     fn to_toml(&self) -> String {
         toml::Value::from(self.to_string()).to_string()
     }
@@ -293,6 +302,12 @@ options! {
     /// or single addresses, IPv4 or IPv6; gzip is not read
     #[arg(long, value_name = "FILE")]
     blocklist: PathBuf = Unset("none");
+    /// Whether to encrypt connections to peers (MSE/PE): `prefer` tries
+    /// encryption first and falls back to plain BitTorrent, and accepts
+    /// both; `require` refuses plain connections; `off` never encrypts and
+    /// refuses encrypted ones [default: prefer]
+    #[arg(long, value_name = "POLICY")]
+    encryption: Encryption = Value(DEFAULT_ENCRYPTION);
     /// Run a command when a torrent finishes downloading, with the name,
     /// path and info hash in $RTRNT_NAME, $RTRNT_PATH and
     /// $RTRNT_INFO_HASH. The command is run directly, not through a shell:
@@ -506,6 +521,7 @@ impl Options {
             max_download_rate: self.max_download_rate.unwrap_or(DEFAULT_MAX_DOWNLOAD_RATE),
             max_upload_rate: self.max_upload_rate.unwrap_or(DEFAULT_MAX_UPLOAD_RATE),
             completion_hook: self.completion_hook,
+            encryption: self.encryption.unwrap_or(DEFAULT_ENCRYPTION),
             resume_dir: resume::default_dir(
                 std::env::var_os("XDG_STATE_HOME"),
                 std::env::home_dir().as_deref(),

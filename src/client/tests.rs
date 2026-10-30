@@ -18,6 +18,7 @@ fn client(dht: bool) -> Client {
         max_download_rate: 64,
         max_upload_rate: 0,
         completion_hook: None,
+        encryption: crate::peer::Encryption::Off,
         resume_dir: None,
     };
     Client::new(config, MultiProgress::new())

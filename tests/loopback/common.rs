@@ -2,7 +2,9 @@ use indicatif::MultiProgress;
 use rtrnt::client::Client;
 use rtrnt::download::{DownloadConfig, SeedLimits, Session};
 use rtrnt::peer::fast;
-use rtrnt::peer::{BlockRef, PeerMessage, generate_peer_id, handshake_bytes, parse_handshake};
+use rtrnt::peer::{
+    BlockRef, Encryption, PeerMessage, generate_peer_id, handshake_bytes, parse_handshake,
+};
 use rtrnt::rate_limit::RateLimits;
 use rtrnt::selection::FileSelection;
 use rtrnt::stats::TorrentStats;
@@ -290,6 +292,20 @@ pub(crate) fn limited_session(
     seed: SeedLimits,
     rate_limits: RateLimits,
 ) -> Arc<Session> {
+    encrypting_session(torrent, info_hash, out, seed, rate_limits, Encryption::Off)
+}
+
+/// A session that connects to peers, and accepts them, as `encryption`
+/// says. The other helpers' sessions speak plain BitTorrent only, as the
+/// mock peers do.
+pub(crate) fn encrypting_session(
+    torrent: TorrentFile,
+    info_hash: [u8; 20],
+    out: &Path,
+    seed: SeedLimits,
+    rate_limits: RateLimits,
+    encryption: Encryption,
+) -> Arc<Session> {
     let storage = Arc::new(Storage::new(&torrent.info, out, &FileSelection::default()).unwrap());
     // What `make_torrent` hashed.
     let metadata = serde_bencode::to_bytes(&torrent.info).unwrap();
@@ -308,6 +324,7 @@ pub(crate) fn limited_session(
         stats: Arc::new(TorrentStats::new(info_hash, "test", Path::new("."))),
         completion: None,
         super_seed: false,
+        encryption,
     })
 }
 
@@ -348,6 +365,7 @@ pub(crate) fn resume_config(out: &Path, state: &Path) -> DownloadConfig {
         max_download_rate: 0,
         max_upload_rate: 0,
         completion_hook: None,
+        encryption: Encryption::Off,
         resume_dir: Some(state.to_path_buf()),
     }
 }

@@ -139,6 +139,7 @@ fn resumable_session(
         stats: Arc::new(TorrentStats::new(info_hash, "test", Path::new("."))),
         completion: None,
         super_seed: false,
+        encryption: rtrnt::peer::Encryption::Off,
     })
 }
 

@@ -163,11 +163,22 @@ pub(crate) async fn download_with(
         let worker = async move {
             let _permit = permit;
             let mut pieces = 0;
-            let result = peer_worker(&session, &swarm, addr, link, listen_port, &mut pieces).await;
+            let mut encrypted = None;
+            let result = peer_worker(
+                &session,
+                &swarm,
+                addr,
+                link,
+                listen_port,
+                &mut pieces,
+                &mut encrypted,
+            )
+            .await;
             WorkerExit {
                 addr,
                 inbound,
                 pieces,
+                encrypted,
                 result,
             }
         };
@@ -293,7 +304,13 @@ pub(crate) async fn download_with(
                 break;
             };
             asked = None;
-            spawn(&mut workers, addr, Link::Connect, permit);
+            let plaintext_first = pool.plaintext_first(addr);
+            spawn(
+                &mut workers,
+                addr,
+                Link::Connect { plaintext_first },
+                permit,
+            );
         }
 
         let retry_at = pool.next_retry().filter(|_| workers.len() < max_peers);
@@ -329,13 +346,18 @@ pub(crate) async fn download_with(
         }
         tokio::select! {
             Some(joined) = workers.join_next() => {
-                let WorkerExit { addr, inbound, pieces, result } = match joined {
+                let WorkerExit { addr, inbound, pieces, encrypted, result } = match joined {
                     Ok(exit) => exit,
                     Err(e) => {
                         warn!("peer task failed: {e}");
                         continue;
                     }
                 };
+                // So the next connection greets the peer the way that
+                // worked.
+                if let (false, Some(encrypted)) = (inbound, encrypted) {
+                    pool.reached(addr, encrypted);
+                }
                 match result {
                     Ok(()) => debug!(%addr, "peer finished"),
                     Err(e) if e.is::<Misbehaved>() || e.is::<peer::ProtocolViolation>() => {
@@ -415,7 +437,7 @@ pub(crate) async fn download_with(
             Some(peers) = pex_peers.recv() => {
                 if pool.ready_len() < MAX_PEX_BACKLOG {
                     stats.add_source(PeerSource::Pex, peers.len());
-                    pool.add(peers);
+                    pool.add_with_encryption(peers);
                 }
             }
             // Found guilty of corrupt blocks by a piece completed elsewhere.
@@ -520,8 +542,9 @@ async fn save_resume(session: &Session, queue: &PieceQueue, saved: &mut usize) {
 
 /// How a peer worker reaches its peer.
 pub(super) enum Link {
-    /// By connecting to it.
-    Connect,
+    /// By connecting to it, greeting it in plaintext before trying
+    /// encryption if `plaintext_first` (see `Encryption::attempts`).
+    Connect { plaintext_first: bool },
     /// Over a connection it opened to us, with its handshake read but not
     /// answered.
     Accepted(Incoming),
@@ -538,7 +561,7 @@ impl Link {
     /// Whether the peer connected to us, so we cannot connect back.
     pub(super) fn is_inbound(&self) -> bool {
         match self {
-            Link::Connect => false,
+            Link::Connect { .. } => false,
             Link::Accepted(_) => true,
             Link::Open { inbound, .. } => *inbound,
         }
@@ -582,6 +605,8 @@ struct WorkerExit {
     inbound: bool,
     /// Pieces the peer delivered first.
     pieces: usize,
+    /// Whether the connection was encrypted, once the handshake was done.
+    encrypted: Option<bool>,
     result: Result<()>,
 }
 

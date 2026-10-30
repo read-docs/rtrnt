@@ -1,6 +1,9 @@
 use super::*;
 use crate::peer::extension::{self, Advertised, ExtendedHandshake};
 use crate::peer::fast;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::Instant;
@@ -155,9 +158,16 @@ async fn sends_interest_changes_and_keep_alives_only_when_needed() {
         received
     });
 
-    let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1, listening(Some(6881)))
-        .await
-        .unwrap();
+    let mut conn = PeerConnection::connect(
+        addr,
+        info_hash,
+        [2u8; 20],
+        1,
+        listening(Some(6881)),
+        &[Wire::Plaintext],
+    )
+    .await
+    .unwrap();
     assert!(!conn.supports_extensions());
     assert!(conn.supports_dht());
     conn.keep_alive().await.unwrap();
@@ -224,9 +234,16 @@ async fn mock_peer(
         }
         received
     });
-    let conn = PeerConnection::connect(addr, info_hash, [2u8; 20], num_pieces, listening(None))
-        .await
-        .unwrap();
+    let conn = PeerConnection::connect(
+        addr,
+        info_hash,
+        [2u8; 20],
+        num_pieces,
+        listening(None),
+        &[Wire::Plaintext],
+    )
+    .await
+    .unwrap();
     (conn, remote)
 }
 
@@ -335,8 +352,16 @@ async fn accept_answers_only_handshakes_for_our_torrent_from_others() {
             socket.read_exact(&mut reply).await.ok().map(|_| reply)
         });
         let (socket, from) = listener.accept().await.unwrap();
-        let result =
-            PeerConnection::accept(socket, from, info_hash, ours, 1, listening(None)).await;
+        let result = PeerConnection::accept(
+            socket,
+            from,
+            info_hash,
+            ours,
+            1,
+            listening(None),
+            Encryption::Prefer,
+        )
+        .await;
         assert_eq!(result.is_ok(), accepted, "{:?}", result.as_ref().err());
         if let Ok(conn) = &result {
             assert_eq!(conn.peer_id, theirs);
@@ -395,9 +420,16 @@ async fn exchanges_extension_handshakes() {
         (ours, read_message(&mut socket).await)
     });
 
-    let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1, listening(Some(6881)))
-        .await
-        .unwrap();
+    let mut conn = PeerConnection::connect(
+        addr,
+        info_hash,
+        [2u8; 20],
+        1,
+        listening(Some(6881)),
+        &[Wire::Plaintext],
+    )
+    .await
+    .unwrap();
     assert!(conn.supports_extensions());
     assert!(conn.peer_extensions().is_none());
     assert_eq!(conn.request_limit(), None);
@@ -449,9 +481,16 @@ async fn malformed_extension_handshake_is_a_protocol_violation() {
         socket.read_to_end(&mut Vec::new()).await.unwrap();
     });
 
-    let mut conn = PeerConnection::connect(addr, info_hash, [2u8; 20], 1, listening(None))
-        .await
-        .unwrap();
+    let mut conn = PeerConnection::connect(
+        addr,
+        info_hash,
+        [2u8; 20],
+        1,
+        listening(None),
+        &[Wire::Plaintext],
+    )
+    .await
+    .unwrap();
     let err = conn.receive().await.unwrap_err();
     assert!(err.is::<ProtocolViolation>(), "{err:#}");
     assert!(conn.peer_extensions().is_none());
@@ -592,4 +631,132 @@ async fn donthave_while_the_piece_count_is_unknown_applies_afterwards() {
     }
     conn.set_piece_count(3).unwrap();
     assert_eq!(conn.peer_has(), [false, true, true]);
+}
+
+/// A peer of torrent [5; 20] that speaks plain BitTorrent only: it reads a
+/// handshake from each connection and answers it if it is one, or hangs
+/// up. Counts the connections it took.
+async fn plain_only_peer() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            counter.fetch_add(1, Ordering::SeqCst);
+            let mut handshake = [0u8; 68];
+            socket.read_exact(&mut handshake).await.unwrap();
+            if parse_handshake(&handshake, &[5; 20]).is_err() {
+                continue;
+            }
+            socket
+                .write_all(&remote_handshake(&[5; 20], false))
+                .await
+                .unwrap();
+            // Kept open until the other end hangs up.
+            let _ = socket.read_to_end(&mut Vec::new()).await;
+        }
+    });
+    (addr, accepted)
+}
+
+#[tokio::test]
+async fn prefer_falls_back_to_plaintext_when_encryption_fails() {
+    let (addr, accepted) = plain_only_peer().await;
+    let attempts = Encryption::Prefer.attempts(false);
+    let conn = PeerConnection::connect(addr, [5; 20], [2; 20], 1, listening(None), attempts)
+        .await
+        .unwrap();
+    assert!(!conn.is_encrypted());
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn require_never_falls_back_to_plaintext() {
+    let (addr, accepted) = plain_only_peer().await;
+    let attempts = Encryption::Require.attempts(true);
+    let result =
+        PeerConnection::connect(addr, [5; 20], [2; 20], 1, listening(None), attempts).await;
+    assert!(result.is_err());
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}
+
+/// Our connecting side against our accepting side, over TCP: with
+/// `connecting` trying the ways in `attempts`, and the accepting side
+/// accepting what `accepting` does, until one connection is accepted.
+async fn connect_to_ourselves(
+    attempts: &'static [Wire],
+    accepting: Encryption,
+) -> (PeerConnection, PeerConnection) {
+    let info_hash = [5u8; 20];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let acceptor = tokio::spawn(async move {
+        loop {
+            let (socket, from) = listener.accept().await.unwrap();
+            let accepted = PeerConnection::accept(
+                socket,
+                from,
+                info_hash,
+                [1; 20],
+                1,
+                listening(None),
+                accepting,
+            )
+            .await;
+            if let Ok(conn) = accepted {
+                return conn;
+            }
+        }
+    });
+    let connected = PeerConnection::connect(addr, info_hash, [2; 20], 1, listening(None), attempts)
+        .await
+        .unwrap();
+    (connected, acceptor.await.unwrap())
+}
+
+#[tokio::test]
+async fn our_two_sides_talk_encrypted() {
+    let attempts = Encryption::Prefer.attempts(false);
+    let (mut ours, mut theirs) = connect_to_ourselves(attempts, Encryption::Prefer).await;
+    assert!(ours.is_encrypted() && theirs.is_encrypted());
+    assert_eq!(ours.peer_id, [1; 20]);
+    assert_eq!(theirs.peer_id, [2; 20]);
+    // Each side's extension handshake comes first.
+    assert!(matches!(
+        theirs.receive().await.unwrap(),
+        PeerMessage::Extended { .. }
+    ));
+    assert!(matches!(
+        ours.receive().await.unwrap(),
+        PeerMessage::Extended { .. }
+    ));
+    let block = PeerMessage::Piece {
+        index: 0,
+        begin: 0,
+        block: vec![7; 16 * 1024],
+    };
+    ours.send_all(&[PeerMessage::Interested, block.clone()])
+        .await
+        .unwrap();
+    assert_eq!(theirs.receive().await.unwrap(), PeerMessage::Interested);
+    assert!(theirs.peer_interested());
+    assert_eq!(theirs.receive().await.unwrap(), block);
+    theirs.set_choking(false).await.unwrap();
+    assert_eq!(ours.receive().await.unwrap(), PeerMessage::Unchoke);
+}
+
+#[tokio::test]
+async fn plaintext_first_moves_on_to_encryption_for_a_peer_that_requires_it() {
+    let attempts = Encryption::Prefer.attempts(true);
+    let (ours, theirs) = connect_to_ourselves(attempts, Encryption::Require).await;
+    assert!(ours.is_encrypted() && theirs.is_encrypted());
+}
+
+#[tokio::test]
+async fn off_talks_plaintext_to_a_peer_that_prefers_encryption() {
+    let attempts = Encryption::Off.attempts(false);
+    let (ours, theirs) = connect_to_ourselves(attempts, Encryption::Prefer).await;
+    assert!(!ours.is_encrypted() && !theirs.is_encrypted());
 }

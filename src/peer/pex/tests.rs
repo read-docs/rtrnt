@@ -149,17 +149,17 @@ fn takes_at_most_fifty_plausible_peers_other_than_the_sender() {
     let peers = worth_trying(&message, false, &[sender]);
     // Only the first 50 entries are looked at.
     assert_eq!(peers.len(), 2 + 42);
-    assert_eq!(peers[..2], [v4(7), v6(8)]);
-    assert_eq!(peers[2], v4(100));
+    assert_eq!(peers[..2], [(v4(7), false), (v6(8), false)]);
+    assert_eq!(peers[2], (v4(100), false));
     // A seed is no use to us once we are one.
     let peers = worth_trying(&message, true, &[sender]);
-    assert_eq!(peers[..2], [v4(7), v4(100)]);
+    assert_eq!(peers[..2], [(v4(7), false), (v4(100), false)]);
 }
 
 #[tokio::test]
 async fn ignores_messages_that_come_too_often() {
     let (exchange, mut learned) = PeerExchange::new(true);
-    let mut peer = exchange.join([1; 20], v4(9), true);
+    let mut peer = exchange.join([1; 20], v4(9), true, false);
     let message = |port| {
         PexMessage {
             added: vec![(v4(port), 0)],
@@ -170,13 +170,13 @@ async fn ignores_messages_that_come_too_often() {
     };
     let start = Instant::now();
     peer.received(&message(1), start, false).unwrap();
-    assert_eq!(learned.try_recv().unwrap(), [v4(1)]);
+    assert_eq!(learned.try_recv().unwrap(), [(v4(1), false)]);
     let soon = start + MIN_RECEIVE_INTERVAL - Duration::from_secs(1);
     peer.received(&message(2), soon, false).unwrap();
     assert!(learned.try_recv().is_err());
     peer.received(&message(3), start + MIN_RECEIVE_INTERVAL, false)
         .unwrap();
-    assert_eq!(learned.try_recv().unwrap(), [v4(3)]);
+    assert_eq!(learned.try_recv().unwrap(), [(v4(3), false)]);
     // Malformed messages are a protocol violation, even when too soon.
     let err = peer.received(b"le", start, false).unwrap_err();
     assert!(err.is::<ProtocolViolation>(), "{err:#}");
@@ -185,9 +185,9 @@ async fn ignores_messages_that_come_too_often() {
 #[tokio::test]
 async fn advertises_connected_peers_with_known_addresses_only() {
     let (exchange, _learned) = PeerExchange::new(true);
-    let outgoing = exchange.join([1; 20], v4(1), true);
-    let mut incoming = exchange.join([2; 20], v4(50_000), false);
-    let mut target = exchange.join([3; 20], v6(3), false);
+    let outgoing = exchange.join([1; 20], v4(1), true, false);
+    let mut incoming = exchange.join([2; 20], v4(50_000), false, false);
+    let mut target = exchange.join([3; 20], v6(3), false, false);
     // An incoming peer is only advertised once its listening port is
     // known.
     assert_eq!(
@@ -213,10 +213,33 @@ async fn advertises_connected_peers_with_known_addresses_only() {
 }
 
 #[tokio::test]
+async fn encrypted_peers_are_flagged_both_ways() {
+    let (exchange, mut learned) = PeerExchange::new(true);
+    let _encrypted = exchange.join([1; 20], v4(1), true, true);
+    let _plain = exchange.join([2; 20], v4(2), true, false);
+    assert_eq!(
+        exchange.others(&[9; 20], &[]),
+        [
+            (v4(1), FLAG_CONNECTABLE | FLAG_ENCRYPTION),
+            (v4(2), FLAG_CONNECTABLE)
+        ]
+        .into()
+    );
+    let mut peer = exchange.join([3; 20], v4(9), true, false);
+    let message = PexMessage {
+        added: vec![(v4(5), FLAG_ENCRYPTION | FLAG_SEED), (v4(6), 0)],
+        dropped: Vec::new(),
+    };
+    peer.received(&message.encode().unwrap(), Instant::now(), false)
+        .unwrap();
+    assert_eq!(learned.try_recv().unwrap(), [(v4(5), true), (v4(6), false)]);
+}
+
+#[tokio::test]
 async fn private_torrents_never_exchange_peers() {
     let (exchange, mut learned) = PeerExchange::new(false);
-    let mut peer = exchange.join([1; 20], v4(9), true);
-    let _other = exchange.join([2; 20], v4(1), true);
+    let mut peer = exchange.join([1; 20], v4(9), true, false);
+    let _other = exchange.join([2; 20], v4(1), true, false);
     assert!(exchange.others(&[9; 20], &[]).is_empty());
     let message = PexMessage {
         added: vec![(v4(1), 0)],

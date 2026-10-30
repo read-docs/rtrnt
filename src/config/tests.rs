@@ -327,6 +327,7 @@ fn describe_names_each_source() {
          # watch-dir: none  # default\n\
          watch-dir-delete = false  # default\n\
          # blocklist: none  # default\n\
+         encryption = \"prefer\"  # default\n\
          # completion-hook: none  # default\n\
          sequential = false  # default\n\
          super-seed = false  # default\n\
@@ -355,6 +356,7 @@ fn describe_names_each_source() {
             max_active_downloads: Some(0),
             max_active_seeds: Some(0),
             watch_dir_delete: Some(false),
+            encryption: Some(crate::peer::Encryption::Prefer),
             sequential: Some(false),
             super_seed: Some(false),
             preallocate: Some(Preallocate::Sparse),
@@ -491,6 +493,36 @@ fn the_blocklist_comes_from_the_command_line_or_the_file() {
         text.contains("blocklist = \"/home/me/p2p.txt\"  # config file\n"),
         "{text}"
     );
+}
+
+#[test]
+fn encryption_is_prefer_require_or_off() {
+    use crate::peer::Encryption;
+    assert_eq!(
+        resolve(Options::default(), Options::default()).encryption,
+        Encryption::Prefer
+    );
+    let file = parse("encryption = \"require\"\n", None).unwrap();
+    assert_eq!(file.encryption, Some(Encryption::Require));
+    let cli = Options {
+        encryption: Some(Encryption::Off),
+        ..Options::default()
+    };
+    assert_eq!(
+        resolve(cli.clone(), file.clone()).encryption,
+        Encryption::Off
+    );
+    let config = ConfigFile {
+        path: None,
+        options: file,
+    };
+    let text = describe(&cli, &Options::default(), &config);
+    assert!(
+        text.contains("encryption = \"off\"  # command line\n"),
+        "{text}"
+    );
+    assert!(parse("encryption = \"always\"\n", None).is_err());
+    assert!(parse("encryption = true\n", None).is_err());
 }
 
 #[test]

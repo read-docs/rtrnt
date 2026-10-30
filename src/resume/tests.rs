@@ -55,6 +55,7 @@ fn config(output: &Path, resume: &Path) -> DownloadConfig {
         max_download_rate: 0,
         max_upload_rate: 0,
         completion_hook: None,
+        encryption: crate::peer::Encryption::Off,
         resume_dir: Some(resume.to_path_buf()),
     }
 }
@@ -84,6 +85,7 @@ fn session(config: &DownloadConfig) -> Arc<Session> {
         )),
         completion: None,
         super_seed: false,
+        encryption: crate::peer::Encryption::Off,
     })
 }
 

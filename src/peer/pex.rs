@@ -44,8 +44,8 @@ const FIRST_RETRY: Duration = Duration::from_secs(1);
 /// Messages that arrive sooner than this after the last one taken from the
 /// same peer are ignored, so a peer cannot flood us with addresses.
 pub const MIN_RECEIVE_INTERVAL: Duration = Duration::from_secs(30);
-/// Flag: the peer prefers encrypted connections. We never set it, since we
-/// do not know.
+/// Flag: the peer prefers encrypted connections. We set it for peers whose
+/// connection to us is encrypted (MSE).
 pub const FLAG_ENCRYPTION: u8 = 0x01;
 /// Flag: the peer is a seed (or only uploads).
 pub const FLAG_SEED: u8 = 0x02;
@@ -166,17 +166,22 @@ fn is_plausible(addr: &SocketAddr) -> bool {
     addr.port() != 0 && !ip.is_unspecified() && !ip.is_multicast() && !broadcast
 }
 
-/// The peers of `message` worth connecting to: among its first `MAX_ADDED`
-/// added peers, the plausible ones other than `sender` (the peer that sent
-/// it, under any of its addresses), leaving out seeds when `seeding`.
-fn worth_trying(message: &PexMessage, seeding: bool, sender: &[SocketAddr]) -> Vec<SocketAddr> {
+/// The peers of `message` worth connecting to, each with whether it is
+/// flagged as supporting encryption: among its first `MAX_ADDED` added
+/// peers, the plausible ones other than `sender` (the peer that sent it,
+/// under any of its addresses), leaving out seeds when `seeding`.
+fn worth_trying(
+    message: &PexMessage,
+    seeding: bool,
+    sender: &[SocketAddr],
+) -> Vec<(SocketAddr, bool)> {
     message
         .added
         .iter()
         .take(MAX_ADDED)
         .filter(|&&(_, flags)| !(seeding && flags & FLAG_SEED != 0))
-        .map(|&(addr, _)| canonical(addr))
-        .filter(|addr| is_plausible(addr) && !sender.contains(addr))
+        .map(|&(addr, flags)| (canonical(addr), flags & FLAG_ENCRYPTION != 0))
+        .filter(|(addr, _)| is_plausible(addr) && !sender.contains(addr))
         .collect()
 }
 
@@ -222,13 +227,15 @@ pub(crate) struct PeerExchange {
     enabled: bool,
     /// The connected peers, by peer id.
     peers: Mutex<HashMap<[u8; 20], Advertised>>,
-    learned: mpsc::UnboundedSender<Vec<SocketAddr>>,
+    /// Peers learned, each with whether it supports encryption.
+    learned: mpsc::UnboundedSender<Vec<(SocketAddr, bool)>>,
 }
 
 impl PeerExchange {
     /// A peer exchange, `enabled` unless the torrent is private, and the
-    /// receiving end for the peers learned through it.
-    pub(crate) fn new(enabled: bool) -> (Self, mpsc::UnboundedReceiver<Vec<SocketAddr>>) {
+    /// receiving end for the peers learned through it, each with whether
+    /// it supports encryption.
+    pub(crate) fn new(enabled: bool) -> (Self, mpsc::UnboundedReceiver<Vec<(SocketAddr, bool)>>) {
         let (learned, receiver) = mpsc::unbounded_channel();
         let exchange = Self {
             enabled,
@@ -243,16 +250,23 @@ impl PeerExchange {
     }
 
     /// Starts the peer exchange with the peer with id `id`, which we are
-    /// connected to at `addr`, over a connection we opened if `outbound`.
-    /// The peer is advertised to others while the returned handle lives,
-    /// once its listening address is known.
-    pub(crate) fn join(&self, id: [u8; 20], addr: SocketAddr, outbound: bool) -> PexPeer<'_> {
+    /// connected to at `addr`, over a connection we opened if `outbound`,
+    /// and `encrypted` or not. The peer is advertised to others while the
+    /// returned handle lives, once its listening address is known.
+    pub(crate) fn join(
+        &self,
+        id: [u8; 20],
+        addr: SocketAddr,
+        outbound: bool,
+        encrypted: bool,
+    ) -> PexPeer<'_> {
         let now = Instant::now();
         let mut peer = PexPeer {
             exchange: self,
             id,
             addr: canonical(addr),
             outbound,
+            encrypted,
             seed: false,
             advertised: Advertised::default(),
             sent: BTreeSet::new(),
@@ -263,7 +277,7 @@ impl PeerExchange {
         if self.enabled {
             self.lock().insert(id, Advertised::default());
             if outbound {
-                peer.advertise(Some(addr), FLAG_CONNECTABLE);
+                peer.advertise(Some(addr), peer.flags());
             }
         }
         peer
@@ -292,6 +306,8 @@ pub(crate) struct PexPeer<'a> {
     /// Whether we opened the connection, so `addr` is where the peer
     /// listens.
     outbound: bool,
+    /// Whether the connection is encrypted.
+    encrypted: bool,
     /// Whether the peer has every piece.
     seed: bool,
     /// What the exchange holds about the peer.
@@ -331,14 +347,7 @@ impl PexPeer<'_> {
             (false, Some(port)) => Some(SocketAddr::new(self.addr.ip(), port)),
             (false, None) => None,
         };
-        let mut flags = 0;
-        if self.outbound {
-            flags |= FLAG_CONNECTABLE;
-        }
-        if self.seed {
-            flags |= FLAG_SEED;
-        }
-        self.advertise(addr, flags);
+        self.advertise(addr, self.flags());
 
         if now < self.send_at
             || conn
@@ -401,6 +410,14 @@ impl PexPeer<'_> {
             let _ = self.exchange.learned.send(peers);
         }
         Ok(())
+    }
+
+    /// The flags other peers are told about the peer.
+    fn flags(&self) -> u8 {
+        let flag = |set: bool, flag: u8| if set { flag } else { 0 };
+        flag(self.outbound, FLAG_CONNECTABLE)
+            | flag(self.seed, FLAG_SEED)
+            | flag(self.encrypted, FLAG_ENCRYPTION)
     }
 
     /// The peer's addresses: where we are connected to it, and where it

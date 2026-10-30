@@ -53,6 +53,7 @@ fn peer(port: u16, rate_down: f64) -> crate::tui::snapshot::PeerSnapshot {
     crate::tui::snapshot::PeerSnapshot {
         addr: addr(port),
         inbound: false,
+        encrypted: false,
         client: None,
         flags: crate::stats::PeerFlags::initial(),
         downloaded: 0,

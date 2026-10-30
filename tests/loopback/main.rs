@@ -3,6 +3,7 @@
 mod add;
 mod common;
 mod download;
+mod encryption;
 mod fast;
 mod magnet;
 mod pause;

@@ -69,6 +69,8 @@ pub struct PeerStats {
     pub addr: SocketAddr,
     /// Whether the peer connected to us.
     pub inbound: bool,
+    /// Whether the connection is encrypted (MSE).
+    pub encrypted: bool,
     /// `v` from its extension handshake.
     client: OnceLock<String>,
     downloaded: AtomicU64,
@@ -83,12 +85,18 @@ impl PeerStats {
         Self {
             addr,
             inbound,
+            encrypted: false,
             client: OnceLock::new(),
             downloaded: AtomicU64::new(0),
             uploaded: AtomicU64::new(0),
             pieces: AtomicU32::new(0),
             flags: AtomicU8::new(PeerFlags::initial().0),
         }
+    }
+
+    /// The same peer, over an encrypted connection if `encrypted`.
+    pub fn with_encryption(self, encrypted: bool) -> Self {
+        Self { encrypted, ..self }
     }
 
     pub fn client(&self) -> Option<&str> {

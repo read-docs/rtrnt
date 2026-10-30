@@ -13,6 +13,7 @@ use tracing::info;
 
 use super::progress::bar_label;
 use super::{Interrupted, SeedLimits, Session};
+use crate::peer::Encryption;
 
 /// Verifies a download against its torrent without changing anything on
 /// disk, and prints which files are missing, the wrong size or corrupt.
@@ -37,6 +38,8 @@ pub async fn check_file(torrent_path: &Path, output_dir: &Path) -> Result<()> {
         stats,
         completion: None,
         super_seed: false,
+        // No peers are connected to.
+        encryption: Encryption::default(),
     });
     // Nothing else is hashing, and nothing stops the check.
     let have = hash_pieces(

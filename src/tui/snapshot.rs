@@ -138,6 +138,8 @@ impl TorrentSnapshot {
 pub struct PeerSnapshot {
     pub addr: SocketAddr,
     pub inbound: bool,
+    /// Whether the connection is encrypted (MSE).
+    pub encrypted: bool,
     pub client: Option<String>,
     pub flags: PeerFlags,
     pub downloaded: u64,
@@ -318,6 +320,7 @@ fn detail(torrent: &TorrentStats, now: Instant) -> Detail {
         .map(|peer| PeerSnapshot {
             addr: peer.addr,
             inbound: peer.inbound,
+            encrypted: peer.encrypted,
             client: peer.client().map(str::to_string),
             flags: peer.flags(),
             downloaded: peer.downloaded(),

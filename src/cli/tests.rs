@@ -10,6 +10,15 @@ fn cli_is_valid() {
 }
 
 #[test]
+fn takes_an_encryption_policy() {
+    let args = Args::try_parse_from(["rtrnt", "a.torrent", "--encryption", "require"]).unwrap();
+    assert_eq!(args.options().encryption, Some(peer::Encryption::Require));
+    let args = Args::try_parse_from(["rtrnt", "a.torrent"]).unwrap();
+    assert_eq!(args.options().encryption, None);
+    assert!(Args::try_parse_from(["rtrnt", "a.torrent", "--encryption", "always"]).is_err());
+}
+
+#[test]
 fn takes_a_torrent_file_or_a_magnet_link() {
     let hash = "c12fe1c06bba254a9dc9f519b335aa7c1367a88a";
     let args = Args::try_parse_from(["rtrnt", "file.torrent"]).unwrap();
