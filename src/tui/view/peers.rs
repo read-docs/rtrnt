@@ -16,7 +16,7 @@ use ratatui::widgets::Paragraph;
 /// Width of the Has bar, before its `seed` or percentage.
 const BAR: usize = 10;
 const ADDRESS: usize = 24;
-const FLAGS: usize = 9;
+const FLAGS: usize = 11;
 const RATE: usize = 10;
 const HAS: usize = BAR + 5;
 /// Narrowest client column worth showing.
@@ -24,8 +24,8 @@ const MIN_CLIENT: usize = 8;
 
 /// The flags column: `D`/`d` we download (unchoked) or are interested but
 /// choked, `U`/`u` we upload or the peer is interested but choked, `I`
-/// incoming, `F` fast extension, `X` peer exchange.
-pub fn flag_letters(flags: PeerFlags, inbound: bool) -> String {
+/// incoming, `F` fast extension, `X` peer exchange, `E` encrypted.
+pub fn flag_letters(flags: PeerFlags, inbound: bool, encrypted: bool) -> String {
     let down = match (flags.am_interested(), flags.peer_choking()) {
         (true, false) => 'D',
         (true, true) => 'd',
@@ -45,6 +45,7 @@ pub fn flag_letters(flags: PeerFlags, inbound: bool) -> String {
         flag(inbound, 'I'),
         flag(flags.fast(), 'F'),
         flag(flags.pex(), 'X'),
+        flag(encrypted, 'E'),
     ];
     let spaced: Vec<String> = letters.iter().map(char::to_string).collect();
     spaced.join(" ")
@@ -160,7 +161,11 @@ pub fn draw(
         spans.push(Span::styled(
             format!(
                 " {}",
-                fit(&flag_letters(peer.flags, peer.inbound), FLAGS, false)
+                fit(
+                    &flag_letters(peer.flags, peer.inbound, peer.encrypted),
+                    FLAGS,
+                    false
+                )
             ),
             Style::new().fg(theme.warn()),
         ));
@@ -230,8 +235,9 @@ pub fn draw(
             if web == 1 { "" } else { "s" }
         ));
     }
-    let legend =
-        format!(" {shown}  ·  D/d down unchoked/interested  U/u up  I incoming  F fast  X pex");
+    let legend = format!(
+        " {shown}  ·  D/d down unchoked/interested  U/u up  I incoming  F fast  X pex  E encrypted"
+    );
     let mut footer_lines = vec![Line::from(Span::styled(legend, theme.dim_style()))];
     if footer > 1 {
         // The cursor peer's rates, titled with who it is, or the torrent's.
@@ -354,12 +360,13 @@ mod tests {
                 true,
                 false,
             );
-            flag_letters(flags, inbound)
+            flag_letters(flags, inbound, false)
         };
-        assert_eq!(letters(false, false, true, false, false), "D U   F  ");
-        assert_eq!(letters(true, true, true, true, true), "d u I F  ");
-        assert_eq!(letters(true, false, false, false, false), "      F  ");
+        assert_eq!(letters(false, false, true, false, false), "D U   F    ");
+        assert_eq!(letters(true, true, true, true, true), "d u I F    ");
+        assert_eq!(letters(true, false, false, false, false), "      F    ");
         let pex = PeerFlags::new(true, true, false, false, false, true);
-        assert_eq!(flag_letters(pex, false), "        X");
+        assert_eq!(flag_letters(pex, false, false), "        X  ");
+        assert_eq!(flag_letters(pex, false, true), "        X E");
     }
 }

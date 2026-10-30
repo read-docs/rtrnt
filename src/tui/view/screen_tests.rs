@@ -99,19 +99,19 @@ fn peers_tab_lists_peers_fastest_first() {
     let buffer = render(100, 32, &snapshot, &app);
     let lines = text(&buffer, buffer.area);
     assert!(lines[10].starts_with(
-        "│ Address                  Client                  Flags              ↓          ↑  Has"
+        "│ Address                  Client                Flags                ↓          ↑  Has"
     ));
     assert_eq!(
         lines[11],
-        "│ 185.21.216.143:51413     Transmission 4.0.6      D U   F X  1.1 MiB/s   48 KiB/s  ██████████ seed│"
+        "│ 185.21.216.143:51413     Transmission 4.0.6    D U   F X E  1.1 MiB/s   48 KiB/s  ██████████ seed│"
     );
     assert_eq!(
         lines[13],
-        "│ 91.121.44.7:6881         libtorrent 2.0.11       D U   F    640 KiB/s  112 KiB/s  ████████▎─  82%│"
+        "│ 91.121.44.7:6881         libtorrent 2.0.11     D U   F      640 KiB/s  112 KiB/s  ████████▎─  82%│"
     );
     assert!(
         lines[18]
-            .starts_with("│ 73.92.10.211:42069       Deluge 2.2.0            d U I F        0 B/s")
+            .starts_with("│ 73.92.10.211:42069       Deluge 2.2.0          d U I F   E      0 B/s")
     );
     assert!(lines[26].starts_with("│ 9 peers  ·  D/d down unchoked/interested"));
     assert!(lines[28].starts_with("│ ↓ ▇"), "{}", lines[28]);
