@@ -6,11 +6,15 @@ pub mod extension;
 pub mod fast;
 mod handshake;
 mod message;
+pub mod mse;
 pub mod pex;
+mod stream;
 
 pub use connection::{PeerConnection, ProtocolViolation};
 pub use handshake::{Handshake, Incoming, handshake_bytes, parse_handshake};
 pub use message::{BlockRef, PeerMessage, encode_bitfield};
+pub use mse::{Encryption, Wire};
+pub use stream::{PeerStream, Transport};
 
 /// Port we listen on for incoming peers unless told otherwise.
 pub const DEFAULT_LISTEN_PORT: u16 = 6881;
