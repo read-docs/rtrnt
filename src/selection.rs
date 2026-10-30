@@ -141,6 +141,63 @@ impl FilePicks {
         Ok(Self(ranges))
     }
 
+    /// Parses the value of a magnet link's `so` parameter (BEP 53): file
+    /// indices and inclusive ranges, counting from 0 (`0,2,4-6`). Items
+    /// that are not one are left out and returned as text, along with the
+    /// picks that are.
+    pub fn parse_indices(text: &str) -> (Self, Vec<String>) {
+        let index = |part: &str| part.parse::<usize>().ok().and_then(|n| n.checked_add(1));
+        let mut ranges = Vec::new();
+        let mut rejected = Vec::new();
+        for item in text.split(',') {
+            let range = match item.split_once('-') {
+                Some((first, last)) => index(first).zip(index(last)),
+                None => index(item).map(|n| (n, n)),
+            };
+            match range {
+                Some((first, last)) if first <= last => ranges.push((first, last)),
+                _ => rejected.push(item.to_owned()),
+            }
+        }
+        (Self(ranges), rejected)
+    }
+
+    /// The picks as a `so` value (see `parse_indices`), ranges merged and
+    /// in order; empty if nothing is picked.
+    pub fn to_indices(&self) -> String {
+        let mut sorted = self.0.clone();
+        sorted.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (first, last) in sorted {
+            match merged.last_mut() {
+                Some(prev) if first <= prev.1.saturating_add(1) => prev.1 = prev.1.max(last),
+                _ => merged.push((first, last)),
+            }
+        }
+        let parts: Vec<String> = merged
+            .into_iter()
+            .map(|(first, last)| {
+                if first == last {
+                    (first - 1).to_string()
+                } else {
+                    format!("{}-{}", first - 1, last - 1)
+                }
+            })
+            .collect();
+        parts.join(",")
+    }
+
+    /// These picks and `other`'s together.
+    pub fn with(mut self, other: &FilePicks) -> Self {
+        self.0.extend_from_slice(&other.0);
+        self
+    }
+
+    /// Whether nothing is picked.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     /// The highest file number picked.
     pub fn last(&self) -> usize {
         self.0.iter().map(|&(_, last)| last).max().unwrap_or(0)

@@ -116,6 +116,31 @@ pub(super) async fn drop_completed(
     Ok(())
 }
 
+/// Lets go of the held piece `index`, which the peer no longer has
+/// (`lt_donthave`, BEP 54), cancelling the requests still outstanding for
+/// it. With `cancelled` (fast extension), the cancelled requests are added
+/// to it, as the peer still answers them.
+pub(super) async fn drop_lost(
+    conn: &mut PeerConnection,
+    active: &mut Vec<ActivePiece<'_>>,
+    index: usize,
+    cancelled: Option<&mut HashSet<BlockRef>>,
+) -> Result<()> {
+    let Some(pos) = active.iter().position(|piece| piece.claim.index == index) else {
+        return Ok(());
+    };
+    debug!(addr = %conn.addr, index, "peer no longer has the piece");
+    let piece = active.swap_remove(pos);
+    let cancels: Vec<PeerMessage> = piece.outstanding().map(BlockRef::cancel).collect();
+    if let Some(cancelled) = cancelled {
+        cancelled.extend(piece.outstanding());
+    }
+    if !cancels.is_empty() {
+        conn.send_all(&cancels).await?;
+    }
+    Ok(())
+}
+
 /// Takes back the requests the peer has not answered within `timeout`, and
 /// cancels them, so their blocks are asked for again. With `cancelled` (fast
 /// extension), the cancelled requests are added to it, as the peer still

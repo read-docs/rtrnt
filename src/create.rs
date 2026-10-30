@@ -186,6 +186,7 @@ pub fn build(
         name: Some(name.clone()),
         trackers: options.trackers.clone(),
         peers: Vec::new(),
+        select_only: None,
     };
     Ok(Created {
         data: top.finish(),

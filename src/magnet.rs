@@ -17,7 +17,7 @@ use crate::download::{self, CheckedOnly, Limits, Session, StartPeers};
 use crate::manager::{Recheck, StartOptions};
 use crate::peer::extension::Advertised;
 use crate::resume::{self, Target};
-use crate::selection;
+use crate::selection::{self, FilePicks};
 use crate::stats::{PeerSource, TorrentState, TorrentStats};
 use crate::storage::Storage;
 use crate::torrent;
@@ -48,6 +48,9 @@ pub struct MagnetLink {
     /// `x.pe`: addresses of peers to fetch the metadata from directly. Only
     /// IP literals; host names are skipped.
     pub peers: Vec<SocketAddr>,
+    /// `so` (BEP 53): the files to download, counting from 0, for when the
+    /// metadata arrives. `None` if the link has none, or none that is valid.
+    pub select_only: Option<FilePicks>,
 }
 
 /// Whether `arg` looks like a magnet link rather than a file path.
@@ -74,6 +77,7 @@ impl MagnetLink {
             name: None,
             trackers: Vec::new(),
             peers: Vec::new(),
+            select_only: None,
         };
         for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
             match &*key {
@@ -99,6 +103,18 @@ impl MagnetLink {
                         && !link.peers.contains(&addr)
                     {
                         link.peers.push(addr);
+                    }
+                }
+                "so" => {
+                    let (picks, rejected) = FilePicks::parse_indices(&value);
+                    for item in rejected {
+                        warn!("magnet link: ignoring {item:?} in so=, not a file index or range");
+                    }
+                    if !picks.is_empty() {
+                        link.select_only = Some(match link.select_only.take() {
+                            Some(known) => known.with(&picks),
+                            None => picks,
+                        });
                     }
                 }
                 _ => {}
@@ -128,6 +144,9 @@ impl MagnetLink {
         }
         for peer in &self.peers {
             query.append_pair("x.pe", &peer.to_string());
+        }
+        if let Some(picks) = &self.select_only {
+            query.append_pair("so", &picks.to_indices());
         }
         format!("magnet:?{}", query.finish())
     }
@@ -380,6 +399,7 @@ async fn fetch_and_download(
         let selection = download::initial_selection(
             options,
             resume.as_ref(),
+            link.select_only.as_ref(),
             selection::file_count(&torrent.info),
         );
         let storage =

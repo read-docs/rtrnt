@@ -160,6 +160,7 @@ fn render(metainfo: &Metainfo, extras: &Extras) -> String {
         name: Some(torrent.info.name.clone()),
         trackers: tiers.concat(),
         peers: Vec::new(),
+        select_only: None,
     };
     let _ = writeln!(
         out,

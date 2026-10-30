@@ -536,3 +536,60 @@ async fn fast_messages_without_the_fast_extension_are_a_protocol_violation() {
     }
     assert!(!PeerMessage::Choke.is_fast());
 }
+
+fn donthave_message(payload: &[u8]) -> PeerMessage {
+    PeerMessage::Extended {
+        id: extension::LT_DONTHAVE_ID,
+        payload: payload.to_vec(),
+    }
+}
+
+#[tokio::test]
+async fn donthave_takes_a_piece_back() {
+    let messages = vec![
+        PeerMessage::HaveAll,
+        donthave_message(&[0, 0, 0, 1]),
+        // Past the last piece, so ignored, like a Have would be.
+        donthave_message(&[0, 0, 1, 0]),
+        donthave_message(&u32::MAX.to_be_bytes()),
+        // A Have brings it back.
+        PeerMessage::Have { piece_index: 1 },
+    ];
+    let (mut conn, _remote) = mock_peer(3, true, messages).await;
+    for _ in 0..3 {
+        conn.receive().await.unwrap();
+    }
+    assert_eq!(conn.peer_has(), [true, false, true]);
+    conn.receive().await.unwrap();
+    conn.receive().await.unwrap();
+    assert_eq!(conn.peer_has(), [true; 3]);
+}
+
+#[tokio::test]
+async fn a_donthave_of_the_wrong_length_is_a_protocol_violation() {
+    for payload in [&[][..], &[0, 0, 1], &[0, 0, 0, 0, 0]] {
+        let (mut conn, _remote) = mock_peer(3, false, vec![donthave_message(payload)]).await;
+        let error = conn.receive().await.unwrap_err();
+        assert!(error.is::<ProtocolViolation>(), "{payload:?}: {error:#}");
+    }
+}
+
+#[tokio::test]
+async fn donthave_while_the_piece_count_is_unknown_applies_afterwards() {
+    let messages = vec![
+        PeerMessage::Have { piece_index: 0 },
+        PeerMessage::Have { piece_index: 1 },
+        PeerMessage::Have { piece_index: 2 },
+        donthave_message(&[0, 0, 0, 0]),
+        // Taken back, then had again.
+        donthave_message(&[0, 0, 0, 1]),
+        PeerMessage::Have { piece_index: 1 },
+    ];
+    let (mut conn, _remote) = mock_peer(0, false, messages).await;
+    conn.defer_pieces();
+    for _ in 0..6 {
+        conn.receive().await.unwrap();
+    }
+    conn.set_piece_count(3).unwrap();
+    assert_eq!(conn.peer_has(), [false, true, true]);
+}

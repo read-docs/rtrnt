@@ -34,9 +34,20 @@ pub const UT_METADATA: &str = "ut_metadata";
 /// Extended message id peers send us `ut_metadata` messages with. The same
 /// as libtorrent's.
 pub const UT_METADATA_ID: u8 = 2;
+/// Name of libtorrent's `lt_donthave` extension (BEP 54): the sender no
+/// longer has a piece it announced. The payload is the piece index, as 4
+/// bytes in network order.
+pub const LT_DONTHAVE: &str = "lt_donthave";
+/// Extended message id peers send us `lt_donthave` messages with. The same
+/// as libtorrent's.
+pub const LT_DONTHAVE_ID: u8 = 3;
 /// The extensions we implement, each with the extended message id peers
 /// must send its messages to us with. Advertised in our handshake as `m`.
-pub const EXTENSIONS: &[(&str, u8)] = &[(pex::NAME, pex::ID), (UT_METADATA, UT_METADATA_ID)];
+pub const EXTENSIONS: &[(&str, u8)] = &[
+    (pex::NAME, pex::ID),
+    (UT_METADATA, UT_METADATA_ID),
+    (LT_DONTHAVE, LT_DONTHAVE_ID),
+];
 /// Extensions that private torrents (BEP 27) must not use, which are left
 /// out of `m` for them.
 pub const PUBLIC_ONLY: &[&str] = &[pex::NAME];
@@ -191,6 +202,12 @@ impl ExtendedHandshake {
         self.your_ip = newer.your_ip.or(self.your_ip);
         self.metadata_size = newer.metadata_size.or(self.metadata_size);
     }
+}
+
+/// The piece index in an `lt_donthave` payload (BEP 54), or `None` unless
+/// the payload is exactly 4 bytes.
+pub fn parse_donthave(payload: &[u8]) -> Option<u32> {
+    <[u8; 4]>::try_from(payload).ok().map(u32::from_be_bytes)
 }
 
 /// An IPv4 (4 bytes) or IPv6 (16 bytes) address in network order.

@@ -14,7 +14,8 @@ use tracing::{debug, warn};
 
 use super::queue::PieceQueue;
 use super::requests::{
-    ActivePiece, Pipeline, drop_completed, expire_requests, release_choked, request_blocks,
+    ActivePiece, Pipeline, drop_completed, drop_lost, expire_requests, release_choked,
+    request_blocks,
 };
 use super::smart_ban::Sender;
 use super::superseed::{HEARING, Offers, PeerOffer};
@@ -426,6 +427,24 @@ pub(super) async fn peer_worker(
             PeerMessage::Port { port } => {
                 if let Some(dht) = &session.dht {
                     dht.add_node(SocketAddr::new(addr.ip(), port));
+                }
+            }
+            // BEP 54: the peer lost a piece it had announced.
+            PeerMessage::Extended {
+                id: extension::LT_DONTHAVE_ID,
+                payload,
+            } => {
+                // `conn` has cleared it from the peer's pieces already,
+                // which `has_changed` brings into the queue's availability.
+                has_changed = true;
+                if let Some(index) = extension::parse_donthave(&payload) {
+                    drop_lost(
+                        &mut conn,
+                        &mut active,
+                        index as usize,
+                        fast.then_some(&mut cancelled),
+                    )
+                    .await?;
                 }
             }
             PeerMessage::Extended {

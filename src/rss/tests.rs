@@ -183,6 +183,7 @@ fn magnet_source(hash: [u8; 20]) -> Source {
         name: None,
         trackers: Vec::new(),
         peers: Vec::new(),
+        select_only: None,
     }))
 }
 
