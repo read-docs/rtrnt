@@ -1992,10 +1992,24 @@ async fn moving_paused_data_updates_the_saved_directory_and_preserves_pause() {
     let client = client_in(&old);
     let mut manager = Manager::with_runner(Arc::clone(&client), never, fake_run);
     manager
-        .command(Command::AddPaused(Source::File(path)))
+        .command(Command::AddPaused(Source::File(path.clone())))
         .await;
     client.stats().torrents()[0].set_verified(7);
     client.stats().torrents()[0].set_selection(vec![Priority::High], 16 * 1024);
+    let info = torrent::load_file(&path).await.unwrap().0.info;
+    let occupied = Storage::paths(&info, &old).unwrap();
+    let other = client
+        .claim_files([123; 20], "another torrent", &occupied)
+        .unwrap();
+    manager
+        .command(Command::MoveData {
+            info_hash: hash,
+            dir: new.clone(),
+        })
+        .await;
+    assert!(old.join("payload").exists());
+    assert!(!new.join("payload").exists());
+    drop(other);
     manager
         .command(Command::MoveData {
             info_hash: hash,

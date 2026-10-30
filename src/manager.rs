@@ -1587,7 +1587,10 @@ where
             }
             let old = storage::layout(&torrent.info, &old_dir)?;
             let new = storage::layout(&torrent.info, &dir)?;
-            let keys = Storage::paths_async(&torrent.info, &dir).await?;
+            let mut keys = Storage::paths_async(&torrent.info, &dir).await?;
+            // A different active torrent may have claimed the old files
+            // since this one paused. Protect both sides of the move.
+            keys.extend(Storage::paths_async(&torrent.info, &old_dir).await?);
             let _claim = self
                 .client
                 .claim_files(info_hash, &torrent.info.name, &keys)?;
