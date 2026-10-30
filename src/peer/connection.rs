@@ -3,7 +3,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::{Buf, BytesMut};
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::{Duration, Instant, timeout};
 use tracing::debug;
 
@@ -112,7 +111,7 @@ impl PeerConnection {
             let Some(&wire) = attempts.next() else {
                 bail!("no way to greet the peer");
             };
-            let socket = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+            let socket = timeout(CONNECT_TIMEOUT, crate::network::global().connect(addr))
                 .await
                 .context("connection timed out")?
                 .context("connection failed")?;

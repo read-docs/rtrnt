@@ -15,6 +15,7 @@ pub mod lsd;
 pub mod magnet;
 pub mod manager;
 pub mod metrics;
+pub mod network;
 pub mod peer;
 mod periodic;
 pub mod portmap;

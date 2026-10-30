@@ -11,7 +11,7 @@ use anyhow::{Result, bail};
 use rand::Rng;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 use std::time::Duration;
@@ -192,7 +192,22 @@ async fn route(
 /// listener comes first. Without IPv6 we listen over IPv4 only, and without
 /// any listener we still download, over the connections we open ourselves.
 pub async fn listen(port: u16) -> Vec<TcpListener> {
-    let bind = |port| TcpListener::bind((Ipv4Addr::UNSPECIFIED, port));
+    if crate::network::global().proxied() {
+        return Vec::new();
+    }
+    let bind = |port| async move {
+        let socket = tokio::net::TcpSocket::new_v4()?;
+        crate::network::global()
+            .bind_socket(&socket2::SockRef::from(&socket), false)
+            .map_err(std::io::Error::other)?;
+        socket.set_reuseaddr(true)?;
+        socket.bind(
+            crate::network::global()
+                .bind_addr(false, port)
+                .map_err(std::io::Error::other)?,
+        )?;
+        socket.listen(1024)
+    };
     let result = match bind(port).await {
         Err(e) if port != 0 => {
             warn!(port, "cannot listen on port: {e}; using a free one instead");
@@ -223,7 +238,15 @@ fn listen_v6(port: u16) -> std::io::Result<TcpListener> {
     #[cfg(unix)]
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
-    socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
+    crate::network::global()
+        .bind_socket(&socket2::SockRef::from(&socket), true)
+        .map_err(std::io::Error::other)?;
+    socket.bind(
+        &crate::network::global()
+            .bind_addr(true, port)
+            .map_err(std::io::Error::other)?
+            .into(),
+    )?;
     socket.listen(1024)?;
     TcpListener::from_std(socket.into())
 }

@@ -50,6 +50,10 @@ pub(super) async fn announce_udp(url: &Url, request: &AnnounceRequest) -> Result
 
 /// Resolves a UDP tracker URL and opens a socket connected to the tracker.
 async fn udp_socket(url: &Url) -> Result<(UdpSocket, SocketAddr)> {
+    anyhow::ensure!(
+        !crate::network::global().proxied(),
+        "UDP trackers are disabled by the SOCKS5 proxy"
+    );
     let host = url
         .host_str()
         .ok_or_else(|| anyhow!("tracker URL has no host"))?;
@@ -65,12 +69,7 @@ async fn udp_socket(url: &Url) -> Result<(UdpSocket, SocketAddr)> {
     .next()
     .ok_or_else(|| anyhow!("could not resolve {}", host))?;
 
-    let bind_addr = if addr.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let socket = UdpSocket::bind(bind_addr).await?;
+    let socket = crate::network::global().udp_socket(addr.is_ipv6(), 0)?;
     socket.connect(addr).await?;
     Ok((socket, addr))
 }

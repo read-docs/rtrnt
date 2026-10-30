@@ -309,6 +309,9 @@ fn describe_names_each_source() {
     assert_eq!(
         text,
         "# config file: /etc/rtrnt.toml\n\
+         # bind-address: any address  # default\n\
+         # bind-interface: any interface  # default\n\
+         # proxy: direct  # default\n\
          output = \"/data\"  # config file\n\
          max-peers = 5  # command line\n\
          max-connections = 150  # config file\n\
@@ -809,4 +812,18 @@ fn print_config_shows_the_tags_as_toml_that_reads_back() {
         parse(value, None).unwrap().tag_settings(),
         file.options.tag_settings()
     );
+}
+
+#[test]
+fn network_settings_parse_and_cli_values_take_precedence() {
+    let file = parse("bind-address = \"127.0.0.1\"\nbind-interface = \"lo0\"\nproxy = \"socks5h://127.0.0.1:1080\"\n", None).unwrap();
+    assert_eq!(file.bind_address, Some("127.0.0.1".parse().unwrap()));
+    assert_eq!(file.bind_interface.as_deref(), Some("lo0"));
+    let merged = Options {
+        proxy: Some("socks5h://127.0.0.1:1081".into()),
+        ..Options::default()
+    }
+    .or(file);
+    assert_eq!(merged.proxy.as_deref(), Some("socks5h://127.0.0.1:1081"));
+    assert!(parse("bind-address = \"not-an-ip\"\n", None).is_err());
 }
