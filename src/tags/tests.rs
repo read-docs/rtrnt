@@ -123,3 +123,19 @@ fn a_table_shows_as_toml_that_reads_back() {
     let wrapper: BTreeMap<String, TagTable> = toml::from_str(&format!("t = {text}")).unwrap();
     assert_eq!(wrapper["t"], table);
 }
+
+#[test]
+fn tag_directories_round_trip_and_empty_paths_are_rejected() {
+    let table: TagTable =
+        toml::from_str("[tv]\ndownload-dir = '/downloads/tv'\nupload = 20").unwrap();
+    table.validate().unwrap();
+    assert_eq!(
+        table.directories()["tv"],
+        std::path::PathBuf::from("/downloads/tv")
+    );
+    let wrapper: BTreeMap<String, TagTable> =
+        toml::from_str(&format!("t = {}", table.to_toml())).unwrap();
+    assert_eq!(wrapper["t"], table);
+    let empty: TagTable = toml::from_str("[tv]\ndownload-dir = ''").unwrap();
+    assert!(empty.validate().is_err());
+}

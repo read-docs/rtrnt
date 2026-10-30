@@ -30,6 +30,7 @@ pub fn draw(frame: &mut Frame, app: &App, input: &Input, area: Rect) {
         | InputKind::SeedRatio
         | InputKind::SeedTime
         | InputKind::Tags => [("enter", "set"), ("esc", "cancel")],
+        InputKind::Trackers | InputKind::MoveData => [("enter", "save"), ("esc", "cancel")],
         InputKind::Add => [("enter", "add"), ("esc", "cancel")],
     };
     spans.extend(keys(theme, &hints));

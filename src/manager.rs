@@ -12,13 +12,36 @@ use crate::session::{SavedAltSpeed, SavedLimits, SavedSession, SavedTorrent, Ses
 use crate::source::Source;
 use crate::stats::{TorrentState, TorrentStats};
 use crate::storage::{self, Storage};
-use crate::tags::{self, TagSettings};
+use crate::tags::{self, TagDirectories, TagSettings};
 use crate::torrent::{self, Info, Metainfo};
 use crate::torrent_limits::TorrentSettings;
 use anyhow::{Result, anyhow};
+
+mod relocate;
+
+/// Validate tracker URLs accepted by the HTTP and UDP announce clients.
+pub fn validate_trackers(trackers: Vec<String>) -> Result<Vec<String>> {
+    let mut result = Vec::new();
+    for tracker in trackers {
+        let url = url::Url::parse(&tracker)?;
+        anyhow::ensure!(
+            matches!(url.scheme(), "http" | "https" | "udp") && url.host_str().is_some(),
+            "tracker must be an http, https or udp URL"
+        );
+        anyhow::ensure!(
+            url.scheme() != "udp" || url.port().is_some(),
+            "UDP tracker needs a port"
+        );
+        if !result.contains(&tracker) {
+            result.push(tracker);
+        }
+    }
+    Ok(result)
+}
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +60,13 @@ const QUEUE_TICK: Duration = Duration::from_secs(1);
 /// What the UI asks of the session.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Command {
+    /// Replace the trackers, one URL per tier, and restart a running torrent.
+    SetTrackers {
+        info_hash: [u8; 20],
+        trackers: Vec<String>,
+    },
+    /// Move a paused torrent’s existing data into this directory.
+    MoveData { info_hash: [u8; 20], dir: PathBuf },
     /// Stop the torrents, as Ctrl-C does.
     Stop,
     /// Change the download and upload limits to these KiB/s, 0 for none.
@@ -72,7 +102,8 @@ pub enum Command {
         settings: TorrentSettings,
     },
     /// Give the torrent with this info hash these tags, in place of its
-    /// own (see `tags`): the settings its tags give it apply at once.
+    /// own (see `tags`): limits apply at once; tag directories move stopped
+    /// torrents only, unless an explicit per-torrent directory wins.
     SetTags {
         info_hash: [u8; 20],
         tags: Vec<String>,
@@ -85,6 +116,14 @@ pub enum Command {
     /// Add the torrent from this source as `Add` does, but paused: it is
     /// listed, and starts when it is resumed.
     AddPaused(Source),
+    /// Add the torrent from this source as `Add` does, or as `AddPaused`
+    /// does if `paused`, with its files in `dir` rather than in the
+    /// session's output directory (see `Manager::dir_of`).
+    AddIn {
+        source: Source,
+        paused: bool,
+        dir: PathBuf,
+    },
     /// Move the torrent with this info hash one place earlier in the queue
     /// and the table, which is the order torrents get a free slot in.
     MoveUp([u8; 20]),
@@ -115,6 +154,20 @@ pub struct StartOptions {
     /// as doing so; `None` to keep what it had, and failing that the
     /// configured default.
     pub sequential: Option<bool>,
+    /// The directory to download into, if the torrent has one of its own
+    /// rather than the client's `output_dir`. The manager fills it in for
+    /// each run from what it keeps for the torrent, whatever is set here.
+    pub output_dir: Option<PathBuf>,
+    /// Tracker URLs overriding the source, one per tier; an empty list disables trackers.
+    pub trackers: Option<Vec<String>>,
+}
+
+impl StartOptions {
+    /// Where a run with these options puts the torrent's files: its own
+    /// directory, or else the one in `config`.
+    pub fn output_dir<'a>(&'a self, config: &'a crate::download::DownloadConfig) -> &'a Path {
+        self.output_dir.as_deref().unwrap_or(&config.output_dir)
+    }
 }
 
 /// Whether, and what next, a run hashes the data on disk, ignoring the
@@ -237,6 +290,13 @@ pub struct Manager<S, R> {
     limits: QueueLimits,
     /// What each tag gives the torrents that have it.
     tag_settings: TagSettings,
+    tag_directories: TagDirectories,
+    /// Directories from tags may follow later tag edits; explicit moves win.
+    tag_dirs: HashSet<[u8; 20]>,
+    /// The torrents that are saved in a directory of their own, by info
+    /// hash, rather than in the client's output directory.
+    dirs: HashMap<[u8; 20], PathBuf>,
+    trackers: HashMap<[u8; 20], Vec<String>>,
 }
 
 /// A limit in KiB/s as a notice says it.
@@ -289,6 +349,10 @@ where
             saved_limits: None,
             limits: QueueLimits::default(),
             tag_settings: TagSettings::new(),
+            tag_directories: TagDirectories::new(),
+            tag_dirs: HashSet::new(),
+            dirs: HashMap::new(),
+            trackers: HashMap::new(),
             speed: SpeedControl::new(
                 client.rate_limits().kib(),
                 (
@@ -316,6 +380,13 @@ where
     /// tagged later.
     pub fn with_tag_settings(mut self, tag_settings: TagSettings) -> Self {
         self.tag_settings = tag_settings;
+        self
+    }
+
+    /// Gives tags their download directories. A tag edit can move stopped
+    /// data; active torrents require pausing and reapplying the tags first.
+    pub fn with_tag_directories(mut self, directories: TagDirectories) -> Self {
+        self.tag_directories = directories;
         self
     }
 
@@ -420,6 +491,17 @@ where
                     continue;
                 }
             };
+            if let Some(trackers) = saved.trackers
+                && let Ok(trackers) = validate_trackers(trackers)
+            {
+                self.trackers.insert(saved.info_hash, trackers);
+            }
+            if let Some(dir) = saved.dir {
+                self.dirs.insert(saved.info_hash, dir);
+                if saved.dir_from_tag {
+                    self.tag_dirs.insert(saved.info_hash);
+                }
+            }
             self.client
                 .stats()
                 .torrent_limits(saved.info_hash)
@@ -450,18 +532,26 @@ where
         self.save_session().await;
     }
 
+    /// Where the torrent with `info_hash` keeps its files: the directory of
+    /// its own, if it has one, and otherwise the client's output directory.
+    fn dir_of(&self, info_hash: [u8; 20]) -> &Path {
+        self.dirs
+            .get(&info_hash)
+            .map_or(self.client.config().output_dir.as_path(), PathBuf::as_path)
+    }
+
     /// Gives a torrent that has not run this session a row, in `state`
     /// (paused, or queued), which its first run takes the place of.
     fn show_row(&self, torrent: &Torrent, source: &Source, state: TorrentState) {
         let name = source.label();
-        let stats = self.client.stats().add_torrent(
-            torrent.info_hash(),
-            &name,
-            &self.client.config().output_dir,
-        );
+        let dir = self.dir_of(torrent.info_hash());
+        let stats = self
+            .client
+            .stats()
+            .add_torrent(torrent.info_hash(), &name, dir);
         if let Torrent::File(metainfo) = torrent {
             stats.set_torrent(&metainfo.torrent);
-            let target = resume::Target::new(self.client.config(), torrent.info_hash());
+            let target = resume::Target::in_dir(self.client.config(), dir, torrent.info_hash());
             let files = crate::selection::file_count(&metainfo.torrent.info);
             if let Some(selection) =
                 target.and_then(|target| resume::load_selection(&target, files))
@@ -469,6 +559,14 @@ where
             {
                 stats.set_selection(selection.for_files(files), wanted);
             }
+        }
+        if let Some(trackers) = self.trackers.get(&torrent.info_hash()) {
+            stats.set_trackers(
+                &trackers
+                    .iter()
+                    .map(|url| vec![url.clone()])
+                    .collect::<Vec<_>>(),
+            );
         }
         stats.set_state(state);
     }
@@ -521,6 +619,9 @@ where
                         .and_then(|stats| stats.sequential_choice()),
                     limits: self.client.stats().torrent_settings(entry.info_hash),
                     tags: self.client.stats().torrent_tags(entry.info_hash),
+                    dir: self.dirs.get(&entry.info_hash).cloned(),
+                    dir_from_tag: self.tag_dirs.contains(&entry.info_hash),
+                    trackers: self.trackers.get(&entry.info_hash).cloned(),
                 })
             })
             .collect();
@@ -594,6 +695,11 @@ where
     /// state of its entry.
     fn spawn(&mut self, torrent: Torrent, options: StartOptions, span: Span) -> State {
         let info_hash = torrent.info_hash();
+        let options = StartOptions {
+            output_dir: self.dirs.get(&info_hash).cloned(),
+            trackers: self.trackers.get(&info_hash).cloned(),
+            ..options
+        };
         let (stop, stopped) = watch::channel(false);
         let paused = stopped.clone();
         let session = (self.stop)();
@@ -858,7 +964,7 @@ where
             }
             State::Paused | State::Ended(_) => match &self.entries[index].source {
                 Source::Magnet(link)
-                    if magnet::saved_torrent(link, &self.client.config().output_dir)
+                    if magnet::saved_torrent(link, self.dir_of(info_hash))
                         .await
                         .is_none() =>
                 {
@@ -993,7 +1099,7 @@ where
                 .filter(|metainfo| metainfo.info_hash == entry.info_hash)
                 .map(|metainfo| metainfo.torrent),
             Source::Magnet(link) => {
-                match magnet::saved_torrent(link, &self.client.config().output_dir).await {
+                match magnet::saved_torrent(link, self.dir_of(entry.info_hash)).await {
                     Some(path) => torrent::load_file(&path)
                         .await
                         .ok()
@@ -1009,7 +1115,8 @@ where
         }
         let wanted = crate::selection::wanted_of(&torrent, selection)
             .map_err(|e| format!("cannot choose the files: {e:#}"))?;
-        let target = resume::Target::new(self.client.config(), entry.info_hash)
+        let dir = self.dir_of(entry.info_hash);
+        let target = resume::Target::in_dir(self.client.config(), dir, entry.info_hash)
             .ok_or("no state directory, so the choice cannot be kept")?;
         target
             .save_selection(selection, files, torrent.num_pieces())
@@ -1125,8 +1232,9 @@ where
     /// The file is loaded here rather than in a task of its own: it is
     /// small, and the check for a torrent the session has is then never
     /// raced by another `Add` of it. The torrents run on meanwhile. With
-    /// `paused` the torrent is listed paused rather than started.
-    async fn add(&mut self, source: Source, paused: bool) {
+    /// `paused` the torrent is listed paused rather than started, and with
+    /// `dir` its files go there rather than to the output directory.
+    async fn add(&mut self, source: Source, paused: bool, dir: Option<PathBuf>) {
         let span = self.span(&source);
         let torrent = match load(&source, &span).await {
             Ok(torrent) => torrent,
@@ -1144,6 +1252,18 @@ where
         }
         span.in_scope(|| info!("added"));
         let source = self.keep_copy(source, info_hash).await;
+        if let Some(dir) = dir {
+            let dir = match std::path::absolute(&dir) {
+                Ok(dir) => dir,
+                Err(error) => {
+                    self.client
+                        .stats()
+                        .notice(format!("cannot add torrent in {}: {error}", dir.display()));
+                    return;
+                }
+            };
+            self.dirs.insert(info_hash, dir);
+        }
         let state = if paused {
             self.show_row(&torrent, &source, TorrentState::Paused);
             State::Paused
@@ -1186,7 +1306,7 @@ where
     /// Drops the row of `entry`, removed from the session, and with
     /// `delete` its files, its resume file and a magnet link's saved
     /// `.torrent`. What cannot be deleted is logged and shown as a notice.
-    async fn forget(&self, entry: Entry, delete: bool) {
+    async fn forget(&mut self, entry: Entry, delete: bool) {
         let gone = |state: &TorrentState| *state == TorrentState::Removing || state.is_finished();
         let stats = stats_of(&self.client, entry.info_hash, gone);
         let name = stats
@@ -1196,6 +1316,9 @@ where
             self.client.stats().remove_torrent(stats);
         }
         self.client.stats().forget_torrent_limits(entry.info_hash);
+        let dir = self.dirs.remove(&entry.info_hash);
+        self.tag_dirs.remove(&entry.info_hash);
+        self.trackers.remove(&entry.info_hash);
         let span = self.span(&entry.source);
         if !delete {
             self.drop_copy(&entry).await;
@@ -1203,7 +1326,8 @@ where
             self.client.stats().notice(format!("removed {name}"));
             return;
         }
-        let failures = delete_data(&self.client, &entry)
+        let output_dir = dir.unwrap_or_else(|| self.client.config().output_dir.clone());
+        let failures = delete_data(&self.client, &entry, &output_dir)
             .instrument(span.clone())
             .await;
         self.drop_copy(&entry).await;
@@ -1384,6 +1508,183 @@ where
         }
     }
 
+    /// Replaces a torrent’s tracker list and restarts it after sending
+    /// stopped to its old trackers. Paused torrents remain paused.
+    async fn set_trackers(&mut self, info_hash: [u8; 20], trackers: Vec<String>) {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.info_hash == info_hash)
+        else {
+            return;
+        };
+        let trackers = match validate_trackers(trackers) {
+            Ok(trackers) => trackers,
+            Err(error) => {
+                self.client
+                    .stats()
+                    .notice(format!("cannot edit trackers: {error:#}"));
+                return;
+            }
+        };
+        if matches!(
+            self.entries[index].state,
+            State::Removing { .. } | State::Requeuing { .. } | State::Restarting { .. }
+        ) {
+            self.client
+                .stats()
+                .notice("wait for the torrent to stop before editing its trackers");
+            return;
+        }
+        if let State::Running { stop } = &self.entries[index].state
+            && *stop.borrow()
+        {
+            self.client
+                .stats()
+                .notice("wait for the torrent to stop before editing its trackers");
+            return;
+        }
+        self.trackers.insert(info_hash, trackers.clone());
+        if matches!(self.entries[index].state, State::Running { .. }) {
+            self.restart(info_hash, StartOptions::default());
+        } else if let Some(stats) = stats_of(&self.client, info_hash, |_| true) {
+            stats.set_trackers(
+                &trackers
+                    .into_iter()
+                    .map(|url| vec![url])
+                    .collect::<Vec<_>>(),
+            );
+        }
+        self.client.stats().notice("tracker list saved");
+    }
+
+    /// Moves a stopped torrent’s data, keeping the original directory on
+    /// any failure before the destination files have all been prepared.
+    async fn move_data(&mut self, info_hash: [u8; 20], dir: PathBuf) {
+        self.move_data_to(info_hash, dir, false).await;
+    }
+
+    async fn move_data_to(&mut self, info_hash: [u8; 20], dir: PathBuf, from_tag: bool) {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.info_hash == info_hash)
+        else {
+            return;
+        };
+        if !matches!(self.entries[index].state, State::Paused | State::Ended(_)) {
+            self.client
+                .stats()
+                .notice("pause the torrent and wait for it to stop before moving its data");
+            return;
+        }
+        let source = self.entries[index].source.clone();
+        let span = self.span(&source);
+        let old_dir = self.dir_of(info_hash).to_path_buf();
+        let loaded = load(&source, &span).await;
+        let result = async {
+            anyhow::ensure!(!dir.as_os_str().is_empty(), "enter a destination directory");
+            let loaded = loaded?;
+            anyhow::ensure!(
+                loaded.info_hash() == info_hash,
+                "the torrent file has changed"
+            );
+            let torrent = match loaded {
+                Torrent::File(metainfo) => metainfo.torrent,
+                Torrent::Magnet(ref link) => {
+                    let path = magnet::saved_torrent(link, &old_dir)
+                        .await
+                        .ok_or_else(|| anyhow!("no metadata yet"))?;
+                    torrent::load_file(&path).await?.0
+                }
+            };
+            let dir = std::path::absolute(&dir)?;
+            tokio::fs::create_dir_all(&dir).await?;
+            let dir = tokio::fs::canonicalize(dir).await?;
+            // A torrent added paused may never have created its old root.
+            tokio::fs::create_dir_all(&old_dir).await?;
+            let old_dir = tokio::fs::canonicalize(&old_dir).await?;
+            if dir == old_dir {
+                return Ok::<_, anyhow::Error>((dir, torrent));
+            }
+            let old = storage::layout(&torrent.info, &old_dir)?;
+            let new = storage::layout(&torrent.info, &dir)?;
+            let mut keys = Storage::paths_async(&torrent.info, &dir).await?;
+            // A different active torrent may have claimed the old files
+            // since this one paused. Protect both sides of the move.
+            keys.extend(Storage::paths_async(&torrent.info, &old_dir).await?);
+            let _claim = self
+                .client
+                .claim_files(info_hash, &torrent.info.name, &keys)?;
+            let mut pairs: Vec<_> = old
+                .into_iter()
+                .zip(new)
+                .map(|(old, new)| (old.path, new.path))
+                .collect();
+            if let Source::Magnet(link) = &source {
+                pairs.push((
+                    link.saved_torrent_path(&old_dir),
+                    link.saved_torrent_path(&dir),
+                ));
+            }
+            task::spawn_blocking(move || relocate::move_files(&pairs)).await??;
+            if let Some(target) = resume::Target::in_dir(self.client.config(), &old_dir, info_hash)
+                && let Err(error) = target
+                    .relocate(
+                        &dir,
+                        crate::selection::file_count(&torrent.info),
+                        torrent.num_pieces(),
+                    )
+                    .await
+            {
+                warn!(%error, "moved data; resume file will be rechecked");
+            }
+            Ok((dir, torrent))
+        }
+        .await;
+        match result {
+            Ok((dir, torrent)) => {
+                self.dirs.insert(info_hash, dir.clone());
+                if from_tag {
+                    self.tag_dirs.insert(info_hash);
+                } else {
+                    self.tag_dirs.remove(&info_hash);
+                }
+                let previous = stats_of(&self.client, info_hash, |_| true);
+                let state = previous
+                    .as_ref()
+                    .map_or(TorrentState::Paused, |stats| stats.state());
+                // Replace the stopped row so its save path and layout agree.
+                let metainfo = Torrent::File(Box::new(Metainfo {
+                    torrent,
+                    info_hash,
+                    info_bytes: Vec::new(),
+                }));
+                self.show_row(&metainfo, &source, state);
+                if let Some(previous) = previous
+                    && let Some(current) = stats_of(&self.client, info_hash, |_| true)
+                {
+                    current.set_verified(previous.verified());
+                    if let Some(pieces) = previous.pieces() {
+                        current.set_final_pieces(pieces);
+                    }
+                    if let (Some(priorities), Some(wanted)) =
+                        (previous.priorities(), previous.wanted())
+                    {
+                        current.set_selection(priorities, wanted);
+                    }
+                }
+                self.client
+                    .stats()
+                    .notice(format!("data moved to {}", dir.display()));
+            }
+            Err(error) => self
+                .client
+                .stats()
+                .notice(format!("cannot move data: {error:#}")),
+        }
+    }
+
     /// Applies `settings` to the torrent with `info_hash`, if the session
     /// has it, and says so.
     fn set_torrent_limits(&self, info_hash: [u8; 20], settings: TorrentSettings) {
@@ -1412,7 +1713,7 @@ where
 
     /// Tags the torrent with `info_hash`, if the session has it, and says
     /// so.
-    fn set_tags(&self, info_hash: [u8; 20], tags: Vec<String>) {
+    async fn set_tags(&mut self, info_hash: [u8; 20], tags: Vec<String>) {
         if !self
             .entries
             .iter()
@@ -1427,8 +1728,44 @@ where
         } else {
             format!("{name}: tags {}", tags::join_tags(&tags))
         };
+        let tag_dir = if !self.dirs.contains_key(&info_hash) || self.tag_dirs.contains(&info_hash) {
+            tags.iter()
+                .find_map(|tag| self.tag_directories.get(tag))
+                .cloned()
+                .or_else(|| {
+                    self.tag_dirs
+                        .contains(&info_hash)
+                        .then(|| self.client.config().output_dir.clone())
+                })
+        } else {
+            None
+        };
         self.apply_tags(info_hash, tags);
         self.client.stats().notice(notice);
+        if let Some(dir) = tag_dir {
+            let absolute = |dir: &Path| dir.canonicalize().or_else(|_| std::path::absolute(dir));
+            let same = matches!((absolute(&dir),absolute(self.dir_of(info_hash))), (Ok(a),Ok(b)) if a == b);
+            // Even an equal path must keep its origin, so an explicit M
+            // can override future tag edits without moving any bytes.
+            if same {
+                if let std::collections::hash_map::Entry::Vacant(entry) = self.dirs.entry(info_hash)
+                {
+                    entry.insert(std::path::absolute(&dir).unwrap_or(dir));
+                    self.tag_dirs.insert(info_hash);
+                }
+                return;
+            }
+            let stopped = self
+                .entries
+                .iter()
+                .find(|entry| entry.info_hash == info_hash)
+                .is_some_and(|entry| matches!(entry.state, State::Paused | State::Ended(_)));
+            if !stopped {
+                self.client.stats().notice("tags saved; pause the torrent, wait, then reapply tags with e to use their download directory");
+                return;
+            }
+            self.move_data_to(info_hash, dir, true).await;
+        }
     }
 
     async fn command(&mut self, command: Command) {
@@ -1471,10 +1808,20 @@ where
                 info_hash,
                 settings,
             } => self.set_torrent_limits(info_hash, settings),
-            Command::SetTags { info_hash, tags } => self.set_tags(info_hash, tags),
+            Command::SetTrackers {
+                info_hash,
+                trackers,
+            } => self.set_trackers(info_hash, trackers).await,
+            Command::MoveData { info_hash, dir } => self.move_data(info_hash, dir).await,
+            Command::SetTags { info_hash, tags } => self.set_tags(info_hash, tags).await,
             Command::Remove { info_hash, delete } => self.remove(info_hash, delete).await,
-            Command::Add(source) => self.add(source, false).await,
-            Command::AddPaused(source) => self.add(source, true).await,
+            Command::Add(source) => self.add(source, false, None).await,
+            Command::AddPaused(source) => self.add(source, true, None).await,
+            Command::AddIn {
+                source,
+                paused,
+                dir,
+            } => self.add(source, paused, Some(dir)).await,
             Command::MoveUp(info_hash) => self.move_in_queue(info_hash, true),
             Command::MoveDown(info_hash) => self.move_in_queue(info_hash, false),
             // The feed stops the torrents itself.
@@ -1556,8 +1903,8 @@ async fn load(source: &Source, span: &Span) -> Result<Torrent> {
 /// are those the torrent file lists, or the metadata the magnet link saved;
 /// a magnet link whose metadata never arrived has none. Nothing is deleted
 /// while a running torrent writes any of the files.
-async fn delete_data(client: &Arc<Client>, entry: &Entry) -> Vec<anyhow::Error> {
-    let output_dir = client.config().output_dir.clone();
+async fn delete_data(client: &Arc<Client>, entry: &Entry, output_dir: &Path) -> Vec<anyhow::Error> {
+    let output_dir = output_dir.to_path_buf();
     let mut failures = Vec::new();
     let mut others = Vec::new();
     let info: Option<Info> = match &entry.source {
@@ -1583,7 +1930,7 @@ async fn delete_data(client: &Arc<Client>, entry: &Entry) -> Vec<anyhow::Error> 
             None => None,
         },
     };
-    if let Some(target) = resume::Target::new(client.config(), entry.info_hash) {
+    if let Some(target) = resume::Target::in_dir(client.config(), &output_dir, entry.info_hash) {
         others.push(target.path().to_path_buf());
     }
     let client = Arc::clone(client);

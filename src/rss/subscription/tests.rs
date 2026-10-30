@@ -113,7 +113,7 @@ fn bad_entries_name_the_problem() {
     assert!(e.contains("match"), "{e}");
     let e = bad("match = [\"a\"]");
     assert!(e.contains("url"), "{e}");
-    let e = bad("url = \"https://x.example/\"\nmatch = [\"a\"]\ndownload-dir = \"/tmp\"");
+    let e = bad("url = \"https://x.example/\"\nmatch = [\"a\"]\ndownload-dir = \"\"");
     assert!(e.contains("download-dir"), "{e}");
 }
 

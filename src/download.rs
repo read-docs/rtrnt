@@ -275,18 +275,23 @@ pub async fn download_file(
 /// `download_file` for a torrent file loaded already, run as `options`
 /// say.
 pub async fn download_metainfo(
-    metainfo: torrent::Metainfo,
+    mut metainfo: torrent::Metainfo,
     options: &StartOptions,
     client: &Client,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     // Before the row, so a torrent the client runs already does not leave a
     // second row of the same torrent behind.
+    if let Some(trackers) = &options.trackers {
+        metainfo.torrent.announce = trackers.first().cloned();
+        metainfo.torrent.announce_list =
+            Some(trackers.iter().map(|url| vec![url.clone()]).collect());
+    }
     let claim = client.claim(metainfo.info_hash)?;
     let stats = client.stats().add_torrent(
         metainfo.info_hash,
         &metainfo.torrent.info.name,
-        &client.config().output_dir,
+        options.output_dir(client.config()),
     );
     stats.set_torrent(&metainfo.torrent);
     let result = download_loaded(metainfo, options, client, claim, &stats, shutdown).await;
@@ -304,6 +309,7 @@ async fn download_loaded(
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let config = client.config();
+    let output_dir = options.output_dir(config);
     let torrent::Metainfo {
         torrent,
         info_hash,
@@ -320,7 +326,7 @@ async fn download_loaded(
     // running one leaves its files alone.
     claim.claim_files(
         &torrent.info.name,
-        &Storage::paths_async(&torrent.info, &config.output_dir).await?,
+        &Storage::paths_async(&torrent.info, output_dir).await?,
     )?;
 
     match options.sequential {
@@ -329,7 +335,7 @@ async fn download_loaded(
     }
     // Before announcing, so a bad output directory does not leave the
     // tracker without a `stopped`.
-    let resume = Target::new(config, info_hash);
+    let resume = Target::in_dir(config, output_dir, info_hash);
     let selection = initial_selection(
         options,
         resume.as_ref(),
@@ -339,14 +345,15 @@ async fn download_loaded(
     let storage = Arc::new(
         Storage::new_async(
             &torrent.info,
-            &config.output_dir,
+            output_dir,
             &selection,
             config.storage_options(),
         )
         .await?,
     );
+
     let dht = start_dht(&torrent, client).await;
-    let completion = completion_for(&torrent, info_hash, config);
+    let completion = completion_for(&torrent, info_hash, config, output_dir);
     let session = Arc::new(Session {
         torrent,
         info_hash,
@@ -374,7 +381,7 @@ async fn download_loaded(
     }
     let left = session.left(&have)?;
     if left == 0 {
-        info!(output = %config.output_dir.display(), "already complete");
+        info!(output = %output_dir.display(), "already complete");
         if !config.seed.enabled() {
             return Ok(());
         }
@@ -433,7 +440,7 @@ async fn download_loaded(
         shutdown,
     )
     .await?;
-    info!(output = %config.output_dir.display(), "done");
+    info!(output = %output_dir.display(), "done");
     Ok(())
 }
 
@@ -442,11 +449,12 @@ pub(crate) fn completion_for(
     torrent: &TorrentFile,
     info_hash: [u8; 20],
     config: &DownloadConfig,
+    output_dir: &Path,
 ) -> Option<Completion> {
     Completion::new(
         config.completion_hook.as_deref()?,
         &torrent.info.name,
-        &config.output_dir,
+        output_dir,
         info_hash,
     )
 }

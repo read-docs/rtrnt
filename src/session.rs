@@ -41,6 +41,13 @@ pub struct SavedTorrent {
     pub limits: TorrentSettings,
     /// The torrent's tags (see `tags`), in the order they were given.
     pub tags: Vec<String>,
+    /// The directory its files are in, if it has one of its own rather than
+    /// the session's output directory.
+    pub dir: Option<PathBuf>,
+    /// Whether the directory came from tags rather than an explicit move/feed.
+    pub dir_from_tag: bool,
+    /// Tracker overrides; absent uses the source’s original list.
+    pub trackers: Option<Vec<String>>,
 }
 
 /// Download and upload limits in KiB/s, 0 for none.
@@ -149,6 +156,14 @@ struct StoredTorrent {
     /// they existed have none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tags: Vec<String>,
+    /// The torrent's own download directory, left out while it has none;
+    /// files from before it existed have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dir: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    dir_from_tag: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trackers: Option<Vec<String>>,
 }
 
 /// `TorrentSettings` as it is written: each setting left out unless set.
@@ -228,6 +243,14 @@ impl SavedSession {
                         }
                     },
                 };
+                let dir = match torrent.dir.as_deref().map(|dir| (dir, dir.to_str())) {
+                    None => None,
+                    Some((_, Some(dir))) => Some(dir.to_string()),
+                    Some((dir, None)) => {
+                        warn!(path = %dir.display(), "not saving a torrent whose directory is not UTF-8");
+                        return None;
+                    }
+                };
                 Some(StoredTorrent {
                     info_hash: ByteBuf::from(torrent.info_hash.to_vec()),
                     source,
@@ -235,6 +258,9 @@ impl SavedSession {
                     sequential: torrent.sequential.map(i64::from),
                     limits: torrent.limits.into(),
                     tags: torrent.tags.clone(),
+                    dir,
+                    dir_from_tag: u64::from(torrent.dir_from_tag),
+                    trackers: torrent.trackers.clone(),
                 })
             })
             .collect();
@@ -283,6 +309,9 @@ impl SavedSession {
                     sequential: entry.sequential.map(|sequential| sequential != 0),
                     limits: entry.limits.into(),
                     tags: parse_tags(&entry.tags.join(",")),
+                    dir: entry.dir.filter(|dir| !dir.is_empty()).map(PathBuf::from),
+                    dir_from_tag: entry.dir_from_tag != 0,
+                    trackers: entry.trackers,
                 })
             })
             .collect();

@@ -619,3 +619,16 @@ async fn a_feed_is_followed_over_http_end_to_end() {
     assert_eq!(std::fs::read(store.torrent_path(hash)).unwrap(), data);
     drop(dir);
 }
+
+#[tokio::test]
+async fn feed_directory_is_forwarded_with_the_pause_setting() {
+    let mut rig = rig(vec![show_feed(
+        "download-dir = '/downloads/shows'\npaused = true",
+    )]);
+    rig.fake.serve(FEED, rss(&[("Show A", "a", MAGNET_A)]));
+    assert!(rig.poller.poll(0).await);
+    let commands = received(&mut rig.commands);
+    assert!(
+        matches!(&commands[..], [Command::AddIn {paused:true,dir,..}] if dir == &PathBuf::from("/downloads/shows"))
+    );
+}

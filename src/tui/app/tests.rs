@@ -1245,3 +1245,51 @@ fn e_sets_the_selected_torrents_tags() {
     app.handle_key(key(KeyCode::Char('e')), &Snapshot::default());
     assert!(app.input.is_none());
 }
+
+#[test]
+fn editing_trackers_validates_urls_and_empty_input_removes_them() {
+    let snapshot = snapshot(&["a"]);
+    let mut app = App::new(Theme::default());
+    app.ensure_selection(&snapshot);
+    app.handle_key(key(KeyCode::Char('E')), &snapshot);
+    type_text(&mut app, &snapshot, "file:///tmp/tracker");
+    assert_eq!(app.handle_key(key(KeyCode::Enter), &snapshot), Action::None);
+    assert!(app.input.as_ref().unwrap().error.is_some());
+    app.input.as_mut().unwrap().text =
+        "https://tracker.example/announce udp://other.example:6969".into();
+    assert_eq!(
+        app.handle_key(key(KeyCode::Enter), &snapshot),
+        Action::Command(Command::SetTrackers {
+            info_hash: [0; 20],
+            trackers: vec![
+                "https://tracker.example/announce".into(),
+                "udp://other.example:6969".into()
+            ]
+        })
+    );
+    app.handle_key(key(KeyCode::Char('E')), &snapshot);
+    assert_eq!(
+        app.handle_key(key(KeyCode::Enter), &snapshot),
+        Action::Command(Command::SetTrackers {
+            info_hash: [0; 20],
+            trackers: vec![]
+        })
+    );
+}
+
+#[test]
+fn move_prompt_resolves_relative_directories_against_the_ui_working_directory() {
+    let snapshot = snapshot(&["a"]);
+    let mut app = App::new(Theme::default());
+    app.ensure_selection(&snapshot);
+    app.dir = PathBuf::from("/home/test");
+    app.handle_key(key(KeyCode::Char('M')), &snapshot);
+    type_text(&mut app, &snapshot, "downloads");
+    assert_eq!(
+        app.handle_key(key(KeyCode::Enter), &snapshot),
+        Action::Command(Command::MoveData {
+            info_hash: [0; 20],
+            dir: PathBuf::from("/home/test/downloads")
+        })
+    );
+}

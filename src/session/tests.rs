@@ -13,6 +13,11 @@ fn saved(byte: u8, paused: bool) -> SavedTorrent {
         sequential: None,
         limits: TorrentSettings::default(),
         tags: Vec::new(),
+
+        dir: None,
+        trackers: None,
+
+        dir_from_tag: false,
     }
 }
 
@@ -34,6 +39,11 @@ fn a_session_round_trips() {
                     seed_time: Some(0),
                 },
                 tags: vec!["linux".into(), "my show".into()],
+
+                dir: None,
+                trackers: None,
+
+                dir_from_tag: false,
             },
             SavedTorrent {
                 info_hash: [2; 20],
@@ -42,6 +52,11 @@ fn a_session_round_trips() {
                 sequential: Some(false),
                 limits: TorrentSettings::default(),
                 tags: Vec::new(),
+
+                dir: None,
+                trackers: None,
+
+                dir_from_tag: false,
             },
             saved(3, false),
         ],
@@ -111,6 +126,11 @@ fn tags_that_make_no_sense_are_cleaned_up_on_loading() {
             sequential: None,
             limits: StoredLimits::default(),
             tags: vec!["Tv".into(), "".into(), "tv".into(), "a,b".into()],
+
+            dir: None,
+            trackers: None,
+
+            dir_from_tag: 0,
         }],
         rate_limits: None,
         alt_speed: None,
@@ -147,6 +167,11 @@ fn an_entry_that_makes_no_sense_is_skipped() {
                 sequential: None,
                 limits: StoredLimits::default(),
                 tags: Vec::new(),
+
+                dir: None,
+                trackers: None,
+
+                dir_from_tag: 0,
             },
             StoredTorrent {
                 info_hash: ByteBuf::from(vec![2; 20]),
@@ -155,6 +180,11 @@ fn an_entry_that_makes_no_sense_is_skipped() {
                 sequential: None,
                 limits: StoredLimits::default(),
                 tags: Vec::new(),
+
+                dir: None,
+                trackers: None,
+
+                dir_from_tag: 0,
             },
             StoredTorrent {
                 info_hash: ByteBuf::from(vec![3; 20]),
@@ -163,6 +193,11 @@ fn an_entry_that_makes_no_sense_is_skipped() {
                 sequential: None,
                 limits: StoredLimits::default(),
                 tags: Vec::new(),
+
+                dir: None,
+                trackers: None,
+
+                dir_from_tag: 0,
             },
         ],
         rate_limits: None,
@@ -178,6 +213,11 @@ fn an_entry_that_makes_no_sense_is_skipped() {
             sequential: None,
             limits: TorrentSettings::default(),
             tags: Vec::new(),
+
+            dir: None,
+            trackers: None,
+
+            dir_from_tag: false,
         }]
     );
 }
