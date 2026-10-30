@@ -20,7 +20,8 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Shared by every web seed, so connections to a server are reused.
 static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
+    crate::network::global()
+        .http_builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
         .build()

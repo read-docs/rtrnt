@@ -17,7 +17,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Shared by every feed and torrent download, so connections to a server
 /// are reused.
 static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
+    crate::network::global()
+        .http_builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .user_agent(concat!("rtrnt/", env!("CARGO_PKG_VERSION")))

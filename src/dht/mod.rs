@@ -35,7 +35,9 @@ use routing::{Insert, K, NodeId, NodeInfo, RoutingTable};
 use secure::IpVotes;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(test)]
+use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 use store::PeerStore;
@@ -99,26 +101,36 @@ impl Dht {
     /// Starts nodes on UDP `port` on every IPv4 and IPv6 interface, or on a free
     /// port if that one is taken, bootstrapping from `DEFAULT_ROUTERS`.
     pub async fn bind(port: u16) -> Result<Dht> {
-        let bind = |port| UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port));
-        let socket = match bind(port).await {
+        Self::bind_with_policy(port, crate::network::global()).await
+    }
+
+    async fn bind_with_policy(port: u16, policy: &crate::network::Policy) -> Result<Dht> {
+        let ipv6 = policy.source_address().is_some_and(|ip| ip.is_ipv6());
+        let socket = match policy.udp_socket(ipv6, port) {
             Err(e) if port != 0 => {
                 warn!(
                     port,
                     "cannot use port for the DHT: {e}; using a free one instead"
                 );
-                bind(0).await
+                policy.udp_socket(ipv6, 0)
             }
             result => result,
         }
         .context("cannot bind the DHT socket")?;
         let routers = DEFAULT_ROUTERS.iter().map(|r| r.to_string()).collect();
         let port = socket.local_addr()?.port();
-        let socket6 = match bind_ipv6(Ipv6Addr::UNSPECIFIED, port) {
-            Ok(socket) => Some(socket),
-            Err(e) => {
-                debug!("IPv6 DHT unavailable; continuing with IPv4: {e}");
-                None
+        // An explicit source address selects one family. With unrestricted
+        // addresses, keep the IPv6 sibling optional as before.
+        let socket6 = if policy.source_address().is_none() {
+            match policy.udp_socket(true, port) {
+                Ok(socket) => Some(socket),
+                Err(e) => {
+                    debug!("IPv6 DHT unavailable; continuing with IPv4: {e}");
+                    None
+                }
             }
+        } else {
+            None
         };
         let dht = Self::start_sockets(socket, socket6, routers)?;
         info!(port = dht.port(), "DHT node started");
@@ -1010,6 +1022,7 @@ fn bounded_reply(mut reply: Message) -> Option<Vec<u8>> {
 }
 
 /// Binds an IPv6-only UDP socket to the same port as the IPv4 node.
+#[cfg(test)]
 fn bind_ipv6(ip: Ipv6Addr, port: u16) -> std::io::Result<UdpSocket> {
     let socket = socket2::Socket::new(
         socket2::Domain::IPV6,

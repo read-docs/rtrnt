@@ -71,7 +71,7 @@ impl Client {
         ));
         let slots = ConnectionSlots::new(config.max_connections);
         let stats = SessionStats::new(Arc::clone(&rate_limits), slots.clone());
-        let portmap = Portmapper::new(config.portmap);
+        let portmap = Portmapper::new(config.portmap && !crate::network::global().restricted());
         stats.set_portmap(portmap.clone());
         Self {
             config,
@@ -170,7 +170,7 @@ impl Client {
     /// listener got for UDP too), unless the DHT is off. A failure to start
     /// it is logged once, and the session goes on without it.
     pub async fn dht(&self) -> Option<Dht> {
-        if !self.config.dht {
+        if !self.config.dht || crate::network::global().proxied() {
             return None;
         }
         // Not the configured port: with port 0 the listener picks its own.
@@ -205,7 +205,7 @@ impl Client {
     /// have no listening port to announce, or the group cannot be joined,
     /// which is logged once.
     pub async fn lsd(&self, info_hash: [u8; 20], private: bool) -> Option<LsdPeers> {
-        if !self.config.lsd {
+        if !self.config.lsd || crate::network::global().restricted() {
             return None;
         }
         if private {

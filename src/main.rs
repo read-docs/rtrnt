@@ -174,6 +174,11 @@ async fn main() -> anyhow::Result<ExitCode> {
         .or(file.options.watch_dir_delete)
         .unwrap_or(config::DEFAULT_WATCH_DIR_DELETE);
     let effective = cli.or(from_session).or(file.options);
+    rtrnt::network::install(rtrnt::network::Policy::new(
+        effective.bind_address,
+        effective.bind_interface.clone(),
+        effective.proxy.as_deref(),
+    )?)?;
     let (alt_limits, alt_schedule) = effective.alt_speed();
     let queue_limits = effective.queue_limits();
     let metrics_listen = effective.metrics_listen;

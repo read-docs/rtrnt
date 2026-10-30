@@ -114,6 +114,18 @@ impl ToToml for ByteSize {
     }
 }
 
+impl ToToml for String {
+    fn to_toml(&self) -> String {
+        toml::Value::from(self.clone()).to_string()
+    }
+}
+
+impl ToToml for std::net::IpAddr {
+    fn to_toml(&self) -> String {
+        toml::Value::from(self.to_string()).to_string()
+    }
+}
+
 impl ToToml for SocketAddr {
     fn to_toml(&self) -> String {
         toml::Value::from(self.to_string()).to_string()
@@ -224,6 +236,15 @@ macro_rules! options {
 // help (checked by a test). The on and off flags of the settings marked
 // `skip` are in `Args`, which fills them in.
 options! {
+    /// Source IP address for network sockets; other address families are refused
+    #[arg(long)]
+    bind_address: std::net::IpAddr = Unset("any address");
+    /// Network interface for peer, tracker and DHT sockets (Linux and macOS)
+    #[arg(long)]
+    bind_interface: String = Unset("any interface");
+    /// SOCKS5 proxy: socks5h://IP:PORT (no authentication); disables direct UDP and incoming peers
+    #[arg(long)]
+    proxy: String = Unset("direct");
     /// Directory to save the downloaded files in [default: .]
     #[arg(short, long)]
     output: PathBuf = Value(PathBuf::from(DEFAULT_OUTPUT_DIR));

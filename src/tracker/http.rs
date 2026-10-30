@@ -12,7 +12,8 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Shared by every announce and scrape, so connections to a tracker are reused.
 static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
+    crate::network::global()
+        .http_builder()
         .timeout(HTTP_TIMEOUT)
         .build()
         .expect("the HTTP client builds with its default settings")
