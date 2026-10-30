@@ -275,6 +275,9 @@ pub(crate) async fn download_with(
             }
         }
         stats.set_pool(pool.len());
+        if let Some(dht) = &mut dht {
+            dht.set_seeding(queue.is_done());
+        }
         // Made before a slot is looked for, so that one freed meanwhile is
         // not missed.
         let mut freed = std::pin::pin!(slots.freed());
@@ -394,6 +397,9 @@ pub(crate) async fn download_with(
             }
             peers = dht_lookup(&mut dht) => {
                 stats.add_source(PeerSource::Dht, peers.len());
+                if let Some(swarm) = dht.as_ref().and_then(DhtSearch::swarm) {
+                    stats.set_dht_swarm(swarm);
+                }
                 pool.add(peers);
                 if let Some(asked) = &mut asked {
                     asked.dht_lookups = asked.dht_lookups.saturating_sub(1);

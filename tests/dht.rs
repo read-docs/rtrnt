@@ -79,6 +79,32 @@ async fn lookup_finds_peers_announced_by_another_node() {
     assert!(leecher.get_peers([8; 20], None).await.is_empty());
 }
 
+/// The scrape of BEP 33 across a network: a node announced as a seed shows
+/// up in the seed count, and as a downloader once it announces as one.
+#[tokio::test]
+async fn lookup_scrapes_the_swarm_size() {
+    let (_hub, nodes) = network(6).await;
+    let (announcer, asker) = (&nodes[0], &nodes[1]);
+    // Nobody has announced: nothing to scrape.
+    let found = asker.lookup_peers(INFO_HASH, None, false).await;
+    assert_eq!(found.swarm, None);
+
+    announcer.lookup_peers(INFO_HASH, Some(51413), true).await;
+    let found = asker.lookup_peers(INFO_HASH, None, false).await;
+    let swarm = found.swarm.expect("the nodes scraped");
+    // Every node is at 127.0.0.1, so there is one address to count.
+    assert_eq!((swarm.seeds, swarm.leechers), (1, 0));
+    assert_eq!(found.peers.len(), 1);
+    // A seed asking as one is sent no seeds.
+    let found = asker.lookup_peers(INFO_HASH, None, true).await;
+    assert!(found.peers.is_empty());
+    assert_eq!(found.swarm.map(|s| s.seeds), Some(1));
+
+    announcer.lookup_peers(INFO_HASH, Some(51413), false).await;
+    let swarm = asker.lookup_peers(INFO_HASH, None, false).await.swarm;
+    assert_eq!(swarm.map(|s| (s.seeds, s.leechers)), Some((0, 1)));
+}
+
 /// Raw bytes on the wire: garbage is ignored, and a ping from BEP 5 gets the
 /// right answer.
 #[tokio::test]
@@ -101,9 +127,15 @@ async fn answers_raw_queries_and_survives_garbage() {
         .await
         .unwrap();
     let reply = recv_answer(&client).await;
-    assert!(reply.starts_with(b"d1:rd2:id20:"), "{reply:?}");
+    // The sender's address comes first, as BEP 42 has it, then the answer.
+    assert!(reply.starts_with(b"d2:ip6:\x7f\x00\x00\x01"), "{reply:?}");
+    let answer = b"1:rd2:id20:";
     assert!(
-        reply.ends_with(b"e1:t2:aa1:v4:RT\x01\x001:y1:re"),
+        reply.windows(answer.len()).any(|w| w == answer),
+        "{reply:?}"
+    );
+    assert!(
+        reply.ends_with(b"1:t2:aa1:v4:RT\x01\x001:y1:re"),
         "{reply:?}"
     );
 

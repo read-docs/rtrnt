@@ -6,10 +6,15 @@
 //! one containing our own id, is ever split, which is the same as BEP 5's
 //! splitting of id ranges. Only nodes that answered one of our queries are
 //! added, so a spoofed source address cannot get into the table.
+//!
+//! Nodes whose id is valid for their address (BEP 42) are preferred: all
+//! nodes are welcome while there is room, but a full bucket gives a place
+//! to a valid newcomer by dropping an invalid node, and pings invalid
+//! questionable nodes first. Invalid nodes are otherwise treated like any.
 
 use rand::Rng;
 use std::fmt;
-use std::net::SocketAddrV4;
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -72,7 +77,7 @@ impl fmt::Debug for NodeId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeInfo {
     pub id: NodeId,
-    pub addr: SocketAddrV4,
+    pub addr: SocketAddr,
 }
 
 /// What `RoutingTable::insert` did with a node.
@@ -89,9 +94,18 @@ pub enum Insert {
     Full,
 }
 
+impl NodeInfo {
+    /// Whether the node's id is valid for its address (BEP 42).
+    pub fn is_secure(&self) -> bool {
+        self.id.is_secure(self.addr.ip())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Entry {
     node: NodeInfo,
+    /// Whether its id is valid for its address.
+    secure: bool,
     last_seen: Instant,
     /// Queries failed in a row.
     failures: u32,
@@ -103,6 +117,7 @@ impl Entry {
     fn new(node: NodeInfo, now: Instant) -> Self {
         Self {
             node,
+            secure: node.is_secure(),
             last_seen: now,
             failures: 0,
             pinging: false,
@@ -140,13 +155,15 @@ impl Bucket {
         self.replacements.retain(|e| e.node.id != entry.node.id);
         self.replacements.push(entry);
         if self.replacements.len() > K {
-            self.replacements.remove(0);
+            // The oldest invalid one goes first, else the oldest.
+            let drop = self.replacements.iter().position(|e| !e.secure);
+            self.replacements.remove(drop.unwrap_or(0));
         }
     }
 
-    /// The least recently seen questionable node, if one should be pinged:
-    /// a replacement is waiting and no other node of the bucket is being
-    /// pinged.
+    /// The least recently seen questionable node, invalid ones first, if
+    /// one should be pinged: a replacement is waiting and no other node of
+    /// the bucket is being pinged.
     fn questionable_to_ping(&mut self, now: Instant) -> Option<NodeInfo> {
         if self.replacements.is_empty() || self.entries.iter().any(|e| e.pinging) {
             return None;
@@ -155,18 +172,21 @@ impl Bucket {
             .entries
             .iter_mut()
             .filter(|e| e.is_questionable(now))
-            .min_by_key(|e| e.last_seen)?;
+            .min_by_key(|e| (e.secure, e.last_seen))?;
         entry.pinging = true;
         Some(entry.node)
     }
 
     /// Removes the node with `id` and moves the newest replacement into its
-    /// place.
+    /// place, a valid one if there is one.
     fn evict(&mut self, id: &NodeId, now: Instant) {
         let before = self.entries.len();
         self.entries.retain(|e| e.node.id != *id);
         if self.entries.len() < before {
-            self.entries.extend(self.replacements.pop());
+            let best = self.replacements.iter().rposition(|e| e.secure);
+            let best = best.or(self.replacements.len().checked_sub(1));
+            self.entries
+                .extend(best.map(|at| self.replacements.remove(at)));
             self.last_changed = now;
         }
     }
@@ -183,6 +203,28 @@ impl RoutingTable {
         Self {
             own,
             buckets: vec![Bucket::new(now)],
+        }
+    }
+
+    /// Our own id.
+    pub fn own(&self) -> NodeId {
+        self.own
+    }
+
+    /// Changes our own id, which moves every node to the bucket where it
+    /// belongs by its distance from the new one. Nodes keep their place if
+    /// it still has room; replacements are dropped.
+    pub fn set_own(&mut self, own: NodeId, now: Instant) {
+        let old = std::mem::replace(self, Self::new(own, now));
+        let mut entries: Vec<Entry> = old.buckets.into_iter().flat_map(|b| b.entries).collect();
+        // Those heard from most recently go in first.
+        entries.sort_by_key(|e| std::cmp::Reverse(e.last_seen));
+        for entry in entries {
+            self.insert(entry.node, entry.last_seen);
+        }
+        for bucket in &mut self.buckets {
+            bucket.entries.iter_mut().for_each(|e| e.pinging = false);
+            bucket.replacements.clear();
         }
     }
 
@@ -238,7 +280,21 @@ impl RoutingTable {
                 bucket.last_changed = now;
                 return Insert::Added;
             }
-            bucket.cache(Entry::new(node, now));
+            // A valid node takes the place of the invalid one heard from
+            // longest ago, unless that one is being pinged.
+            let entry = Entry::new(node, now);
+            if entry.secure
+                && let Some(invalid) = bucket
+                    .entries
+                    .iter_mut()
+                    .filter(|e| !e.secure && !e.pinging)
+                    .min_by_key(|e| e.last_seen)
+            {
+                *invalid = entry;
+                bucket.last_changed = now;
+                return Insert::Added;
+            }
+            bucket.cache(entry);
             return match bucket.questionable_to_ping(now) {
                 Some(questionable) => Insert::PingFirst(questionable),
                 None => Insert::Full,
@@ -295,7 +351,7 @@ impl RoutingTable {
 
     /// Records a query to `addr` that went unanswered. A node that goes bad
     /// this way is replaced at once if a replacement is waiting.
-    pub fn failed(&mut self, addr: SocketAddrV4, now: Instant) {
+    pub fn failed(&mut self, addr: SocketAddr, now: Instant) {
         for bucket in &mut self.buckets {
             let Some(entry) = bucket.entries.iter_mut().find(|e| e.node.addr == addr) else {
                 continue;
@@ -312,7 +368,7 @@ impl RoutingTable {
 
     /// Notes a query from a known node. Returns false if it is not in the
     /// table (at that address).
-    pub fn heard_from(&mut self, id: &NodeId, addr: SocketAddrV4, now: Instant) -> bool {
+    pub fn heard_from(&mut self, id: &NodeId, addr: SocketAddr, now: Instant) -> bool {
         let index = self.index(id);
         let entry = self.buckets[index]
             .entries
@@ -330,15 +386,19 @@ impl RoutingTable {
 
     /// Whether a node we do not know yet would get a place in the table,
     /// so that it is worth checking that it answers.
-    pub fn wants(&self, id: &NodeId) -> bool {
-        if *id == self.own {
+    pub fn wants(&self, node: &NodeInfo) -> bool {
+        if node.id == self.own {
             return false;
         }
-        let index = self.index(id);
+        let index = self.index(&node.id);
         let bucket = &self.buckets[index];
         let can_split = index == self.buckets.len() - 1 && self.buckets.len() < ID_BITS;
-        !bucket.entries.iter().any(|e| e.node.id == *id)
-            && (bucket.entries.len() < K || can_split || bucket.entries.iter().any(Entry::is_bad))
+        let displaces = node.is_secure() && bucket.entries.iter().any(|e| !e.secure && !e.pinging);
+        !bucket.entries.iter().any(|e| e.node.id == node.id)
+            && (bucket.entries.len() < K
+                || can_split
+                || displaces
+                || bucket.entries.iter().any(Entry::is_bad))
     }
 
     /// Up to `count` nodes closest to `target`, closest first. Bad nodes are

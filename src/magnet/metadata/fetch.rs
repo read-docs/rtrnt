@@ -299,6 +299,9 @@ impl MetadataFetch<'_> {
                 }
                 found = download::dht_lookup(&mut dht) => {
                     stats.add_source(PeerSource::Dht, found.len());
+                    if let Some(swarm) = dht.as_ref().and_then(DhtSearch::swarm) {
+                        stats.set_dht_swarm(swarm);
+                    }
                     peers.pool.add(found);
                     if let Some(asked) = &mut asked {
                         asked.dht_lookups = asked.dht_lookups.saturating_sub(1);

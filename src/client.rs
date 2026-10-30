@@ -8,7 +8,7 @@ use crate::download::DownloadConfig;
 use crate::listener::Listener;
 use crate::lsd::{Lsd, LsdPeers};
 use crate::peer;
-use crate::portmap::{Portmapper, Protocol};
+use crate::portmap::{Portmapper, Protocol, Status};
 use crate::rate_limit::RateLimits;
 use crate::stats::SessionStats;
 use anyhow::{Result, bail};
@@ -16,6 +16,7 @@ use indicatif::MultiProgress;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, OnceCell, OwnedSemaphorePermit, Semaphore};
 use tracing::{Instrument, Span, info, info_span, warn};
@@ -184,6 +185,7 @@ impl Client {
             if let Some(dht) = &dht {
                 stats.set_dht(dht.clone());
                 portmap.map(Protocol::Udp, dht.port());
+                tokio::spawn(tell_dht_external_ip(portmap.clone(), dht.clone()));
             }
             dht
         };
@@ -401,6 +403,28 @@ impl Drop for FileClaim<'_> {
                 files.remove(path);
             }
         }
+    }
+}
+
+/// How often, and how many times, the port mapper is asked for the router's
+/// outside address.
+const EXTERNAL_IP_POLL: Duration = Duration::from_secs(5);
+const EXTERNAL_IP_POLLS: u32 = 60;
+
+/// Tells `dht` the outside address the router reports once the port mapper
+/// has it, so that the node id can match it (BEP 42) without waiting for
+/// other nodes to say. Gives up when the mapping fails or does not come.
+async fn tell_dht_external_ip(portmap: Portmapper, dht: Dht) {
+    for _ in 0..EXTERNAL_IP_POLLS {
+        match portmap.status() {
+            Status::Off | Status::Failed(_) => return,
+            Status::Mapped {
+                external_ip: Some(ip),
+                ..
+            } => return dht.set_external_ip(ip),
+            Status::Searching | Status::Mapped { .. } => {}
+        }
+        tokio::time::sleep(EXTERNAL_IP_POLL).await;
     }
 }
 

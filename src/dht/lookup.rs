@@ -10,7 +10,7 @@
 
 use super::routing::{K, NodeId, NodeInfo};
 use std::collections::HashSet;
-use std::net::SocketAddrV4;
+use std::net::SocketAddr;
 
 /// Queries in flight at once.
 pub const ALPHA: usize = 3;
@@ -45,12 +45,12 @@ pub struct Lookup {
     /// Sorted by distance to the target. Nodes that failed are removed.
     candidates: Vec<Candidate>,
     /// Every address ever added, so that no node is queried twice.
-    seen: HashSet<SocketAddrV4>,
+    seen: HashSet<SocketAddr>,
     /// Bootstrap routers not queried yet. Their ids are unknown and they
     /// are never candidates themselves: they only hand out nodes.
-    routers: Vec<SocketAddrV4>,
-    routers_in_flight: HashSet<SocketAddrV4>,
-    routers_stalled: HashSet<SocketAddrV4>,
+    routers: Vec<SocketAddr>,
+    routers_in_flight: HashSet<SocketAddr>,
+    routers_stalled: HashSet<SocketAddr>,
     queries: usize,
 }
 
@@ -61,7 +61,7 @@ impl Lookup {
         own: NodeId,
         target: NodeId,
         nodes: Vec<NodeInfo>,
-        routers: Vec<SocketAddrV4>,
+        routers: Vec<SocketAddr>,
     ) -> Self {
         let mut lookup = Self {
             own,
@@ -117,7 +117,7 @@ impl Lookup {
     /// The addresses to query now: the routers at once, then the closest
     /// fresh candidates among the `K` closest ones, keeping at most
     /// `ALPHA` queries in flight.
-    pub fn next_queries(&mut self) -> Vec<SocketAddrV4> {
+    pub fn next_queries(&mut self) -> Vec<SocketAddr> {
         let mut out = Vec::new();
         for router in std::mem::take(&mut self.routers) {
             if self.queries < MAX_QUERIES {
@@ -145,7 +145,7 @@ impl Lookup {
     /// `nodes` closer to the target it knows and its `get_peers` token.
     pub fn on_response(
         &mut self,
-        from: SocketAddrV4,
+        from: SocketAddr,
         id: NodeId,
         nodes: Vec<NodeInfo>,
         token: Option<Vec<u8>>,
@@ -188,7 +188,7 @@ impl Lookup {
 
     /// Records that `from` has not answered within the first timeout, so
     /// that another node can be queried meanwhile.
-    pub fn on_slow(&mut self, from: SocketAddrV4) {
+    pub fn on_slow(&mut self, from: SocketAddr) {
         if self.routers_in_flight.remove(&from) {
             self.routers_stalled.insert(from);
             return;
@@ -200,7 +200,7 @@ impl Lookup {
     }
 
     /// Records that `from` did not answer at all.
-    pub fn on_failure(&mut self, from: SocketAddrV4) {
+    pub fn on_failure(&mut self, from: SocketAddr) {
         if self.routers_in_flight.remove(&from) | self.routers_stalled.remove(&from) {
             return;
         }

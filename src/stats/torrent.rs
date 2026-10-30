@@ -1,3 +1,4 @@
+use crate::dht::SwarmEstimate;
 use crate::download::{CheckedOnly, Interrupted};
 use crate::magnet::FetchInterrupted;
 use crate::selection::Priority;
@@ -197,6 +198,8 @@ pub struct TorrentStats {
     next_announce: Mutex<Option<Instant>>,
     /// Peers learned of from each `PeerSource`, in its order.
     sources: [AtomicU64; 5],
+    /// The swarm size the DHT's last scrape found (BEP 33).
+    dht_swarm: Mutex<Option<SwarmEstimate>>,
 }
 
 impl TorrentStats {
@@ -237,6 +240,7 @@ impl TorrentStats {
             trackers: Mutex::new(Vec::new()),
             next_announce: Mutex::new(None),
             sources: Default::default(),
+            dht_swarm: Mutex::new(None),
         }
     }
 
@@ -572,6 +576,16 @@ impl TorrentStats {
         *lock(&self.next_announce)
     }
 
+    /// Records the swarm size the DHT scraped.
+    pub(crate) fn set_dht_swarm(&self, swarm: SwarmEstimate) {
+        *lock(&self.dht_swarm) = Some(swarm);
+    }
+
+    /// The swarm size the DHT scraped, if it did.
+    pub fn dht_swarm(&self) -> Option<SwarmEstimate> {
+        *lock(&self.dht_swarm)
+    }
+
     /// Counts `count` peers learned of from `source`.
     pub(crate) fn add_source(&self, source: PeerSource, count: usize) {
         self.sources[source as usize].fetch_add(count as u64, Ordering::Relaxed);
@@ -587,6 +601,18 @@ impl TorrentStats {
 mod tests {
     use super::*;
     use std::net::SocketAddr;
+
+    #[test]
+    fn the_dht_swarm_is_what_the_last_scrape_said() {
+        let torrent = TorrentStats::new([1; 20], "t", Path::new("."));
+        assert_eq!(torrent.dht_swarm(), None);
+        let swarm = SwarmEstimate {
+            seeds: 3,
+            leechers: 9,
+        };
+        torrent.set_dht_swarm(swarm);
+        assert_eq!(torrent.dht_swarm(), Some(swarm));
+    }
 
     #[test]
     fn the_default_applies_until_sequential_is_chosen() {

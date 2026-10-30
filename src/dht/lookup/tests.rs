@@ -1,4 +1,10 @@
 use super::*;
+use std::net::IpAddr;
+
+/// A socket address from anything that is an IP address.
+fn sock(ip: impl Into<IpAddr>, port: u16) -> SocketAddr {
+    SocketAddr::new(ip.into(), port)
+}
 use crate::dht::routing::RoutingTable;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -6,8 +12,8 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use tokio::time::Instant;
 
-fn addr(n: u16) -> SocketAddrV4 {
-    SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), n)
+fn addr(n: u16) -> SocketAddr {
+    sock(Ipv4Addr::new(10, 0, 0, 1), n)
 }
 
 fn node(id: u8, port: u16) -> NodeInfo {
@@ -116,7 +122,7 @@ fn ignores_ourselves_duplicates_and_unreachable_nodes() {
     let mut lookup = Lookup::new(OWN, TARGET, Vec::new(), Vec::new());
     let unspecified = NodeInfo {
         id: NodeId([3; 20]),
-        addr: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 1),
+        addr: sock(Ipv4Addr::UNSPECIFIED, 1),
     };
     lookup.add(vec![
         NodeInfo {
@@ -187,7 +193,7 @@ fn finds_the_closest_nodes_in_a_simulated_network() {
             addr: addr(port),
         })
         .collect();
-    let tables: HashMap<SocketAddrV4, (NodeId, RoutingTable)> = nodes
+    let tables: HashMap<SocketAddr, (NodeId, RoutingTable)> = nodes
         .iter()
         .map(|me| {
             let mut table = RoutingTable::new(me.id, now);
