@@ -12,6 +12,7 @@ use crate::session::{SavedAltSpeed, SavedLimits, SavedSession, SavedTorrent, Ses
 use crate::source::Source;
 use crate::stats::{TorrentState, TorrentStats};
 use crate::storage::{self, Storage};
+use crate::tags::{self, TagSettings};
 use crate::torrent::{self, Info, Metainfo};
 use crate::torrent_limits::TorrentSettings;
 use anyhow::{Result, anyhow};
@@ -69,6 +70,12 @@ pub enum Command {
     SetTorrentLimits {
         info_hash: [u8; 20],
         settings: TorrentSettings,
+    },
+    /// Give the torrent with this info hash these tags, in place of its
+    /// own (see `tags`): the settings its tags give it apply at once.
+    SetTags {
+        info_hash: [u8; 20],
+        tags: Vec<String>,
     },
     /// Drop the torrent with this info hash from the session, stopping it
     /// first if it runs, and with `delete` its files and resume file too.
@@ -228,6 +235,8 @@ pub struct Manager<S, R> {
     alt_on: bool,
     /// How many torrents may run at once, before the rest queue.
     limits: QueueLimits,
+    /// What each tag gives the torrents that have it.
+    tag_settings: TagSettings,
 }
 
 /// A limit in KiB/s as a notice says it.
@@ -279,6 +288,7 @@ where
             store: None,
             saved_limits: None,
             limits: QueueLimits::default(),
+            tag_settings: TagSettings::new(),
             speed: SpeedControl::new(
                 client.rate_limits().kib(),
                 (
@@ -298,6 +308,14 @@ where
     /// or at `restore`.
     pub fn with_alt_speed(mut self, alt: Limits, schedule: Schedule) -> Self {
         self.speed = SpeedControl::new(self.client.rate_limits().kib(), alt, schedule);
+        self
+    }
+
+    /// Has the tags give their torrents the settings in `tag_settings` (see
+    /// `tags`), for those with a tag already (see `restore`) and those
+    /// tagged later.
+    pub fn with_tag_settings(mut self, tag_settings: TagSettings) -> Self {
+        self.tag_settings = tag_settings;
         self
     }
 
@@ -406,6 +424,7 @@ where
                 .stats()
                 .torrent_limits(saved.info_hash)
                 .set(saved.limits);
+            self.apply_tags(saved.info_hash, saved.tags);
             let state = if saved.paused {
                 self.show_row(&torrent, &saved.source, TorrentState::Paused);
                 if let Some(on) = saved.sequential
@@ -501,6 +520,7 @@ where
                     sequential: stats_of(&self.client, entry.info_hash, |_| true)
                         .and_then(|stats| stats.sequential_choice()),
                     limits: self.client.stats().torrent_settings(entry.info_hash),
+                    tags: self.client.stats().torrent_tags(entry.info_hash),
                 })
             })
             .collect();
@@ -1381,6 +1401,36 @@ where
         stats.notice(format!("{name}: {}", settings.describe()));
     }
 
+    /// Gives the torrent with `info_hash` these tags, and the settings they
+    /// give it.
+    fn apply_tags(&self, info_hash: [u8; 20], tags: Vec<String>) {
+        let stats = self.client.stats();
+        let given = tags::tag_settings(&tags, &self.tag_settings);
+        stats.torrent_limits(info_hash).set_tag_settings(given);
+        stats.set_torrent_tags(info_hash, tags);
+    }
+
+    /// Tags the torrent with `info_hash`, if the session has it, and says
+    /// so.
+    fn set_tags(&self, info_hash: [u8; 20], tags: Vec<String>) {
+        if !self
+            .entries
+            .iter()
+            .any(|entry| entry.info_hash == info_hash)
+        {
+            return;
+        }
+        let name = stats_of(&self.client, info_hash, |_| true)
+            .map_or_else(|| "torrent".to_string(), |torrent| torrent.name());
+        let notice = if tags.is_empty() {
+            format!("{name}: no tags")
+        } else {
+            format!("{name}: tags {}", tags::join_tags(&tags))
+        };
+        self.apply_tags(info_hash, tags);
+        self.client.stats().notice(notice);
+    }
+
     async fn command(&mut self, command: Command) {
         match command {
             // They are the limits of the mode that is on.
@@ -1421,6 +1471,7 @@ where
                 info_hash,
                 settings,
             } => self.set_torrent_limits(info_hash, settings),
+            Command::SetTags { info_hash, tags } => self.set_tags(info_hash, tags),
             Command::Remove { info_hash, delete } => self.remove(info_hash, delete).await,
             Command::Add(source) => self.add(source, false).await,
             Command::AddPaused(source) => self.add(source, true).await,

@@ -15,6 +15,7 @@ use crate::peer;
 use crate::queue::QueueLimits;
 use crate::resume;
 use crate::rss::{self, Subscription};
+use crate::tags::{TagSettings, TagTable};
 use anyhow::{Context, Result, bail};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer};
@@ -102,6 +103,12 @@ impl ToToml for Vec<Subscription> {
 impl ToToml for Schedule {
     fn to_toml(&self) -> String {
         Schedule::to_toml(self)
+    }
+}
+
+impl ToToml for TagTable {
+    fn to_toml(&self) -> String {
+        TagTable::to_toml(self)
     }
 }
 
@@ -303,6 +310,11 @@ options! {
     /// `exclude` and `paused`.
     #[arg(skip)]
     rss: Vec<Subscription> = Unset("none");
+    /// What a tag gives the torrents that have it: a table for each tag,
+    /// as in `[tags.private]` with `download`, `upload`, `seed-ratio` and
+    /// `seed-time`, each applying unless the torrent sets its own.
+    #[arg(skip)]
+    tags: TagTable = Unset("none");
 }
 
 /// Whether `ratio` is a valid seed ratio: a finite number, 0 or more.
@@ -321,7 +333,9 @@ fn parse_ratio(arg: &str) -> Result<f64, String> {
 
 /// Reads `seed-ratio`, which must be a valid ratio (see `is_valid_ratio`).
 /// An integer is fine too.
-fn deserialize_ratio<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<f64>, D::Error> {
+pub(crate) fn deserialize_ratio<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<f64>, D::Error> {
     let ratio = f64::deserialize(deserializer)?;
     if !is_valid_ratio(ratio) {
         return Err(D::Error::custom(format!(
@@ -343,6 +357,14 @@ impl Options {
             ),
             self.alt_speed_schedule.clone().unwrap_or_default(),
         )
+    }
+
+    /// What each tag gives its torrents (see `tags`).
+    pub fn tag_settings(&self) -> TagSettings {
+        self.tags
+            .as_ref()
+            .map(TagTable::settings)
+            .unwrap_or_default()
     }
 
     /// The queue limits these settings give, with the built-in default for
@@ -448,6 +470,9 @@ pub fn parse(text: &str, home: Option<&Path>) -> Result<Options> {
         .blocklist
         .map(|path| expand_tilde(path, home))
         .transpose()?;
+    if let Some(tags) = &options.tags {
+        tags.validate()?;
+    }
     Ok(options)
 }
 

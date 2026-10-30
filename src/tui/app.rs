@@ -2,12 +2,14 @@
 //! that turns byte counters into rates.
 
 use super::Command;
+use super::filter::{View, cycle_tag, known_tags};
 use super::snapshot::{Detail, Snapshot, TorrentSnapshot};
 use super::theme::Theme;
 use super::view::Areas;
 use crate::selection::Priority;
 use crate::source::Source;
 use crate::stats::TorrentState;
+use crate::tags::{join_tags, parse_tags};
 use crate::torrent_limits::{TorrentSettings, format_ratio};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
@@ -138,6 +140,8 @@ pub enum InputKind {
     SeedRatio,
     /// The selected torrent's own seed time.
     SeedTime,
+    /// The selected torrent's tags, comma separated.
+    Tags,
     /// A torrent to add.
     Add,
 }
@@ -153,6 +157,7 @@ impl InputKind {
             InputKind::TorrentUploadLimit => "torrent upload limit, KiB/s (0: none): ",
             InputKind::SeedRatio => "torrent seed ratio (0: none, empty: session's): ",
             InputKind::SeedTime => "torrent seed time, minutes (0: none, empty: session's): ",
+            InputKind::Tags => "tags (comma separated): ",
             InputKind::Add => "add: ",
         }
     }
@@ -161,6 +166,7 @@ impl InputKind {
     pub fn placeholder(self) -> Option<&'static str> {
         match self {
             InputKind::Add => Some("path to a .torrent or magnet link"),
+            InputKind::Tags => Some("none; e.g. linux, iso"),
             InputKind::Filter
             | InputKind::DownloadLimit
             | InputKind::UploadLimit
@@ -237,6 +243,9 @@ pub struct App {
     pub reverse: bool,
     /// Torrents whose name contains this (ignoring case) are shown.
     pub filter: String,
+    /// Only the torrents in this state and with this tag are shown (see
+    /// `filter`).
+    pub view: View,
     /// Set while something is being typed.
     pub input: Option<Input>,
     pub show_help: bool,
@@ -269,6 +278,7 @@ impl App {
             sort: Sort::Added,
             reverse: false,
             filter: String::new(),
+            view: View::default(),
             input: None,
             show_help: false,
             removal: None,
@@ -285,7 +295,10 @@ impl App {
         let mut torrents: Vec<&TorrentSnapshot> = snapshot
             .torrents
             .iter()
-            .filter(|torrent| torrent.name.to_lowercase().contains(&filter))
+            .filter(|torrent| {
+                self.view.includes(&torrent.state, &torrent.tags)
+                    && torrent.name.to_lowercase().contains(&filter)
+            })
             .collect();
         torrents.sort_by(|a, b| {
             let order = self.sort.compare(a, b).then(a.order.cmp(&b.order));
@@ -349,10 +362,32 @@ impl App {
             .filter(|torrent| torrent.state != TorrentState::Removing)
     }
 
-    /// The selected torrent, if `D`, `U`, `R` and `T` can set its limits:
-    /// not while it is being removed.
+    /// The selected torrent, if `D`, `U`, `R`, `T` and `e` can set its limits
+    /// or tags: not while it is being removed.
     pub fn limitable<'a>(&self, snapshot: &'a Snapshot) -> Option<&'a TorrentSnapshot> {
         self.removable(snapshot)
+    }
+
+    /// Moves the state view `f` and `F` choose to the next one, or the
+    /// previous if not `forward`.
+    fn cycle_state(&mut self, forward: bool) {
+        self.view.state = if forward {
+            self.view.state.next()
+        } else {
+            self.view.state.previous()
+        };
+    }
+
+    /// Moves the tag view `g` and `G` choose to the next tag in use, none
+    /// after the last, or the previous if not `forward`.
+    fn cycle_tag_view(&mut self, snapshot: &Snapshot, forward: bool) {
+        let known = known_tags(
+            snapshot
+                .torrents
+                .iter()
+                .map(|torrent| torrent.tags.as_slice()),
+        );
+        self.view.tag = cycle_tag(self.view.tag.as_deref(), &known, forward);
     }
 
     /// Selects the torrent with info hash `selected`, its detail panel
@@ -663,6 +698,17 @@ impl App {
             KeyCode::Char('/') => {
                 self.input = Some(Input::new(InputKind::Filter, self.filter.clone()));
             }
+            KeyCode::Char('f') => self.cycle_state(true),
+            KeyCode::Char('F') => self.cycle_state(false),
+            KeyCode::Char('g') => self.cycle_tag_view(snapshot, true),
+            KeyCode::Char('G') => self.cycle_tag_view(snapshot, false),
+            KeyCode::Char('0') => self.view = View::default(),
+            KeyCode::Char('e') => {
+                if let Some(torrent) = self.limitable(snapshot) {
+                    let tags = join_tags(&torrent.tags);
+                    self.input = Some(Input::new(InputKind::Tags, tags));
+                }
+            }
             KeyCode::Char(c @ ('D' | 'U' | 'R' | 'T')) => {
                 if let Some(torrent) = self.limitable(snapshot) {
                     let limits = torrent.limits;
@@ -848,6 +894,16 @@ impl App {
                 .map(|time| own(&|s| s.seed_time = time).expect("checked above")),
             // Applied already, as it was typed.
             InputKind::Filter => return Action::None,
+            // The torrent may have gone while the line was open.
+            InputKind::Tags => {
+                return match current {
+                    Some((info_hash, _)) => Action::Command(Command::SetTags {
+                        info_hash,
+                        tags: parse_tags(&text),
+                    }),
+                    None => Action::None,
+                };
+            }
             InputKind::DownloadLimit => limit()
                 .map(|down| Command::SetRateLimits(down, up))
                 .map_err(|_| "enter a whole number of KiB/s, 0 for none".to_string()),

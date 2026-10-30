@@ -1,7 +1,9 @@
 use super::*;
 use crate::stats::TorrentState;
+use crate::torrent_limits::TorrentSettings;
 use crate::tui::app::App;
 use crate::tui::demo;
+use crate::tui::filter::{StateView, View};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -846,4 +848,75 @@ fn an_empty_session_says_to_press_a() {
     );
     let buffer = render(100, 32, &snapshot, &app);
     assert!(text(&buffer, buffer.area)[31].starts_with(" add: /▏   enter add"));
+}
+
+#[test]
+fn tags_show_after_the_name_and_the_view_in_the_title() {
+    let mut snapshot = demo::fixture();
+    snapshot.torrents[0].tags = vec!["linux".into(), "iso".into()];
+    let mut app = app(&snapshot);
+    let buffer = render(100, 32, &snapshot, &app);
+    let lines = text(&buffer, buffer.area);
+    assert!(
+        lines[3].starts_with("│▌debian-13.7.0-amd…  #linux #iso"),
+        "{}",
+        lines[3]
+    );
+    // The columns after the name stay where they were.
+    assert!(
+        lines[3].contains("  754 MiB ██████▎───  61% downloading"),
+        "{}",
+        lines[3]
+    );
+    assert!(lines[1].ends_with(" sort: added ▾ ╮"));
+
+    app.view = View {
+        state: StateView::Downloading,
+        tag: Some("linux".into()),
+    };
+    app.filter = "deb".into();
+    app.ensure_selection(&snapshot);
+    let buffer = render(100, 32, &snapshot, &app);
+    let lines = text(&buffer, buffer.area);
+    assert!(
+        lines[1].ends_with(" downloading #linux  /deb  sort: added ▾ ╮"),
+        "{}",
+        lines[1]
+    );
+    assert!(lines[3].starts_with("│▌debian"));
+    assert!(lines[4].starts_with("╭ 1 Peers"), "{}", lines[4]);
+}
+
+#[test]
+fn an_empty_view_says_how_to_leave_it() {
+    let snapshot = demo::fixture();
+    let mut app = app(&snapshot);
+    app.view.state = StateView::Error;
+    let buffer = render(100, 32, &snapshot, &app);
+    let lines = text(&buffer, buffer.area);
+    assert!(lines[3].contains("no torrent matches the filter or the view (0 shows every torrent)"));
+}
+
+#[test]
+fn the_info_tab_shows_tags_and_the_limits_they_give() {
+    let mut snapshot = demo::fixture();
+    snapshot.torrents[0].tags = vec!["slow".into()];
+    snapshot.torrents[0].effective_limits = TorrentSettings {
+        download: 40,
+        ..Default::default()
+    };
+    let mut app = app(&snapshot);
+    app.tab = crate::tui::app::Tab::Info;
+    let buffer = render(100, 40, &snapshot, &app);
+    let lines = text(&buffer, buffer.area);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("limits") && l.contains("↓ 40 KiB/s (tag)"))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains(" tags ") && l.contains("slow"))
+    );
 }

@@ -27,6 +27,7 @@ pub mod source;
 pub mod state;
 pub mod stats;
 pub mod storage;
+pub mod tags;
 pub mod torrent;
 pub mod torrent_limits;
 pub mod tracker;

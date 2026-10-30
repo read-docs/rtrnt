@@ -90,6 +90,11 @@ pub struct TorrentSnapshot {
     /// What the torrent overrides of the session's limits and seed
     /// settings.
     pub limits: TorrentSettings,
+    /// What applies of those, given the tags too: the torrent's own over
+    /// its tags' (see `tags`).
+    pub effective_limits: TorrentSettings,
+    /// The torrent's tags, in the order they were given.
+    pub tags: Vec<String>,
 }
 
 impl TorrentSnapshot {
@@ -234,6 +239,8 @@ impl Snapshot {
                 .map(|(order, torrent)| {
                     let mut snapshot = torrent_snapshot(torrent, order, now);
                     snapshot.limits = stats.torrent_settings(snapshot.info_hash);
+                    snapshot.effective_limits = stats.effective_settings(snapshot.info_hash);
+                    snapshot.tags = stats.torrent_tags(snapshot.info_hash);
                     snapshot
                 })
                 .collect(),
@@ -296,6 +303,8 @@ fn torrent_snapshot(torrent: &TorrentStats, order: usize, now: Instant) -> Torre
         rate_up: 0.0,
         eta: None,
         limits: TorrentSettings::default(),
+        effective_limits: TorrentSettings::default(),
+        tags: Vec::new(),
     }
 }
 
@@ -444,6 +453,8 @@ mod tests {
             rate_up: 0.0,
             eta: None,
             limits: TorrentSettings::default(),
+            effective_limits: TorrentSettings::default(),
+            tags: Vec::new(),
         };
         assert_eq!(torrent.progress(), 0.25);
         assert_eq!(torrent.left(), None);

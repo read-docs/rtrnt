@@ -12,6 +12,7 @@ fn saved(byte: u8, paused: bool) -> SavedTorrent {
         paused,
         sequential: None,
         limits: TorrentSettings::default(),
+        tags: Vec::new(),
     }
 }
 
@@ -32,6 +33,7 @@ fn a_session_round_trips() {
                     seed_ratio_milli: Some(1500),
                     seed_time: Some(0),
                 },
+                tags: vec!["linux".into(), "my show".into()],
             },
             SavedTorrent {
                 info_hash: [2; 20],
@@ -39,6 +41,7 @@ fn a_session_round_trips() {
                 paused: false,
                 sequential: Some(false),
                 limits: TorrentSettings::default(),
+                tags: Vec::new(),
             },
             saved(3, false),
         ],
@@ -62,6 +65,59 @@ fn limits_are_only_there_once_set() {
     let bytes = session.encode().unwrap();
     assert!(!String::from_utf8_lossy(&bytes).contains("rate limits"));
     assert_eq!(SavedSession::decode(&bytes).unwrap().rate_limits, None);
+}
+
+#[test]
+fn tags_are_only_there_once_set_and_keep_their_order() {
+    let mut tagged = saved(1, false);
+    tagged.tags = vec!["tv".into(), "archive".into()];
+    let session = SavedSession {
+        torrents: vec![tagged.clone(), saved(2, false)],
+        rate_limits: None,
+        alt_speed: None,
+    };
+    let bytes = session.encode().unwrap();
+    // One torrent has tags, so the key is in the file once.
+    let text = String::from_utf8_lossy(&bytes);
+    assert_eq!(text.matches("4:tags").count(), 1, "{text}");
+    let decoded = SavedSession::decode(&bytes).unwrap();
+    assert_eq!(decoded.torrents[0].tags, tagged.tags);
+    assert!(decoded.torrents[1].tags.is_empty());
+}
+
+#[test]
+fn a_file_from_before_tags_loads_without_them() {
+    // Version 1, one torrent, written by a build that had no tags (and no
+    // limits): its entry has only the keys it had then.
+    let mut old = b"d8:torrentsld9:info hash20:".to_vec();
+    old.extend([1u8; 20]);
+    old.extend(b"6:pausedi1e6:source10:/x.torrente");
+    old.extend(b"e7:versioni1ee");
+    let decoded = SavedSession::decode(&old).unwrap();
+    assert_eq!(decoded.torrents.len(), 1);
+    assert_eq!(decoded.torrents[0].info_hash, [1; 20]);
+    assert!(decoded.torrents[0].paused);
+    assert!(decoded.torrents[0].tags.is_empty());
+}
+
+#[test]
+fn tags_that_make_no_sense_are_cleaned_up_on_loading() {
+    let stored = Stored {
+        version: VERSION,
+        torrents: vec![StoredTorrent {
+            info_hash: ByteBuf::from(vec![1; 20]),
+            source: "/x.torrent".into(),
+            paused: 0,
+            sequential: None,
+            limits: StoredLimits::default(),
+            tags: vec!["Tv".into(), "".into(), "tv".into(), "a,b".into()],
+        }],
+        rate_limits: None,
+        alt_speed: None,
+    };
+    let decoded = SavedSession::decode(&serde_bencode::to_bytes(&stored).unwrap()).unwrap();
+    // "a,b" is two tags once split, as a comma separates them.
+    assert_eq!(decoded.torrents[0].tags, ["tv", "a", "b"]);
 }
 
 #[test]
@@ -90,6 +146,7 @@ fn an_entry_that_makes_no_sense_is_skipped() {
                 paused: 0,
                 sequential: None,
                 limits: StoredLimits::default(),
+                tags: Vec::new(),
             },
             StoredTorrent {
                 info_hash: ByteBuf::from(vec![2; 20]),
@@ -97,6 +154,7 @@ fn an_entry_that_makes_no_sense_is_skipped() {
                 paused: 0,
                 sequential: None,
                 limits: StoredLimits::default(),
+                tags: Vec::new(),
             },
             StoredTorrent {
                 info_hash: ByteBuf::from(vec![3; 20]),
@@ -104,6 +162,7 @@ fn an_entry_that_makes_no_sense_is_skipped() {
                 paused: 1,
                 sequential: None,
                 limits: StoredLimits::default(),
+                tags: Vec::new(),
             },
         ],
         rate_limits: None,
@@ -118,6 +177,7 @@ fn an_entry_that_makes_no_sense_is_skipped() {
             paused: true,
             sequential: None,
             limits: TorrentSettings::default(),
+            tags: Vec::new(),
         }]
     );
 }
