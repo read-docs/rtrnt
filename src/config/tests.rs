@@ -326,7 +326,7 @@ fn describe_names_each_source() {
          max-active-downloads = 0  # default\n\
          max-active-seeds = 0  # default\n\
          # tui: when stdout and stderr are terminals  # default\n\
-         # session: only in the terminal UI  # default\n\
+         # session: only in the terminal UI or daemon  # default\n\
          # watch-dir: none  # default\n\
          watch-dir-delete = false  # default\n\
          # blocklist: none  # default\n\

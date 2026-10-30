@@ -103,9 +103,9 @@ pub(crate) struct Args {
     /// false` in the config file)
     #[arg(long, overrides_with = "tui")]
     no_tui: bool,
-    /// Do not load or save the session file, which the terminal UI keeps
-    /// (`session = false` in the config file); without the UI nothing is
-    /// loaded or saved anyway, unless the config file says `session = true`
+    /// Do not load or save the session file, which the terminal UI and daemon
+    /// keep (`session = false` in the config file); other modes keep it only
+    /// when the config file says `session = true`
     #[arg(long)]
     no_session: bool,
     /// Delete the files taken from the watch directory instead of renaming

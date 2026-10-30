@@ -310,10 +310,10 @@ options! {
     #[arg(skip)]
     tui: bool = Unset("when stdout and stderr are terminals");
     /// Whether to remember the torrents and rate limits across runs
-    /// (`--no-session` is `session = false`); unset, the terminal UI does
-    /// and the rest does not.
+    /// (`--no-session` is `session = false`); unset, the terminal UI and
+    /// daemon keep it.
     #[arg(skip)]
-    session: bool = Unset("only in the terminal UI");
+    session: bool = Unset("only in the terminal UI or daemon");
     /// Add the .torrent files, and the .magnet files holding a magnet link,
     /// that appear in this directory, checked every 2 seconds; each is
     /// renamed to <name>.added once taken, or <name>.invalid if it does not
