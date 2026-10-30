@@ -6,7 +6,8 @@
 //! exception is `--no-dht`, which is `dht = false` (and `--dht` overrides
 //! it from the command line), and likewise `--no-tui`, `tui = false` and
 //! `--no-session`, `session = false`; and `--watch-dir-delete` is
-//! `watch-dir-delete = true`; `--no-sequential` is `sequential = false`.
+//! `watch-dir-delete = true`; `--no-sequential` is `sequential = false`; and
+//! `--super-seed` is `super-seed = true`.
 
 use crate::altspeed::{Limits, Schedule};
 use crate::download::{DownloadConfig, SeedLimits};
@@ -44,6 +45,8 @@ pub const DEFAULT_WATCH_DIR_DELETE: bool = false;
 /// Whether to download pieces in order, the first and last of each file
 /// first: no, rarest first.
 pub const DEFAULT_SEQUENTIAL: bool = false;
+/// Whether to super-seed (BEP 16) a torrent we have complete: no.
+pub const DEFAULT_SUPER_SEED: bool = false;
 /// Download limit in KiB/s: none.
 pub const DEFAULT_MAX_DOWNLOAD_RATE: u64 = 0;
 /// Upload limit in KiB/s: none.
@@ -269,6 +272,11 @@ options! {
     /// is `sequential = false`); the UI's `o` turns it on or off for one.
     #[arg(skip)]
     sequential: bool = Value(DEFAULT_SEQUENTIAL);
+    /// Whether to super-seed (BEP 16) the torrents we have complete: each
+    /// peer is shown one piece at a time, which spreads a first copy of the
+    /// torrent over the swarm faster (`--super-seed`)
+    #[arg(skip)]
+    super_seed: bool = Value(DEFAULT_SUPER_SEED);
     /// Download limit in KiB per second while the alternative speed mode
     /// ("turtle mode", `t` in the terminal UI) is on (0: unlimited)
     /// [default: 50]
@@ -364,6 +372,7 @@ impl Options {
             },
             dht: self.dht.unwrap_or(DEFAULT_DHT),
             sequential: self.sequential.unwrap_or(DEFAULT_SEQUENTIAL),
+            super_seed: self.super_seed.unwrap_or(DEFAULT_SUPER_SEED),
             portmap: self.portmap.unwrap_or(DEFAULT_PORTMAP),
             max_download_rate: self.max_download_rate.unwrap_or(DEFAULT_MAX_DOWNLOAD_RATE),
             max_upload_rate: self.max_upload_rate.unwrap_or(DEFAULT_MAX_UPLOAD_RATE),

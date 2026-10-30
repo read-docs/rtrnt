@@ -47,6 +47,7 @@ fn config(output: &Path, resume: &Path) -> DownloadConfig {
         seed: Default::default(),
         dht: false,
         sequential: false,
+        super_seed: false,
         portmap: false,
         max_download_rate: 0,
         max_upload_rate: 0,
@@ -79,6 +80,7 @@ fn session(config: &DownloadConfig) -> Arc<Session> {
             Path::new("."),
         )),
         completion: None,
+        super_seed: false,
     })
 }
 

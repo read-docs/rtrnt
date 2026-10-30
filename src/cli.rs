@@ -102,6 +102,13 @@ pub(crate) struct Args {
     /// file says `sequential = true`
     #[arg(long, overrides_with = "sequential")]
     no_sequential: bool,
+    /// Super-seed (BEP 16) the torrents we have complete: tell each peer of
+    /// one piece at a time instead of every piece we have, and the next
+    /// once another peer has that one, so that a first copy of a torrent
+    /// reaches the swarm with the least upload (`super-seed = true` in the
+    /// config file). Meant for the first seed of a torrent; off by default
+    #[arg(long)]
+    super_seed: bool,
 }
 
 /// What to do instead of downloading.
@@ -161,6 +168,7 @@ impl Args {
             session: self.session(),
             watch_dir_delete: self.watch_dir_delete(),
             sequential: self.sequential(),
+            super_seed: self.super_seed(),
             ..self.settings.clone()
         }
     }
@@ -175,6 +183,11 @@ impl Args {
     /// line, as for `dht`.
     pub(crate) fn sequential(&self) -> Option<bool> {
         tri(self.sequential, self.no_sequential)
+    }
+
+    /// Whether to super-seed: `Some(true)` with `--super-seed`.
+    pub(crate) fn super_seed(&self) -> Option<bool> {
+        self.super_seed.then_some(true)
     }
 
     /// Whether port mapping was turned on or off on the command line, as for

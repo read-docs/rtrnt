@@ -246,16 +246,27 @@ impl Storage {
         data: Vec<u8>,
         hash: [u8; 20],
     ) -> Result<bool> {
+        Ok(self.write_verified(index, data, hash).await?.is_ok())
+    }
+
+    /// Like `verify_and_write`, but a piece that does not match its `hash`
+    /// is handed back, written nowhere, in the `Err`.
+    pub async fn write_verified(
+        self: &Arc<Self>,
+        index: usize,
+        data: Vec<u8>,
+        hash: [u8; 20],
+    ) -> Result<std::result::Result<(), Vec<u8>>> {
         let storage = Arc::clone(self);
         let offset = index as u64 * self.piece_length;
         tokio::task::spawn_blocking(move || {
             let actual: [u8; 20] = Sha1::digest(&data).into();
             if actual != hash {
-                return Ok(false);
+                return Ok(Err(data));
             }
             storage
                 .write_at(offset, &data)
-                .map(|()| true)
+                .map(|()| Ok(()))
                 .context(StorageError)
         })
         .await?

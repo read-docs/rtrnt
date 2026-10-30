@@ -138,6 +138,7 @@ fn resumable_session(
         resume: resume::Target::new(config, info_hash),
         stats: Arc::new(TorrentStats::new(info_hash, "test", Path::new("."))),
         completion: None,
+        super_seed: false,
     })
 }
 

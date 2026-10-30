@@ -311,6 +311,7 @@ pub(crate) fn limited_session(
         resume: None,
         stats: Arc::new(TorrentStats::new(info_hash, "test", Path::new("."))),
         completion: None,
+        super_seed: false,
     })
 }
 
@@ -343,6 +344,7 @@ pub(crate) fn resume_config(out: &Path, state: &Path) -> DownloadConfig {
         seed: SeedLimits::default(),
         dht: false,
         sequential: false,
+        super_seed: false,
         portmap: false,
         max_download_rate: 0,
         max_upload_rate: 0,

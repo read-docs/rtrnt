@@ -263,6 +263,7 @@ fn describe_names_each_source() {
          # blocklist: none  # default\n\
          # completion-hook: none  # default\n\
          sequential = false  # default\n\
+         super-seed = false  # default\n\
          alt-speed-download = 50  # default\n\
          alt-speed-upload = 50  # default\n\
          # alt-speed-schedule: only by hand  # default\n\
@@ -285,6 +286,7 @@ fn describe_names_each_source() {
             max_active_seeds: Some(0),
             watch_dir_delete: Some(false),
             sequential: Some(false),
+            super_seed: Some(false),
             alt_speed_download: Some(50),
             alt_speed_upload: Some(50),
             ..options(Some("/data"), Some(5), Some(6881))
