@@ -9,7 +9,10 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use unicode_normalization::UnicodeNormalization;
 
+mod alloc;
 pub mod verify;
+
+pub use alloc::Preallocate;
 
 /// Most files kept open at once. A torrent can have thousands of files, and
 /// macOS's default soft limit is 256 descriptors shared with peer sockets.
@@ -118,7 +121,7 @@ impl Storage {
 
     /// Creates (or opens) every file with its final size, except a file
     /// that `selection` skips and no wanted piece touches, which is left
-    /// alone (not created, not resized). A skipped file that shares a piece
+    /// alone (not created, not resized, never preallocated). A skipped file that shares a piece
     /// with a wanted one is created with its full length (sparse where the
     /// file system allows). Single-file torrents go in `out_dir/name`,
     /// multi-file ones under `out_dir/name/`.
@@ -126,6 +129,19 @@ impl Storage {
     /// `selection` lists a priority for each file, or none at all, which
     /// means all are `Normal`.
     pub fn new(info: &Info, out_dir: &Path, selection: &FileSelection) -> Result<Self> {
+        Self::with_preallocate(info, out_dir, selection, Preallocate::default())
+    }
+
+    /// Like `new`, with each file that is created or opened given its disk
+    /// space as `preallocate` says. With `Full`, a disk without room for
+    /// the wanted files fails here, at the start, and the error says which
+    /// file.
+    pub fn with_preallocate(
+        info: &Info,
+        out_dir: &Path,
+        selection: &FileSelection,
+        preallocate: Preallocate,
+    ) -> Result<Self> {
         let mut files = layout(info, out_dir)?;
         if !selection.is_empty() && selection.priorities().len() != files.len() {
             bail!(
@@ -159,7 +175,15 @@ impl Storage {
             file.found = Some(found);
             // Resizing to the same size would still bump the modification
             // time, which the resume file goes by.
-            if found != file.length {
+            if preallocate == Preallocate::Full {
+                alloc::reserve(&handle, found, file.length).with_context(|| {
+                    format!(
+                        "failed to reserve {} bytes for {}",
+                        file.length,
+                        file.path.display()
+                    )
+                })?;
+            } else if found != file.length {
                 handle.set_len(file.length)?;
             }
         }
@@ -196,9 +220,17 @@ impl Storage {
 
     /// `new` on the blocking thread pool, so that creating and resizing the
     /// files does not hold up the runtime.
-    pub async fn new_async(info: &Info, out_dir: &Path, selection: &FileSelection) -> Result<Self> {
+    pub async fn new_async(
+        info: &Info,
+        out_dir: &Path,
+        selection: &FileSelection,
+        preallocate: Preallocate,
+    ) -> Result<Self> {
         let (info, out_dir, selection) = (info.clone(), out_dir.to_path_buf(), selection.clone());
-        tokio::task::spawn_blocking(move || Self::new(&info, &out_dir, &selection)).await?
+        tokio::task::spawn_blocking(move || {
+            Self::with_preallocate(&info, &out_dir, &selection, preallocate)
+        })
+        .await?
     }
 
     /// `open_existing` on the blocking thread pool.

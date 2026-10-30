@@ -15,6 +15,7 @@ use crate::peer;
 use crate::queue::QueueLimits;
 use crate::resume;
 use crate::rss::{self, Subscription};
+use crate::storage::Preallocate;
 use crate::tags::{TagSettings, TagTable};
 use anyhow::{Context, Result, bail};
 use serde::de::Error as _;
@@ -50,6 +51,8 @@ pub const DEFAULT_WATCH_DIR_DELETE: bool = false;
 pub const DEFAULT_SEQUENTIAL: bool = false;
 /// Whether to super-seed (BEP 16) a torrent we have complete: no.
 pub const DEFAULT_SUPER_SEED: bool = false;
+/// How files get their disk space: as data arrives (sparse).
+pub const DEFAULT_PREALLOCATE: Preallocate = Preallocate::Sparse;
 /// Download limit in KiB/s: none.
 pub const DEFAULT_MAX_DOWNLOAD_RATE: u64 = 0;
 /// Upload limit in KiB/s: none.
@@ -87,6 +90,12 @@ impl ToToml for PathBuf {
 impl ToToml for f64 {
     fn to_toml(&self) -> String {
         toml::Value::from(*self).to_string()
+    }
+}
+
+impl ToToml for Preallocate {
+    fn to_toml(&self) -> String {
+        toml::Value::from(self.as_str()).to_string()
     }
 }
 
@@ -290,6 +299,13 @@ options! {
     /// torrent over the swarm faster (`--super-seed`)
     #[arg(skip)]
     super_seed: bool = Value(DEFAULT_SUPER_SEED);
+    /// How files get their disk space: `sparse` sets each to its full size
+    /// and lets the file system fill it in as pieces arrive; `full`
+    /// reserves the space of every wanted file when it is created, so a full
+    /// disk fails at the start. Skipped files are not reserved
+    /// [default: sparse]
+    #[arg(long, value_enum, value_name = "MODE")]
+    preallocate: Preallocate = Value(DEFAULT_PREALLOCATE);
     /// Download limit in KiB per second while the alternative speed mode
     /// ("turtle mode", `t` in the terminal UI) is on (0: unlimited)
     /// [default: 50]
@@ -403,6 +419,7 @@ impl Options {
             sequential: self.sequential.unwrap_or(DEFAULT_SEQUENTIAL),
             super_seed: self.super_seed.unwrap_or(DEFAULT_SUPER_SEED),
             portmap: self.portmap.unwrap_or(DEFAULT_PORTMAP),
+            preallocate: self.preallocate.unwrap_or(DEFAULT_PREALLOCATE),
             max_download_rate: self.max_download_rate.unwrap_or(DEFAULT_MAX_DOWNLOAD_RATE),
             max_upload_rate: self.max_upload_rate.unwrap_or(DEFAULT_MAX_UPLOAD_RATE),
             completion_hook: self.completion_hook,

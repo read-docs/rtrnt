@@ -22,6 +22,17 @@ fn defaults_when_nothing_is_set() {
     assert!(config.dht);
     assert_eq!(config.max_download_rate, 0);
     assert_eq!(config.max_upload_rate, 0);
+    assert_eq!(config.preallocate, Preallocate::Sparse);
+}
+
+#[test]
+fn preallocate_comes_from_the_file_and_rejects_other_words() {
+    let file = parse("preallocate = \"full\"", None).unwrap();
+    assert_eq!(
+        resolve(Options::default(), file).preallocate,
+        Preallocate::Full
+    );
+    assert!(parse("preallocate = \"dense\"", None).is_err());
 }
 
 #[test]
@@ -273,6 +284,7 @@ fn describe_names_each_source() {
          # completion-hook: none  # default\n\
          sequential = false  # default\n\
          super-seed = false  # default\n\
+         preallocate = \"sparse\"  # default\n\
          alt-speed-download = 50  # default\n\
          alt-speed-upload = 50  # default\n\
          # alt-speed-schedule: only by hand  # default\n\
@@ -298,6 +310,7 @@ fn describe_names_each_source() {
             watch_dir_delete: Some(false),
             sequential: Some(false),
             super_seed: Some(false),
+            preallocate: Some(Preallocate::Sparse),
             alt_speed_download: Some(50),
             alt_speed_upload: Some(50),
             ..options(Some("/data"), Some(5), Some(6881))

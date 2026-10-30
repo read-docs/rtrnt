@@ -382,8 +382,15 @@ async fn fetch_and_download(
             resume.as_ref(),
             selection::file_count(&torrent.info),
         );
-        let storage =
-            Arc::new(Storage::new_async(&torrent.info, &config.output_dir, &selection).await?);
+        let storage = Arc::new(
+            Storage::new_async(
+                &torrent.info,
+                &config.output_dir,
+                &selection,
+                config.preallocate,
+            )
+            .await?,
+        );
         // BEP 27: a private torrent's peers come from its trackers alone.
         // Magnet links for private torrents are not a thing in practice,
         // but should one come, we stop using the DHT once we know.

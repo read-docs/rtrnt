@@ -7,7 +7,7 @@ use crate::rate_limit::RateLimits;
 use crate::resume::{self, Target};
 use crate::selection::{self, FileSelection, Priority};
 use crate::stats::{PeerSource, TorrentStats};
-use crate::storage::Storage;
+use crate::storage::{Preallocate, Storage};
 use crate::torrent::{self, TorrentFile};
 use crate::torrent_limits::TorrentLimits;
 use crate::tracker::announcer::{Announcer, Transferred};
@@ -68,6 +68,8 @@ pub struct DownloadConfig {
     /// Whether to ask the router to forward the listening port (see
     /// `portmap`).
     pub portmap: bool,
+    /// Whether files get their disk space when created (see `Preallocate`).
+    pub preallocate: Preallocate,
     /// Most block data to download per second, in KiB, across all peers;
     /// 0 for no limit.
     pub max_download_rate: u64,
@@ -304,8 +306,15 @@ async fn download_loaded(
         resume.as_ref(),
         selection::file_count(&torrent.info),
     );
-    let storage =
-        Arc::new(Storage::new_async(&torrent.info, &config.output_dir, &selection).await?);
+    let storage = Arc::new(
+        Storage::new_async(
+            &torrent.info,
+            &config.output_dir,
+            &selection,
+            config.preallocate,
+        )
+        .await?,
+    );
     let dht = start_dht(&torrent, client).await;
     let completion = completion_for(&torrent, info_hash, config);
     let session = Arc::new(Session {

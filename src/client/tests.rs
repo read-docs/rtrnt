@@ -13,6 +13,7 @@ fn client(dht: bool) -> Client {
         sequential: false,
         super_seed: false,
         portmap: false,
+        preallocate: Default::default(),
         max_download_rate: 64,
         max_upload_rate: 0,
         completion_hook: None,
