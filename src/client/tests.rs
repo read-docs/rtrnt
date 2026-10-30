@@ -9,6 +9,7 @@ fn client(dht: bool) -> Client {
         listen_port: 0,
         seed: SeedLimits::default(),
         dht,
+        lsd: false,
         sequential: false,
         super_seed: false,
         portmap: false,

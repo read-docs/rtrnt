@@ -467,6 +467,7 @@ async fn fetch_and_download(
     let start = StartPeers {
         pool: fetched.pool,
         banned_ips: fetched.banned_ips,
+        lsd: client.lsd(info_hash, session.torrent.is_private()).await,
         connections,
     };
     download::download_with(

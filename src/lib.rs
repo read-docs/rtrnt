@@ -11,6 +11,7 @@ pub mod download;
 pub mod hook;
 pub mod info;
 pub mod listener;
+pub mod lsd;
 pub mod magnet;
 pub mod manager;
 pub mod metrics;

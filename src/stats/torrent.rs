@@ -158,6 +158,7 @@ pub enum PeerSource {
     Dht,
     Pex,
     Incoming,
+    Lsd,
 }
 
 /// One torrent of the session.
@@ -195,7 +196,7 @@ pub struct TorrentStats {
     trackers: Mutex<Vec<TrackerStatus>>,
     next_announce: Mutex<Option<Instant>>,
     /// Peers learned of from each `PeerSource`, in its order.
-    sources: [AtomicU64; 4],
+    sources: [AtomicU64; 5],
 }
 
 impl TorrentStats {

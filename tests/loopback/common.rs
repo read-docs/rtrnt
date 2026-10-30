@@ -343,6 +343,7 @@ pub(crate) fn resume_config(out: &Path, state: &Path) -> DownloadConfig {
         listen_port: 0,
         seed: SeedLimits::default(),
         dht: false,
+        lsd: false,
         sequential: false,
         super_seed: false,
         portmap: false,

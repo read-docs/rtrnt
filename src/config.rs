@@ -4,7 +4,7 @@
 //! config file, else from its built-in default. Keys in the file are the
 //! long option names, so `--max-peers 50` is `max-peers = 50`; the one
 //! exception is `--no-dht`, which is `dht = false` (and `--dht` overrides
-//! it from the command line), and likewise `--no-tui`, `tui = false` and
+//! it from the command line), and likewise `--no-lsd`, `lsd = false`, `--no-tui`, `tui = false` and
 //! `--no-session`, `session = false`; and `--watch-dir-delete` is
 //! `watch-dir-delete = true`; `--no-sequential` is `sequential = false`; and
 //! `--super-seed` is `super-seed = true`.
@@ -37,6 +37,8 @@ pub const DEFAULT_SEED_RATIO: f64 = 0.0;
 pub const DEFAULT_SEED_TIME: u64 = 0;
 /// Whether to look for peers in the DHT unless told otherwise.
 pub const DEFAULT_DHT: bool = true;
+/// Whether to look for peers on the local network unless told otherwise.
+pub const DEFAULT_LSD: bool = true;
 /// Whether to map the listening port on the router unless told otherwise.
 pub const DEFAULT_PORTMAP: bool = true;
 /// Whether to delete the files taken from the watch directory: they are
@@ -214,6 +216,10 @@ options! {
     /// `dht = false`).
     #[arg(skip)]
     dht: bool = Value(DEFAULT_DHT);
+    /// Whether to look for peers on the local network by multicast (Local
+    /// Service Discovery, BEP 14; `--no-lsd` is `lsd = false`).
+    #[arg(skip)]
+    lsd: bool = Value(DEFAULT_LSD);
     /// Whether to ask the router to forward the listening port, by PCP,
     /// NAT-PMP or UPnP (`--no-portmap` is `portmap = false`).
     #[arg(skip)]
@@ -371,6 +377,7 @@ impl Options {
                 time: minutes(self.seed_time.unwrap_or(DEFAULT_SEED_TIME)),
             },
             dht: self.dht.unwrap_or(DEFAULT_DHT),
+            lsd: self.lsd.unwrap_or(DEFAULT_LSD),
             sequential: self.sequential.unwrap_or(DEFAULT_SEQUENTIAL),
             super_seed: self.super_seed.unwrap_or(DEFAULT_SUPER_SEED),
             portmap: self.portmap.unwrap_or(DEFAULT_PORTMAP),

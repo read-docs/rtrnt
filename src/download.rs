@@ -55,6 +55,9 @@ pub struct DownloadConfig {
     pub seed: SeedLimits,
     /// Whether to look for peers in the DHT too (never for private torrents).
     pub dht: bool,
+    /// Whether to look for peers on the local network too (never for
+    /// private torrents).
+    pub lsd: bool,
     /// Whether a torrent that has not been told otherwise downloads its
     /// pieces in order (see `PieceQueue`) rather than the rarest first.
     pub sequential: bool,
@@ -376,6 +379,7 @@ async fn download_loaded(
     stats.add_source(PeerSource::Tracker, peers.len());
     let mut start = StartPeers::with_blocklist(Arc::clone(client.blocklist()));
     start.pool.add(peers);
+    start.lsd = client.lsd(info_hash, session.torrent.is_private()).await;
     download_with(
         session,
         &have,

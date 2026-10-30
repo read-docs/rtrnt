@@ -18,6 +18,7 @@ fn client() -> Arc<Client> {
         listen_port: 0,
         seed: SeedLimits::default(),
         dht: false,
+        lsd: false,
         sequential: false,
         super_seed: false,
         portmap: false,

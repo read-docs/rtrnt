@@ -6,6 +6,7 @@ use crate::blocklist::Blocklist;
 use crate::dht::Dht;
 use crate::download::DownloadConfig;
 use crate::listener::Listener;
+use crate::lsd::{Lsd, LsdPeers};
 use crate::peer;
 use crate::portmap::{Portmapper, Protocol};
 use crate::rate_limit::RateLimits;
@@ -40,6 +41,8 @@ pub struct Client {
     portmap: Portmapper,
     /// `None` if the DHT is off or could not be started.
     dht: OnceCell<Option<Dht>>,
+    /// `None` if LSD is off or could not be started.
+    lsd: OnceCell<Option<Lsd>>,
     /// Info hashes of the torrents running, so none runs twice.
     torrents: Mutex<HashSet<[u8; 20]>>,
     /// The files the torrents running write, keyed as `Storage::paths`
@@ -79,6 +82,7 @@ impl Client {
             listener: OnceCell::new(),
             portmap,
             dht: OnceCell::new(),
+            lsd: OnceCell::new(),
             torrents: Mutex::new(HashSet::new()),
             files: Mutex::new(HashMap::new()),
             stats: Arc::new(stats),
@@ -187,6 +191,32 @@ impl Client {
             .get_or_init(|| start.instrument(session_span()))
             .await
             .clone()
+    }
+
+    /// Announces the torrent `info_hash` on the local network and returns
+    /// the peers found there, once the first call has joined the multicast
+    /// group. `None` if LSD is off, the torrent is `private` (BEP 27), we
+    /// have no listening port to announce, or the group cannot be joined,
+    /// which is logged once.
+    pub async fn lsd(&self, info_hash: [u8; 20], private: bool) -> Option<LsdPeers> {
+        if !self.config.lsd {
+            return None;
+        }
+        if private {
+            info!("private torrent: not using local service discovery");
+            return None;
+        }
+        let port = self.listener().await.port()?;
+        let start = async move {
+            Lsd::bind(port)
+                .inspect_err(|e| warn!("cannot start local service discovery: {e:#}"))
+                .ok()
+        };
+        self.lsd
+            .get_or_init(|| start.instrument(session_span()))
+            .await
+            .as_ref()?
+            .register(info_hash, private)
     }
 
     /// Removes the router's port mappings, if it made any, waiting a few

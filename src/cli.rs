@@ -66,6 +66,14 @@ pub(crate) struct Args {
     /// says `dht = false`
     #[arg(long, overrides_with = "no_dht")]
     dht: bool,
+    /// Do not look for peers on the local network by multicast (Local
+    /// Service Discovery; `lsd = false` in the config file)
+    #[arg(long, overrides_with = "lsd")]
+    no_lsd: bool,
+    /// Look for peers on the local network, as by default, even if the
+    /// config file says `lsd = false`
+    #[arg(long, overrides_with = "no_lsd")]
+    lsd: bool,
     /// Do not ask the router to forward the listening port with PCP,
     /// NAT-PMP or UPnP (`portmap = false` in the config file)
     #[arg(long, overrides_with = "portmap")]
@@ -163,6 +171,7 @@ impl Args {
     pub(crate) fn options(&self) -> config::Options {
         config::Options {
             dht: self.dht(),
+            lsd: self.lsd(),
             portmap: self.portmap(),
             tui: self.tui(),
             session: self.session(),
@@ -177,6 +186,12 @@ impl Args {
     /// of `--dht` and `--no-dht`, if either is given.
     pub(crate) fn dht(&self) -> Option<bool> {
         tri(self.dht, self.no_dht)
+    }
+
+    /// Whether Local Service Discovery was turned on or off on the command
+    /// line, as for `dht`.
+    pub(crate) fn lsd(&self) -> Option<bool> {
+        tri(self.lsd, self.no_lsd)
     }
 
     /// Whether sequential download was turned on or off on the command
