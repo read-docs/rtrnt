@@ -93,14 +93,14 @@ impl Incoming {
     /// start an MSE handshake, refused if `encryption` is `Off`, for one of
     /// `torrents` (see `mse::respond`).
     pub async fn read(
-        socket: Transport,
+        socket: impl Into<Transport>,
         addr: SocketAddr,
         encryption: Encryption,
         torrents: impl FnOnce() -> Vec<[u8; 20]>,
     ) -> Result<Self> {
         timeout(
             HANDSHAKE_TIMEOUT,
-            Self::read_untimed(socket, addr, encryption, torrents),
+            Self::read_untimed(socket.into(), addr, encryption, torrents),
         )
         .await
         .context("handshake timed out")?

@@ -95,6 +95,8 @@ pub struct DownloadConfig {
     pub completion_hook: Option<Vec<String>>,
     /// Whether connections to peers are encrypted (see `peer::mse`).
     pub encryption: Encryption,
+    /// Whether to use uTP, prefer it, or require it for peer connections.
+    pub utp_policy: crate::utp::Policy,
     /// Directory the resume files (see `resume`) are kept in, or `None` to
     /// keep none.
     pub resume_dir: Option<PathBuf>,
@@ -164,6 +166,10 @@ pub struct Session {
     pub super_seed: bool,
     /// Whether connections to peers are encrypted (see `peer::mse`).
     pub encryption: Encryption,
+    /// Shared uTP endpoint, if that transport is enabled and available.
+    pub utp: Option<Arc<crate::utp::Endpoint>>,
+    /// Transport policy for outgoing peers.
+    pub utp_policy: crate::utp::Policy,
 }
 
 impl Session {
@@ -370,6 +376,8 @@ async fn download_loaded(
         completion,
         super_seed: config.super_seed,
         encryption: config.encryption,
+        utp: client.utp().await,
+        utp_policy: config.utp_policy,
     });
 
     let mut shutdown = std::pin::pin!(shutdown);
@@ -520,8 +528,18 @@ pub async fn download_from_peers(
 ) -> Result<()> {
     let mut start = StartPeers::default();
     start.pool.add(peers.iter().copied());
-    let incoming = Listener::start(listeners, Arc::default(), session.encryption)
-        .register(session.info_hash)?;
+    let listeners = if session.utp_policy == crate::utp::Policy::Require {
+        Vec::new()
+    } else {
+        listeners
+    };
+    let incoming = Listener::start_with_utp(
+        listeners,
+        Arc::default(),
+        session.encryption,
+        session.utp.clone(),
+    )
+    .register(session.info_hash)?;
     // Slots of its own, as many as the peers it may have.
     let limits = Limits {
         max_peers,

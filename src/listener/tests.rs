@@ -27,7 +27,7 @@ async fn connect_encrypted(
 ) -> anyhow::Result<PeerStream<Transport>> {
     let socket = TcpStream::connect(addr).await.unwrap();
     let handshake = handshake_bytes(&info_hash, &generate_peer_id());
-    mse::initiate(socket, &info_hash, &handshake).await
+    mse::initiate(socket.into(), &info_hash, &handshake).await
 }
 
 /// Waits until `socket` is closed, failing if it is left open.

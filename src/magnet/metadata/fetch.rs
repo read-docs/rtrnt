@@ -42,6 +42,8 @@ struct Shared {
     changed: Notify,
     connected: ConnectedPeers,
     stats: Arc<TorrentStats>,
+    utp: Option<Arc<crate::utp::Endpoint>>,
+    utp_policy: crate::utp::Policy,
 }
 
 impl Shared {
@@ -84,6 +86,8 @@ pub(crate) struct MetadataFetch<'a> {
     pub stats: Arc<TorrentStats>,
     /// Whether connections to peers are encrypted.
     pub encryption: Encryption,
+    pub utp: Option<Arc<crate::utp::Endpoint>>,
+    pub utp_policy: crate::utp::Policy,
 }
 
 /// A fetched info dictionary, and the peers to carry on downloading from.
@@ -193,12 +197,16 @@ impl MetadataFetch<'_> {
             mut dht,
             stats,
             encryption,
+            utp,
+            utp_policy,
         } = self;
         let shared = Arc::new(Shared {
             assembly: Mutex::new(Assembly::new(info_hash)),
             changed: Notify::new(),
             connected: ConnectedPeers::default(),
             stats: Arc::clone(&stats),
+            utp,
+            utp_policy,
         });
         let listen_port = incoming.port();
         let mut peers = Peers {
@@ -385,7 +393,17 @@ async fn fetch_from_peer(
     let mut conn = match peer {
         Reach::Answer(peer) => PeerConnection::answer(peer, peer_id, 0, advertised).await?,
         Reach::Connect(attempts) => {
-            PeerConnection::connect(addr, info_hash, peer_id, 0, advertised, attempts).await?
+            PeerConnection::connect_via(
+                addr,
+                info_hash,
+                peer_id,
+                0,
+                advertised,
+                attempts,
+                shared.utp.as_deref(),
+                shared.utp_policy,
+            )
+            .await?
         }
     };
     conn.defer_pieces();

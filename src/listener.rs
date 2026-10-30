@@ -6,6 +6,7 @@
 //! torrent's.
 
 use crate::blocklist::Blocklist;
+use crate::peer::Transport;
 use crate::peer::{Encryption, Incoming};
 use anyhow::{Result, bail};
 use rand::Rng;
@@ -76,14 +77,31 @@ impl Listener {
         blocklist: Arc<Blocklist>,
         encryption: Encryption,
     ) -> Arc<Self> {
+        Self::start_with_utp(listeners, blocklist, encryption, None)
+    }
+
+    /// Routes incoming TCP and uTP connections through the same torrent registry.
+    pub fn start_with_utp(
+        listeners: Vec<TcpListener>,
+        blocklist: Arc<Blocklist>,
+        encryption: Encryption,
+        utp: Option<Arc<crate::utp::Endpoint>>,
+    ) -> Arc<Self> {
         let port = listeners
             .first()
             .and_then(|listener| listener.local_addr().ok())
-            .map(|addr| addr.port());
+            .map(|addr| addr.port())
+            .or_else(|| utp.as_ref().map(|endpoint| endpoint.port()));
         let routes = Arc::new(Routes::default());
-        let task = (!listeners.is_empty()).then(|| {
-            tokio::spawn(route(listeners, Arc::clone(&routes), blocklist, encryption))
-                .abort_handle()
+        let task = (!listeners.is_empty() || utp.is_some()).then(|| {
+            tokio::spawn(route(
+                listeners,
+                Arc::clone(&routes),
+                blocklist,
+                encryption,
+                utp,
+            ))
+            .abort_handle()
         });
         Arc::new(Self { port, routes, task })
     }
@@ -148,11 +166,12 @@ async fn route(
     routes: Arc<Routes>,
     blocklist: Arc<Blocklist>,
     encryption: Encryption,
+    utp: Option<Arc<crate::utp::Endpoint>>,
 ) {
     let mut handshakes = JoinSet::new();
     loop {
         tokio::select! {
-            (socket, addr) = accept(&listeners) => {
+            (socket, addr) = accept_transport(&listeners, utp.as_deref()) => {
                 if blocklist.refuses(addr.ip()) {
                     continue;
                 }
@@ -182,6 +201,27 @@ async fn route(
                 });
             }
             Some(_) = handshakes.join_next() => {}
+        }
+    }
+}
+
+/// Accepts either transport without blocking the other when no peer is ready.
+async fn accept_transport(
+    listeners: &[TcpListener],
+    utp: Option<&crate::utp::Endpoint>,
+) -> (Transport, SocketAddr) {
+    loop {
+        tokio::select! {
+            (socket, addr) = accept(listeners) => return (socket.into(), addr),
+            incoming = async {
+                match utp { Some(endpoint) => endpoint.accept().await, None => std::future::pending().await }
+            } => match incoming {
+                Ok(peer) => return peer,
+                Err(e) => {
+                    warn!("cannot accept uTP peer: {e:#}");
+                    tokio::time::sleep(ACCEPT_RETRY).await;
+                }
+            }
         }
     }
 }

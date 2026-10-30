@@ -176,6 +176,7 @@ async fn downloads_a_magnet_link_banning_a_peer_with_bad_metadata() {
         max_upload_rate: 0,
         completion_hook: None,
         encryption: rtrnt::peer::Encryption::Off,
+        utp_policy: Default::default(),
         resume_dir: None,
     };
     let client = client(config);
@@ -364,6 +365,7 @@ async fn downloads_a_magnet_link_from_another_rtrnt() {
         max_upload_rate: 0,
         completion_hook: None,
         encryption: rtrnt::peer::Encryption::Off,
+        utp_policy: Default::default(),
         resume_dir: None,
     };
     let client = client(config);

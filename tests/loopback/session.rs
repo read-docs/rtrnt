@@ -75,6 +75,7 @@ async fn two_torrents_share_one_listening_port() {
         max_upload_rate: 0,
         completion_hook: None,
         encryption: rtrnt::peer::Encryption::Off,
+        utp_policy: Default::default(),
         resume_dir: None,
     });
     let (first, second) = tokio::time::timeout(Duration::from_secs(30), async {
@@ -135,6 +136,7 @@ async fn a_client_runs_a_torrent_once() {
         max_upload_rate: 0,
         completion_hook: None,
         encryption: rtrnt::peer::Encryption::Off,
+        utp_policy: Default::default(),
         resume_dir: None,
     });
     let (stop, stop_rx) = oneshot::channel::<()>();
@@ -187,6 +189,7 @@ async fn a_magnet_link_for_a_running_torrent_gets_no_row() {
         max_upload_rate: 0,
         completion_hook: None,
         encryption: rtrnt::peer::Encryption::Off,
+        utp_policy: Default::default(),
         resume_dir: None,
     });
     let info_hash = [7; 20];
@@ -233,6 +236,7 @@ async fn a_torrent_given_twice_gets_one_row() {
         max_upload_rate: 0,
         completion_hook: None,
         encryption: rtrnt::peer::Encryption::Off,
+        utp_policy: Default::default(),
         resume_dir: None,
     }));
     let mut manager = Manager::new(Arc::clone(&client), pending::<()>);
@@ -481,6 +485,8 @@ async fn a_torrent_waits_its_turn_to_check_its_data() {
         completion: None,
         super_seed: false,
         encryption: rtrnt::peer::Encryption::Off,
+        utp_policy: Default::default(),
+        utp: None,
     });
     let hashing = Semaphore::new(1);
     let turn = hashing.acquire().await.unwrap();
@@ -569,6 +575,7 @@ async fn stats_follow_a_download() {
         max_upload_rate: 0,
         completion_hook: None,
         encryption: rtrnt::peer::Encryption::Off,
+        utp_policy: Default::default(),
         resume_dir: None,
     }));
     // Another torrent's turn at checking.

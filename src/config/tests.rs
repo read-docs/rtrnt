@@ -331,6 +331,7 @@ fn describe_names_each_source() {
          watch-dir-delete = false  # default\n\
          # blocklist: none  # default\n\
          encryption = \"prefer\"  # default\n\
+         utp = \"off\"  # default\n\
          # completion-hook: none  # default\n\
          sequential = false  # default\n\
          super-seed = false  # default\n\
@@ -360,6 +361,7 @@ fn describe_names_each_source() {
             max_active_seeds: Some(0),
             watch_dir_delete: Some(false),
             encryption: Some(crate::peer::Encryption::Prefer),
+            utp: Some(crate::utp::Policy::Off),
             sequential: Some(false),
             super_seed: Some(false),
             preallocate: Some(Preallocate::Sparse),
@@ -826,4 +828,16 @@ fn network_settings_parse_and_cli_values_take_precedence() {
     .or(file);
     assert_eq!(merged.proxy.as_deref(), Some("socks5h://127.0.0.1:1081"));
     assert!(parse("bind-address = \"not-an-ip\"\n", None).is_err());
+}
+
+#[test]
+fn utp_transport_policy_is_explicit_and_defaults_to_off() {
+    let defaults = Options::default().into_download_config();
+    assert_eq!(defaults.utp_policy, crate::utp::Policy::Off);
+    let file = parse("utp = \"require\"", None).unwrap();
+    assert_eq!(
+        file.into_download_config().utp_policy,
+        crate::utp::Policy::Require
+    );
+    assert!(parse("utp = \"sometimes\"", None).is_err());
 }
