@@ -416,3 +416,13 @@ fn metrics_listen_takes_an_address() {
     let args = Args::try_parse_from(["rtrnt", "a"]).unwrap();
     assert_eq!(args.options().metrics_listen, None);
 }
+
+#[test]
+fn daemon_can_start_empty_and_keeps_session_without_a_terminal() {
+    let args = Args::try_parse_from(["rtrnt", "--daemon"]).unwrap();
+    assert!(!args.use_tui(None, || true));
+    assert!(args.check_torrents(false, false).is_ok());
+    assert!(args.use_session(None, false));
+    assert!(Args::try_parse_from(["rtrnt", "--daemon", "--attach"]).is_err());
+    assert!(Args::try_parse_from(["rtrnt", "--attach", "test.torrent"]).is_err());
+}

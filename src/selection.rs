@@ -10,7 +10,19 @@ use crate::torrent::{Info, TorrentFile};
 use anyhow::Result;
 
 /// How much a file is wanted.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum Priority {
     /// Not downloaded, unless a piece it shares with another file is.
     Skip,

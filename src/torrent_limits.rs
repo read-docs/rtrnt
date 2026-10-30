@@ -21,7 +21,7 @@ use tokio::sync::Notify;
 use tokio::sync::futures::Notified;
 
 /// A torrent's own settings; each is "as the session says" unless set.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TorrentSettings {
     /// Most block data to download per second, in KiB, across the torrent's
     /// peers; 0 for no limit of its own (the session's still applies).

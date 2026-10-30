@@ -14,9 +14,10 @@ use tracing_subscriber::registry::LookupSpan;
 pub const CAPACITY: usize = 1000;
 
 /// One log event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LogLine {
     pub time: SystemTime,
+    #[serde(with = "level_wire")]
     pub level: Level,
     /// The torrent the event is about (its `torrent` span's `name`), or
     /// `session` for work shared by every torrent.
@@ -195,3 +196,18 @@ impl Visit for FieldVisitor {
 
 #[cfg(test)]
 mod tests;
+
+mod level_wire {
+    pub fn serialize<S: serde::Serializer>(
+        level: &tracing::Level,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(level.as_str())
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<tracing::Level, D::Error> {
+        let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}

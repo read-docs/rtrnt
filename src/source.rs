@@ -45,3 +45,19 @@ impl Source {
         }
     }
 }
+
+impl serde::Serialize for Source {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Source::File(path) => serializer.serialize_str(&path.to_string_lossy()),
+            Source::Magnet(link) => serializer.serialize_str(&link.to_uri()),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Source {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::parse(&text).map_err(serde::de::Error::custom)
+    }
+}

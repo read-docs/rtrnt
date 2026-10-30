@@ -35,7 +35,7 @@ pub const EXIT_INTERRUPTED: u8 = 130;
 const QUEUE_TICK: Duration = Duration::from_secs(1);
 
 /// What the UI asks of the session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Command {
     /// Stop the torrents, as Ctrl-C does.
     Stop,

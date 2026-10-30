@@ -78,7 +78,7 @@ pub struct Granted {
 }
 
 /// How port mapping is going, as the header shows it.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub enum Status {
     /// Turned off, or nothing asked for yet.
     #[default]
@@ -565,3 +565,38 @@ impl Task {
 
 #[cfg(test)]
 mod tests;
+
+impl<'de> serde::Deserialize<'de> for Status {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        enum Wire {
+            Off,
+            Searching,
+            Mapped {
+                via: String,
+                external_ip: Option<Ipv4Addr>,
+                external_port: u16,
+            },
+            Failed(String),
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Off => Self::Off,
+            Wire::Searching => Self::Searching,
+            Wire::Failed(message) => Self::Failed(message),
+            Wire::Mapped {
+                via,
+                external_ip,
+                external_port,
+            } => Self::Mapped {
+                via: match via.as_str() {
+                    "PCP" => "PCP",
+                    "NAT-PMP" => "NAT-PMP",
+                    "UPnP" => "UPnP",
+                    _ => return Err(serde::de::Error::custom("unknown mapping protocol")),
+                },
+                external_ip,
+                external_port,
+            },
+        })
+    }
+}

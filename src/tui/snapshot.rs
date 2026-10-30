@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 pub const NOTICE_SHOWN: Duration = Duration::from_secs(5);
 
 /// Everything one frame shows.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Snapshot {
     /// The time of day, as shown in the header.
     pub clock: String,
@@ -35,7 +35,7 @@ pub struct Snapshot {
     pub finished: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SessionSnapshot {
     pub dht_nodes: Option<usize>,
     pub port: Option<u16>,
@@ -51,7 +51,7 @@ pub struct SessionSnapshot {
     pub watch_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TorrentSnapshot {
     pub info_hash: [u8; 20],
     pub name: String,
@@ -134,7 +134,7 @@ impl TorrentSnapshot {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PeerSnapshot {
     pub addr: SocketAddr,
     pub inbound: bool,
@@ -152,7 +152,7 @@ pub struct PeerSnapshot {
 }
 
 /// One web seed of the selected torrent.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WebSeedSnapshot {
     pub url: String,
     pub http_seed: bool,
@@ -164,7 +164,7 @@ pub struct WebSeedSnapshot {
 }
 
 /// The selected torrent's insides.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Detail {
     pub info_hash: [u8; 20],
     pub peers: Vec<PeerSnapshot>,
@@ -200,7 +200,7 @@ impl Detail {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Sources {
     pub tracker: u64,
     pub dht: u64,

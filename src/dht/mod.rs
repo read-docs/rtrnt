@@ -291,7 +291,7 @@ pub struct DhtPeers {
 
 /// How many peers a torrent has, estimated from the bloom filters of the
 /// nodes closest to it (BEP 33).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SwarmEstimate {
     /// Peers with the whole torrent.
     pub seeds: u32,

@@ -58,6 +58,18 @@ pub(crate) struct Args {
     /// terminal UI; log lines still go to stderr
     #[arg(long, conflicts_with_all = ["tui", "check", "scrape", "print_config"])]
     pub(crate) json: bool,
+    /// Run headless until stopped, keeping the session and serving local RPC
+    #[arg(long, conflicts_with_all = ["attach", "tui", "check", "scrape", "print_config", "rpc_request"])]
+    pub(crate) daemon: bool,
+    /// Attach the terminal UI to an existing daemon; q detaches
+    #[arg(long, conflicts_with_all = ["daemon", "torrents", "check", "scrape", "print_config", "json", "rpc_request"])]
+    pub(crate) attach: bool,
+    /// Unix control socket [default: $XDG_STATE_HOME/rtrnt/rpc/control.sock]
+    #[arg(long, value_name = "PATH")]
+    pub(crate) rpc_socket: Option<PathBuf>,
+    /// Send one JSON RPC action, print the response, and exit
+    #[arg(long, value_name = "JSON", conflicts_with_all = ["daemon", "attach", "torrents", "check", "scrape", "print_config", "json", "tui"])]
+    pub(crate) rpc_request: Option<String>,
     /// Do not look for peers in the DHT, only ask the trackers (`dht =
     /// false` in the config file)
     #[arg(long, overrides_with = "dht")]
@@ -233,7 +245,11 @@ impl Args {
     /// --scrape, and otherwise as the command line says, or else the config
     /// file (`file_session`), or else when the terminal UI is on (`tui`).
     pub(crate) fn use_session(&self, file_session: Option<bool>, tui: bool) -> bool {
-        !(self.check || self.scrape) && self.session().or(file_session).unwrap_or(tui)
+        !(self.check || self.scrape)
+            && self
+                .session()
+                .or(file_session)
+                .unwrap_or(tui || self.daemon)
     }
 
     /// Whether to show the terminal UI: never with --check, --scrape,
@@ -241,7 +257,7 @@ impl Args {
     /// config file (`file_tui`), or else when `terminals` says stdout and
     /// stderr both are.
     pub(crate) fn use_tui(&self, file_tui: Option<bool>, terminals: impl FnOnce() -> bool) -> bool {
-        !(self.check || self.scrape || self.print_config || self.json)
+        !(self.check || self.scrape || self.print_config || self.json || self.daemon)
             && self.tui().or(file_tui).unwrap_or_else(terminals)
     }
 
@@ -251,7 +267,7 @@ impl Args {
     /// them.
     pub(crate) fn check_torrents(&self, use_tui: bool, watching: bool) -> Result<(), clap::Error> {
         let watching = watching && !(self.check || self.scrape);
-        if self.torrents.is_empty() && !use_tui && !watching && !self.print_config {
+        if self.torrents.is_empty() && !use_tui && !watching && !self.print_config && !self.daemon {
             return Err(Self::command().error(
                 ErrorKind::MissingRequiredArgument,
                 "a torrent is needed, unless the terminal UI is on or a watch directory or RSS feed is set to add one",

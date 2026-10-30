@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 /// How the two sides of a connection stand, packed in a byte.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PeerFlags(u8);
 
 impl PeerFlags {
@@ -149,7 +149,7 @@ impl PeerStats {
 }
 
 /// What a web seed is doing.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WebSeedState {
     /// Waiting for a piece to fetch.
     #[default]

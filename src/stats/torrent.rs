@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use super::{PeerStats, WebSeedStats, lock};
 
 /// Where a torrent is in its life.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TorrentState {
     /// Fetching the metadata of a magnet link: `pieces` of `total` metadata
     /// pieces in (`total` is 0 until a peer says), from `peers` peers.
@@ -72,7 +72,7 @@ pub struct Previous {
 }
 
 /// The shape of a torrent, known once its metadata is.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Layout {
     pub size: u64,
     pub piece_length: u64,
@@ -113,7 +113,7 @@ struct Selected {
 
 /// Which pieces we have, are downloading, and how many connected peers have
 /// each.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PieceSnapshot {
     pub have: Vec<bool>,
     pub in_flight: Vec<bool>,
@@ -133,14 +133,14 @@ enum Pieces {
 }
 
 /// What a tracker last said.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TrackerResult {
     NotContacted,
     Ok,
     Error(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TrackerStatus {
     /// The tier (BEP 12), counting from 0.
     pub tier: usize,

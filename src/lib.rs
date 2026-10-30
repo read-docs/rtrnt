@@ -21,6 +21,8 @@ pub mod portmap;
 pub mod queue;
 pub mod rate_limit;
 pub mod resume;
+#[cfg(unix)]
+pub mod rpc;
 pub mod rss;
 pub mod selection;
 pub mod session;

@@ -49,6 +49,30 @@ async fn main() -> anyhow::Result<ExitCode> {
             }
         };
     }
+    if args.attach || args.rpc_request.is_some() {
+        #[cfg(unix)]
+        {
+            let socket = args
+                .rpc_socket
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(rtrnt::rpc::default_socket)?;
+            if let Some(action) = args.rpc_request.take() {
+                let response = rtrnt::rpc::request(&socket, serde_json::from_str(&action)?).await?;
+                println!("{}", serde_json::to_string(&response)?);
+                return Ok(if matches!(response, rtrnt::rpc::Response::Error(_)) {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                });
+            }
+            let (feed, idle) = rtrnt::rpc::RemoteFeed::connect(&socket).await?;
+            tui::run(feed, idle, std::env::current_dir()?).await?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        #[cfg(not(unix))]
+        bail!("daemon control requires Unix sockets");
+    }
     // Relative paths given to the UI's `a` are under it. Should it be gone,
     // they stay relative, and fail to load.
     let start_dir = std::env::current_dir().unwrap_or_default();
@@ -78,7 +102,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     } else {
         // --json leaves stdout to the JSON lines, and the bars have no place
         // beside them.
-        let bars = if args.json {
+        let bars = if args.json || args.daemon {
             MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
         } else {
             MultiProgress::new()
@@ -87,6 +111,8 @@ async fn main() -> anyhow::Result<ExitCode> {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(move || LogLine::new(log_bars.clone()))
+            .finish()
+            .with(logs.layer())
             .init();
         bars
     };
@@ -214,7 +240,7 @@ async fn main() -> anyhow::Result<ExitCode> {
             })
             .await;
     }
-    if use_tui || watch_dir.is_some() || !rss_feeds.is_empty() {
+    if use_tui || args.daemon || watch_dir.is_some() || !rss_feeds.is_empty() {
         manager.expect_more();
     }
     let options = StartOptions {
@@ -256,6 +282,41 @@ async fn main() -> anyhow::Result<ExitCode> {
         );
         // It lets go of its sender when Ctrl-C comes, so the run can end.
         tokio::spawn(poller.run(Arc::clone(&shutdown).signal()));
+    }
+    if args.daemon {
+        #[cfg(unix)]
+        {
+            let socket = args
+                .rpc_socket
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(rtrnt::rpc::default_socket)?;
+            let daemon_shutdown = Arc::clone(&shutdown);
+            let server = rtrnt::rpc::Server::bind(
+                socket.clone(),
+                Arc::clone(client.stats()),
+                logs.clone(),
+                manager.idle(),
+                commands.clone(),
+                move || {
+                    daemon_shutdown.request_stop();
+                },
+            )?;
+            info!(path = %socket.display(), "serving local control; attach with rtrnt --attach");
+            drop(commands);
+            let mut run = std::pin::pin!(manager.run(commands_rx));
+            let result = tokio::select! {
+                result = &mut run => result,
+                () = Arc::clone(&shutdown).signal() => {
+                    drop(server);
+                    run.await
+                }
+            };
+            client.close_port_mappings().await;
+            return result;
+        }
+        #[cfg(not(unix))]
+        bail!("daemon mode requires Unix sockets");
     }
     if !use_tui {
         // Only the watcher and the RSS poller, if there are any, send
