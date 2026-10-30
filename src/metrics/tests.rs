@@ -33,6 +33,8 @@ fn torrent(hash: u8, name: &str, state: TorrentState) -> TorrentSnapshot {
         rate_up: 20.0,
         eta: Some(Duration::from_secs(90)),
         limits: TorrentSettings::default(),
+        effective_limits: TorrentSettings::default(),
+        tags: Vec::new(),
     }
 }
 

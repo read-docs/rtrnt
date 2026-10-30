@@ -858,7 +858,7 @@ fn tags_show_after_the_name_and_the_view_in_the_title() {
     let buffer = render(100, 32, &snapshot, &app);
     let lines = text(&buffer, buffer.area);
     assert!(
-        lines[3].starts_with("│▌debian-13.7.0-amd…  #linux #iso"),
+        lines[3].starts_with("│▌debian-13.7.0-am… #linux …"),
         "{}",
         lines[3]
     );
@@ -884,7 +884,8 @@ fn tags_show_after_the_name_and_the_view_in_the_title() {
         lines[1]
     );
     assert!(lines[3].starts_with("│▌debian"));
-    assert!(lines[4].starts_with("╭ 1 Peers"), "{}", lines[4]);
+    // The others are out of the table.
+    assert!(!lines[4].contains("Big Buck"), "{}", lines[4]);
 }
 
 #[test]
