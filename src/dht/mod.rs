@@ -13,6 +13,7 @@
 //! id derived from that address, and nodes with such ids are preferred in
 //! the routing table. The routing table is not saved between runs.
 
+mod bloom;
 mod krpc;
 mod lookup;
 mod routing;
@@ -24,6 +25,7 @@ mod token;
 pub use search::DhtSearch;
 
 use anyhow::{Context, Result, anyhow};
+use bloom::Bloom;
 use krpc::{Body, ERROR_METHOD_UNKNOWN, ERROR_PROTOCOL, Message, Query, Response};
 use lookup::Lookup;
 use routing::{Insert, K, NodeId, NodeInfo, RoutingTable};
@@ -182,7 +184,24 @@ impl Dht {
         info_hash: [u8; 20],
         announce_port: Option<u16>,
     ) -> Vec<SocketAddr> {
-        self.0.node.get_peers(info_hash, announce_port).await
+        self.lookup_peers(info_hash, announce_port, false)
+            .await
+            .peers
+    }
+
+    /// Like `get_peers`, and also scrapes the swarm size (BEP 33). A node
+    /// that `seeding` the torrent announces itself as a seed and asks for no
+    /// seeds in return.
+    pub async fn lookup_peers(
+        &self,
+        info_hash: [u8; 20],
+        announce_port: Option<u16>,
+        seeding: bool,
+    ) -> DhtPeers {
+        self.0
+            .node
+            .get_peers(info_hash, announce_port, seeding)
+            .await
     }
 
     /// Pings `addr`, which a peer named in a `Port` message, and adds it to
@@ -195,6 +214,24 @@ impl Dht {
             debug!(%addr, "too many DHT nodes to verify; skipping");
         }
     }
+}
+
+/// What a lookup for peers found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DhtPeers {
+    pub peers: Vec<SocketAddr>,
+    /// The size of the swarm, if any node answered the scrape.
+    pub swarm: Option<SwarmEstimate>,
+}
+
+/// How many peers a torrent has, estimated from the bloom filters of the
+/// nodes closest to it (BEP 33).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwarmEstimate {
+    /// Peers with the whole torrent.
+    pub seeds: u32,
+    /// Peers still downloading.
+    pub leechers: u32,
 }
 
 struct Node {
@@ -297,11 +334,48 @@ impl Drop for Unregister<'_> {
     }
 }
 
+/// What a lookup is for.
+#[derive(Clone, Copy)]
+enum Kind {
+    FindNode,
+    /// Ask for peers and bloom filters of the swarm; `noseed` if we are one.
+    GetPeers {
+        noseed: bool,
+    },
+}
+
 /// What a lookup found.
 struct Found {
     peers: HashSet<SocketAddrV4>,
+    /// The merged bloom filters of the nodes that sent them: seeds, and
+    /// other peers.
+    seeds: Option<Bloom>,
+    others: Option<Bloom>,
     /// The closest nodes that answered, with their `get_peers` tokens.
     closest: Vec<(NodeInfo, Option<Vec<u8>>)>,
+}
+
+impl Found {
+    /// The swarm size from the filters of all answers. Peers that nodes
+    /// without the extension sent are added to the filter of non-seeds
+    /// unless a seed filter has them, so that they count too.
+    fn swarm(&self) -> Option<SwarmEstimate> {
+        if self.seeds.is_none() && self.others.is_none() {
+            return None;
+        }
+        let seeds = self.seeds.clone().unwrap_or_default();
+        let mut others = self.others.clone().unwrap_or_default();
+        for peer in &self.peers {
+            let ip = IpAddr::V4(*peer.ip());
+            if !seeds.contains(ip) {
+                others.insert(ip);
+            }
+        }
+        Some(SwarmEstimate {
+            seeds: seeds.count(),
+            leechers: others.count(),
+        })
+    }
 }
 
 impl Node {
@@ -331,7 +405,7 @@ impl Node {
         if let Some(id) = id {
             info!(%ip, ?id, "DHT node id changed to match our external address");
             let node = Arc::clone(self);
-            tokio::spawn(async move { node.lookup(id, false).await });
+            tokio::spawn(async move { node.lookup(id, Kind::FindNode).await });
         }
     }
 
@@ -523,7 +597,7 @@ impl Node {
     /// `get_peers` is set and `find_node` otherwise. It starts from the
     /// closest nodes in the table, plus the routers while the table holds
     /// fewer than `K` nodes.
-    async fn lookup(self: &Arc<Self>, target: NodeId, get_peers: bool) -> Found {
+    async fn lookup(self: &Arc<Self>, target: NodeId, kind: Kind) -> Found {
         let seeds = self.lock().table.closest(&target, K);
         let routers = if seeds.len() < K {
             self.resolve_routers().await
@@ -535,16 +609,18 @@ impl Node {
         // When each query becomes slow, in the order they were sent.
         let mut slow = VecDeque::new();
         let mut peers = HashSet::new();
+        let (mut seeds, mut others) = (None::<Bloom>, None::<Bloom>);
         let deadline = Instant::now() + LOOKUP_TIMEOUT;
         loop {
             for addr in lookup.next_queries() {
                 let node = Arc::clone(self);
-                let query = if get_peers {
-                    Query::GetPeers {
+                let query = match kind {
+                    Kind::GetPeers { noseed } => Query::GetPeers {
                         info_hash: target.0,
-                    }
-                } else {
-                    Query::FindNode { target }
+                        noseed,
+                        scrape: true,
+                    },
+                    Kind::FindNode => Query::FindNode { target },
                 };
                 slow.push_back((Instant::now() + QUERY_TIMEOUT, addr));
                 queries.spawn(async move { (addr, node.query(addr, query).await) });
@@ -579,6 +655,14 @@ impl Node {
                 Ok(response) => {
                     let reachable =
                         |peer: &SocketAddrV4| peer.port() != 0 && !peer.ip().is_unspecified();
+                    for (filter, sent) in [
+                        (&mut seeds, &response.seed_filter),
+                        (&mut others, &response.peer_filter),
+                    ] {
+                        if let Some(sent) = sent {
+                            filter.get_or_insert_with(Bloom::default).merge(sent);
+                        }
+                    }
                     for peer in response.values.into_iter().filter(reachable) {
                         if peers.len() >= MAX_LOOKUP_PEERS {
                             break;
@@ -595,12 +679,14 @@ impl Node {
         }
         Found {
             peers,
+            seeds,
+            others,
             closest: lookup.closest_responded(),
         }
     }
 
     async fn bootstrap(self: &Arc<Self>) -> usize {
-        self.lookup(self.id(), false).await;
+        self.lookup(self.id(), Kind::FindNode).await;
         let nodes = self.lock().table.len();
         if nodes == 0 {
             warn!("DHT bootstrap found no nodes");
@@ -614,15 +700,21 @@ impl Node {
         self: &Arc<Self>,
         info_hash: [u8; 20],
         announce_port: Option<u16>,
-    ) -> Vec<SocketAddr> {
+        seeding: bool,
+    ) -> DhtPeers {
         if self.lock().table.is_empty() {
             self.bootstrap().await;
         }
-        let found = self.lookup(NodeId(info_hash), true).await;
+        let kind = Kind::GetPeers { noseed: seeding };
+        let found = self.lookup(NodeId(info_hash), kind).await;
+        let swarm = found.swarm();
         if let Some(port) = announce_port {
-            self.announce(info_hash, port, found.closest).await;
+            self.announce(info_hash, port, seeding, found.closest).await;
         }
-        found.peers.into_iter().map(SocketAddr::V4).collect()
+        DhtPeers {
+            peers: found.peers.into_iter().map(SocketAddr::V4).collect(),
+            swarm,
+        }
     }
 
     /// Tells the `closest` nodes that sent a token that we accept peers for
@@ -632,6 +724,7 @@ impl Node {
         self: &Arc<Self>,
         info_hash: [u8; 20],
         port: u16,
+        seed: bool,
         closest: Vec<(NodeInfo, Option<Vec<u8>>)>,
     ) {
         let implied_port = port == self.addr.port();
@@ -644,6 +737,7 @@ impl Node {
                 info_hash,
                 port,
                 implied_port,
+                seed,
                 token,
             };
             let dht = Arc::clone(self);
@@ -740,7 +834,7 @@ impl Node {
             }
             Some(targets) => {
                 for target in targets {
-                    self.lookup(target, false).await;
+                    self.lookup(target, Kind::FindNode).await;
                 }
             }
         }
@@ -786,23 +880,39 @@ fn answer(
         }),
         // Nodes come along even when there are peers, as most clients do:
         // they help the lookup go on.
-        Query::GetPeers { info_hash } => response(Response {
-            nodes: state.table.closest(&NodeId(info_hash), K),
-            values: state.store.get(&info_hash, now),
-            token: Some(state.tokens.issue(ip, now)),
-            ..Response::default()
-        }),
+        Query::GetPeers {
+            info_hash,
+            noseed,
+            scrape,
+        } => {
+            let (seed_filter, peer_filter) = match scrape
+                .then(|| state.store.scrape(&info_hash, now))
+                .flatten()
+            {
+                Some((seeds, others)) => (Some(seeds), Some(others)),
+                None => (None, None),
+            };
+            response(Response {
+                nodes: state.table.closest(&NodeId(info_hash), K),
+                values: state.store.get(&info_hash, noseed, now),
+                token: Some(state.tokens.issue(ip, now)),
+                seed_filter,
+                peer_filter,
+                ..Response::default()
+            })
+        }
         Query::AnnouncePeer {
             info_hash,
             port,
             implied_port,
+            seed,
             token,
         } => {
             if state.tokens.check(&token, ip, now) {
                 let port = if implied_port { from.port() } else { port };
                 state
                     .store
-                    .announce(info_hash, SocketAddrV4::new(ip, port), now);
+                    .announce(info_hash, SocketAddrV4::new(ip, port), seed, now);
                 response(Response::default())
             } else {
                 error(ERROR_PROTOCOL, "bad token")

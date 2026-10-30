@@ -3,6 +3,7 @@
 
 use super::log_buffer::{LogBuffer, LogLine};
 use super::view::LOG_LINES;
+use crate::dht::SwarmEstimate;
 use crate::portmap::Status as PortmapStatus;
 use crate::selection::Priority;
 use crate::stats::{
@@ -173,6 +174,8 @@ pub struct Detail {
     /// Peers learned of from the trackers, the DHT, peer exchange, and
     /// peers that connected to us.
     pub sources: Sources,
+    /// How many seeds and leechers the DHT estimates the swarm has.
+    pub dht_swarm: Option<SwarmEstimate>,
     /// Download and upload rates, a sample per tick, oldest first. Filled
     /// in from the rate history.
     pub down_history: Vec<f64>,
@@ -351,6 +354,7 @@ fn detail(torrent: &TorrentStats, now: Instant) -> Detail {
             pex: torrent.source(PeerSource::Pex),
             incoming: torrent.source(PeerSource::Incoming),
         },
+        dht_swarm: torrent.dht_swarm(),
         down_history: Vec::new(),
         up_history: Vec::new(),
         peer_history: None,

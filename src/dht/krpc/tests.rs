@@ -1,4 +1,5 @@
 use super::*;
+use crate::dht::bloom;
 use std::net::Ipv6Addr;
 
 const ID: &[u8; 20] = b"abcdefghij0123456789";
@@ -73,7 +74,11 @@ fn decodes_bep_5_examples() {
     );
     assert_eq!(
         query(b"d1:ad2:id20:abcdefghij01234567899:info_hash20:mnopqrstuvwxyz123456e1:q9:get_peers1:t2:aa1:y1:qe"),
-        Query::GetPeers { info_hash: *OTHER }
+        Query::GetPeers {
+            info_hash: *OTHER,
+            noseed: false,
+            scrape: false
+        }
     );
     assert_eq!(
         query(b"d1:ad2:id20:abcdefghij012345678912:implied_porti1e9:info_hash20:mnopqrstuvwxyz1234564:porti6881e5:token8:aoeusnthe1:q13:announce_peer1:t2:aa1:y1:qe"),
@@ -81,6 +86,7 @@ fn decodes_bep_5_examples() {
             info_hash: *OTHER,
             port: 6881,
             implied_port: true,
+            seed: false,
             token: b"aoeusnth".to_vec(),
         }
     );
@@ -132,7 +138,19 @@ fn messages_roundtrip() {
         },
         Body::Query {
             id,
-            query: Query::GetPeers { info_hash: *OTHER },
+            query: Query::GetPeers {
+                info_hash: *OTHER,
+                noseed: false,
+                scrape: false,
+            },
+        },
+        Body::Query {
+            id,
+            query: Query::GetPeers {
+                info_hash: *OTHER,
+                noseed: true,
+                scrape: true,
+            },
         },
         Body::Query {
             id,
@@ -140,6 +158,17 @@ fn messages_roundtrip() {
                 info_hash: *OTHER,
                 port: 51413,
                 implied_port: false,
+                seed: false,
+                token: vec![1, 2, 3],
+            },
+        },
+        Body::Query {
+            id,
+            query: Query::AnnouncePeer {
+                info_hash: *OTHER,
+                port: 51413,
+                implied_port: true,
+                seed: true,
                 token: vec![1, 2, 3],
             },
         },
@@ -152,6 +181,8 @@ fn messages_roundtrip() {
             nodes: vec![node(1, 6881), node(2, 1)],
             values: vec![SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 80)],
             token: Some(b"tok".to_vec()),
+            seed_filter: Some(Bloom::from_bytes(&[0x55; bloom::BYTES]).unwrap()),
+            peer_filter: Some(Bloom::default()),
         }),
         Body::Response(Response {
             id,
@@ -242,6 +273,8 @@ fn caps_nodes_and_values_per_response() {
         nodes,
         values: vec![SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1); 500],
         token: None,
+        seed_filter: None,
+        peer_filter: None,
     };
     let message = Message {
         tid: vec![1],
@@ -277,4 +310,61 @@ fn carries_our_address_as_top_level_ip() {
     // A malformed one is dropped, not an error.
     let data = b"d2:ip3:abc1:rd2:id20:abcdefghij0123456789e1:t2:aa1:y1:re";
     assert_eq!(Message::decode(data).unwrap().ip, None);
+}
+
+/// BEP 33's keys are plain integers and 256-byte strings.
+#[test]
+fn bep_33_fields_on_the_wire() {
+    let query = |extra: &[u8]| {
+        let mut data =
+            b"d1:ad2:id20:abcdefghij01234567899:info_hash20:mnopqrstuvwxyz123456".to_vec();
+        data.extend_from_slice(extra);
+        data.extend_from_slice(b"e1:q9:get_peers1:t2:aa1:y1:qe");
+        match Message::decode(&data).unwrap().body {
+            Body::Query { query, .. } => query,
+            other => panic!("not a query: {other:?}"),
+        }
+    };
+    let flags = |query| match query {
+        Query::GetPeers { noseed, scrape, .. } => (noseed, scrape),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(flags(query(b"")), (false, false));
+    assert_eq!(flags(query(b"6:noseedi1e6:scrapei1e")), (true, true));
+    assert_eq!(flags(query(b"6:noseedi0e6:scrape3:abc")), (false, false));
+
+    let filter = vec![0xaa; bloom::BYTES];
+    let mut data = b"d1:rd4:BFpe256:".to_vec();
+    data.extend_from_slice(&filter);
+    data.extend_from_slice(b"4:BFsd3:abc2:id20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re");
+    let Body::Response(response) = Message::decode(&data).unwrap().body else {
+        panic!("not a response");
+    };
+    // The one of the right size is kept, the other dropped.
+    assert_eq!(response.peer_filter.unwrap().as_bytes().as_slice(), filter);
+    assert_eq!(response.seed_filter, None);
+
+    let announce = |seed| Query::AnnouncePeer {
+        info_hash: *OTHER,
+        port: 1,
+        implied_port: false,
+        seed,
+        token: vec![1],
+    };
+    let args = query_args(&NodeId(*ID), &announce(true));
+    assert_eq!(args.get(b"seed".as_slice()), Some(&Value::Int(1)));
+    assert!(!query_args(&NodeId(*ID), &announce(false)).contains_key(b"seed".as_slice()));
+    // Only 1 means a seed.
+    let mut data = b"d1:ad2:id20:abcdefghij01234567899:info_hash20:mnopqrstuvwxyz1234564:porti1e4:seedi2e5:token1:xe1:q13:announce_peer1:t2:aa1:y1:qe".to_vec();
+    let seed = |data: &[u8]| match Message::decode(data).unwrap().body {
+        Body::Query {
+            query: Query::AnnouncePeer { seed, .. },
+            ..
+        } => seed,
+        other => panic!("{other:?}"),
+    };
+    assert!(!seed(&data));
+    let at = data.windows(7).position(|w| w == b"4:seedi").unwrap() + 7;
+    data[at] = b'1';
+    assert!(seed(&data));
 }

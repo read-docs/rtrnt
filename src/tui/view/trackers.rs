@@ -90,15 +90,36 @@ pub fn draw(
         on("ok".to_string())
     };
     rows.push(Line::default());
-    for (name, (status, style), peers) in [
-        ("DHT", dht, detail.sources.dht),
-        ("PeX", pex, detail.sources.pex),
+    // The DHT's counts are estimates from bloom filters, marked with a ~.
+    let swarm = detail.dht_swarm;
+    let estimate = |count: Option<u32>| number(count.map(|n| format!("~{n}")));
+    for (name, (status, style), peers, seeds, leechers) in [
+        (
+            "DHT",
+            dht,
+            detail.sources.dht,
+            estimate(swarm.map(|s| s.seeds)),
+            estimate(swarm.map(|s| s.leechers)),
+        ),
+        ("PeX", pex, detail.sources.pex, String::new(), String::new()),
         (
             "incoming",
             ("—".to_string(), theme.dim_style()),
             detail.sources.incoming,
+            String::new(),
+            String::new(),
         ),
     ] {
+        let counts = if swarm.is_some() && name == "DHT" {
+            format!(
+                " {} {} {}",
+                number(Some(peers.to_string())),
+                seeds,
+                leechers
+            )
+        } else {
+            format!(" {}", number(Some(peers.to_string())))
+        };
         rows.push(Line::from(vec![
             Span::raw(format!(
                 " {} {}",
@@ -106,7 +127,7 @@ pub fn draw(
                 fit(name, url, false)
             )),
             Span::styled(format!(" {}", fit(&status, STATUS, false)), style),
-            Span::raw(format!(" {}", number(Some(peers.to_string())))),
+            Span::raw(counts),
         ]));
     }
 

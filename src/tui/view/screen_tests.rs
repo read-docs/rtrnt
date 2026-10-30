@@ -251,8 +251,8 @@ fn trackers_tab_groups_by_tier() {
     ));
     assert!(lines[4].starts_with("│ 3    https://tracker.example.net/announce      not contacted"));
     assert!(lines[6].starts_with(
-        "│      DHT                                       ok, 312 nodes             118"
-    ));
+        "│      DHT                                       ok, 312 nodes             118   ~640  ~1180"
+    ), "{}", lines[6]);
     assert!(lines[7].starts_with(
         "│      PeX                                       ok                         70"
     ));

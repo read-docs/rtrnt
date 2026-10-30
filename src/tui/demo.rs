@@ -7,6 +7,7 @@ use super::snapshot::{
     Detail, NOTICE_SHOWN, PeerSnapshot, SessionSnapshot, Snapshot, Sources, TorrentSnapshot,
 };
 use super::{Command, Feed};
+use crate::dht::SwarmEstimate;
 use crate::portmap::Status as PortmapStatus;
 use crate::stats::{Layout, PeerFlags, PieceSnapshot, TorrentState, TrackerResult, TrackerStatus};
 use crate::tags;
@@ -603,6 +604,10 @@ impl DemoFeed {
                 pex: 70,
                 incoming: 12,
             },
+            dht_swarm: Some(SwarmEstimate {
+                seeds: 640,
+                leechers: 1180,
+            }),
             down_history: Vec::new(),
             up_history: Vec::new(),
             peer_history: None,

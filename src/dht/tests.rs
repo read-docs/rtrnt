@@ -11,6 +11,14 @@ fn ask(state: &mut State, query: Query, from: SocketAddrV4, now: Instant) -> (Bo
     answer(state, OWN, NodeId([1; 20]), query, from, now)
 }
 
+fn get_peers(noseed: bool, scrape: bool) -> Query {
+    Query::GetPeers {
+        info_hash: INFO_HASH,
+        noseed,
+        scrape,
+    }
+}
+
 fn response(body: Body) -> Response {
     match body {
         Body::Response(response) => response,
@@ -51,14 +59,7 @@ fn answers_ping_and_find_node() {
 fn announce_needs_a_token_from_get_peers() {
     let now = Instant::now();
     let mut state = State::new(OWN, now);
-    let (body, _) = ask(
-        &mut state,
-        Query::GetPeers {
-            info_hash: INFO_HASH,
-        },
-        addr(1),
-        now,
-    );
+    let (body, _) = ask(&mut state, get_peers(false, false), addr(1), now);
     let reply = response(body);
     assert!(reply.values.is_empty());
     let token = reply.token.unwrap();
@@ -67,6 +68,7 @@ fn announce_needs_a_token_from_get_peers() {
         info_hash: INFO_HASH,
         port,
         implied_port,
+        seed: false,
         token: token.to_vec(),
     };
     // From another address, or with a made-up token: refused.
@@ -87,12 +89,8 @@ fn announce_needs_a_token_from_get_peers() {
     // The token is bound to the IP address, not the port.
     let (body, _) = ask(&mut state, announce(6881, false, &token), addr(5), now);
     response(body);
-    let get_peers = |state: &mut State| {
-        let query = Query::GetPeers {
-            info_hash: INFO_HASH,
-        };
-        response(ask(state, query, addr(1), now).0).values
-    };
+    let get_peers =
+        |state: &mut State| response(ask(state, get_peers(false, false), addr(1), now).0).values;
     assert_eq!(get_peers(&mut state), [addr(6881)]);
     // The same host announcing again, with its source port as `implied_port`
     // says, replaces its entry.
@@ -233,4 +231,85 @@ fn the_routers_address_counts_at_once_if_it_can_be_public() {
     assert!(id.is_secure_v4(ours));
     assert_eq!(state.table.own(), id);
     assert_eq!(state.adopt(ours, now), None);
+}
+
+#[test]
+fn scrape_answers_with_filters_and_noseed_skips_seeds() {
+    let now = Instant::now();
+    let mut state = State::new(OWN, now);
+    let host = |n: u8| SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, n), 1);
+    // Tokens go by address, so each host gets its own.
+    for (n, seed) in [(2, true), (3, false), (4, false)] {
+        let token = response(ask(&mut state, get_peers(false, false), host(n), now).0)
+            .token
+            .unwrap();
+        let query = Query::AnnouncePeer {
+            info_hash: INFO_HASH,
+            port: 6881,
+            implied_port: false,
+            seed,
+            token,
+        };
+        response(ask(&mut state, query, host(n), now).0);
+    }
+
+    // No filters unless asked for.
+    let plain = response(ask(&mut state, get_peers(false, false), addr(1), now).0);
+    assert_eq!((plain.seed_filter, plain.peer_filter), (None, None));
+    assert_eq!(plain.values.len(), 3);
+
+    let scraped = response(ask(&mut state, get_peers(false, true), addr(1), now).0);
+    let (seeds, others) = (scraped.seed_filter.unwrap(), scraped.peer_filter.unwrap());
+    assert_eq!((seeds.count(), others.count()), (1, 2));
+    assert!(seeds.contains(IpAddr::V4(*host(2).ip())));
+
+    // A seed is sent no seeds.
+    let noseed = response(ask(&mut state, get_peers(true, false), addr(1), now).0);
+    assert_eq!(noseed.values.len(), 2);
+    assert!(!noseed.values.iter().any(|v| v.ip() == host(2).ip()));
+
+    // A torrent nobody announced has nothing to scrape.
+    let other = Query::GetPeers {
+        info_hash: [3; 20],
+        noseed: false,
+        scrape: true,
+    };
+    let none = response(ask(&mut state, other, addr(1), now).0);
+    assert_eq!((none.seed_filter, none.peer_filter), (None, None));
+}
+
+#[test]
+fn a_lookup_merges_the_filters_into_swarm_counts() {
+    let mut seeds = Bloom::default();
+    let mut others = Bloom::default();
+    for n in 0..30u8 {
+        seeds.insert(Ipv4Addr::new(1, 1, 1, n).into());
+    }
+    for n in 0..70u8 {
+        others.insert(Ipv4Addr::new(2, 2, 2, n).into());
+    }
+    let none = Found {
+        peers: HashSet::new(),
+        seeds: None,
+        others: None,
+        closest: Vec::new(),
+    };
+    assert_eq!(none.swarm(), None);
+    // Peers from nodes that sent no filters count too, unless a seed filter
+    // has them.
+    let found = Found {
+        peers: [
+            SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 5), 1),
+            SocketAddrV4::new(Ipv4Addr::new(3, 3, 3, 3), 1),
+        ]
+        .into(),
+        seeds: Some(seeds),
+        others: Some(others),
+        closest: Vec::new(),
+    };
+    let swarm = found.swarm().unwrap();
+    // The estimate of a filter is close, not exact; the seed that sits in
+    // both lists is not counted twice.
+    assert_eq!(swarm.seeds, 30);
+    assert!((70..=72).contains(&swarm.leechers), "{swarm:?}");
 }

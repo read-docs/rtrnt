@@ -5,6 +5,7 @@
 //! nesting depth and the size of every field, and rejects anything
 //! malformed. A datagram is at most 64 KiB, which bounds the rest.
 
+use super::bloom::Bloom;
 use super::routing::{NodeId, NodeInfo};
 use anyhow::{Result, anyhow, bail};
 use std::collections::BTreeMap;
@@ -188,6 +189,10 @@ pub enum Query {
     },
     GetPeers {
         info_hash: [u8; 20],
+        /// We are a seed and want no seeds in the answer (BEP 33).
+        noseed: bool,
+        /// We want the bloom filters of seeds and peers (BEP 33).
+        scrape: bool,
     },
     AnnouncePeer {
         info_hash: [u8; 20],
@@ -195,6 +200,8 @@ pub enum Query {
         port: u16,
         /// Use the port the query came from instead of `port`.
         implied_port: bool,
+        /// The announcing node has the whole torrent (BEP 33).
+        seed: bool,
         token: Vec<u8>,
     },
     /// A method we do not know, answered with error 204.
@@ -222,6 +229,10 @@ pub struct Response {
     pub values: Vec<SocketAddrV4>,
     /// Lets us `announce_peer` to the node that sent it.
     pub token: Option<Vec<u8>>,
+    /// The IP addresses of the seeds the node stores for the torrent, and
+    /// of its other peers: BEP 33's `BFsd` and `BFpe`.
+    pub seed_filter: Option<Bloom>,
+    pub peer_filter: Option<Bloom>,
 }
 
 impl Message {
@@ -289,17 +300,31 @@ fn query_args(id: &NodeId, query: &Query) -> Dict {
         Query::FindNode { target } => {
             args.insert(b"target".to_vec(), Value::Bytes(target.0.to_vec()));
         }
-        Query::GetPeers { info_hash } => {
+        Query::GetPeers {
+            info_hash,
+            noseed,
+            scrape,
+        } => {
             args.insert(b"info_hash".to_vec(), Value::Bytes(info_hash.to_vec()));
+            if *noseed {
+                args.insert(b"noseed".to_vec(), Value::Int(1));
+            }
+            if *scrape {
+                args.insert(b"scrape".to_vec(), Value::Int(1));
+            }
         }
         Query::AnnouncePeer {
             info_hash,
             port,
             implied_port,
+            seed,
             token,
         } => {
             args.insert(b"info_hash".to_vec(), Value::Bytes(info_hash.to_vec()));
             args.insert(b"port".to_vec(), Value::Int(i64::from(*port)));
+            if *seed {
+                args.insert(b"seed".to_vec(), Value::Int(1));
+            }
             args.insert(b"token".to_vec(), Value::Bytes(token.clone()));
             if *implied_port {
                 args.insert(b"implied_port".to_vec(), Value::Int(1));
@@ -326,6 +351,14 @@ fn response_fields(response: &Response) -> Dict {
     if let Some(token) = &response.token {
         fields.insert(b"token".to_vec(), Value::Bytes(token.clone()));
     }
+    for (key, bloom) in [
+        (&b"BFsd"[..], &response.seed_filter),
+        (b"BFpe", &response.peer_filter),
+    ] {
+        if let Some(bloom) = bloom {
+            fields.insert(key.to_vec(), Value::Bytes(bloom.as_bytes().to_vec()));
+        }
+    }
     fields
 }
 
@@ -340,10 +373,11 @@ fn decode_query(dict: &Dict) -> Result<Body> {
         },
         b"get_peers" => Query::GetPeers {
             info_hash: id20(args, b"info_hash")?,
+            noseed: flag(args, b"noseed"),
+            scrape: flag(args, b"scrape"),
         },
         b"announce_peer" => {
-            let implied_port =
-                matches!(args.get(b"implied_port".as_slice()), Some(Value::Int(i)) if *i != 0);
+            let implied_port = flag(args, b"implied_port");
             let port = int(args, b"port")
                 .ok()
                 .and_then(|port| u16::try_from(port).ok())
@@ -361,6 +395,8 @@ fn decode_query(dict: &Dict) -> Result<Body> {
                 info_hash: id20(args, b"info_hash")?,
                 port,
                 implied_port,
+                // Anything but 1 means a peer.
+                seed: matches!(args.get(b"seed".as_slice()), Some(Value::Int(1))),
                 token: token.to_vec(),
             }
         }
@@ -395,11 +431,18 @@ fn decode_response(fields: &Dict) -> Result<Response> {
         Some(_) => bail!("invalid token"),
         None => None,
     };
+    // A filter of the wrong size is as good as none.
+    let bloom = |key: &[u8]| match fields.get(key) {
+        Some(Value::Bytes(bytes)) => Bloom::from_bytes(bytes),
+        _ => None,
+    };
     Ok(Response {
         id,
         nodes,
         values,
         token,
+        seed_filter: bloom(b"BFsd"),
+        peer_filter: bloom(b"BFpe"),
     })
 }
 
@@ -420,6 +463,11 @@ fn decode_error(dict: &Dict) -> Result<Body> {
         _ => String::new(),
     };
     Ok(Body::Error { code, message })
+}
+
+/// Whether `key` is an integer other than zero.
+fn flag(dict: &Dict, key: &[u8]) -> bool {
+    matches!(dict.get(key), Some(Value::Int(i)) if *i != 0)
 }
 
 fn get<'a>(dict: &'a Dict, key: &[u8]) -> Result<&'a Value> {
