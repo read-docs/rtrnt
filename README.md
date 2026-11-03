@@ -1,251 +1,104 @@
-
 # rtrnt
 
-A terminal-based BitTorrent client written in Rust.
+A BitTorrent client for the terminal, written in Rust. Run `rtrnt`, press `a`, paste a magnet link.
 
-## Overview
-
-**rtrnt** is a lightweight BitTorrent client implementation built with Rust, designed to download files from torrent networks through the terminal. It supports both HTTP and UDP tracker protocols and implements the core BitTorrent peer protocol for efficient file downloads.
-
-## Features
-
-- 🚀 **Async/Await Architecture** - Built with Tokio for high-performance concurrent downloads
-- 🌐 **Multi-Protocol Support** - Compatible with both UDP and HTTP trackers
-- 🔗 **Peer Protocol Implementation** - Full BitTorrent peer wire protocol support, with the extension protocol (BEP 10) and the fast extension (BEP 6)
-- ⚡ **Parallel Downloads** - Concurrent piece downloading from multiple peers
-- 🔒 **Data Integrity** - SHA-1 hash verification for downloaded pieces
-- 📦 **Bencode Support** - Native torrent file parsing
-
-## Usage
-
-```sh
-cargo run --release -- path/to/file.torrent -o ~/Downloads
-cargo run --release -- 'magnet:?xt=urn:btih:...&tr=udp://tracker.example:1337' -o ~/Downloads
-cargo run --release -- first.torrent second.torrent 'magnet:?xt=urn:btih:...' -o ~/Downloads
+```
+ rtrnt │ ↓ 6.6 MiB/s  ↑ 1.1 MiB/s (2 MiB/s) │ 5 torrents  71/200 peers  DHT 312 nodes         14:02
+╭ Torrents ───────────────────────────────────────────────────────────────────────── sort: added ▾ ╮
+│ Name                           Size Progress        Status               ↓          ↑ Peers  ETA │
+│▌debian-13.7.0-amd64-netin…  754 MiB ██████▎───  61% downloading  4.2 MiB/s  367 KiB/s    38   1m │
+│ archlinux-2026.10.01-x86_…  1.2 GiB ██████████ 100% seeding              —  706 KiB/s    12    ∞ │
+│ ubuntu-26.04-desktop-amd6…  6.1 GiB █▎────────  11% downloading  2.4 MiB/s  103 KiB/s    21  38m │
+│ Big Buck Bunny                    — ████▎─────  42% metadata             —          —     4    — │
+│ fedora-Workstation-Live-4…  2.4 GiB ███▊──────  36% checking             —          —     0    — │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭ 1 Peers ─ 2 Pieces ─ 3 Trackers ─ 4 Files ─ 5 Info ───────────── debian-13.7.0-amd64-netinst.iso ╮
+│ Address                  Client                  Flags              ↓          ↑  Has            │
+│ 185.21.216.143:51413     Transmission 4.0.6      D U   F X  1.1 MiB/s   48 KiB/s  ██████████ seed│
+│ [2a01:4f8:c17::9]:6881   qBittorrent 5.1.2       D u   F X  812 KiB/s      0 B/s  ██████████ seed│
+│ 91.121.44.7:6881         libtorrent 2.0.11       D U   F    640 KiB/s  112 KiB/s  ████████▎─  82%│
+│ 46.4.88.120:51413        Transmission 4.1.0      D u   F X  511 KiB/s      0 B/s  ██████████ seed│
+│ 5.39.71.22:6881          rtrnt 0.1.0             D U   F    402 KiB/s   54 KiB/s  ██████▋───  66%│
+│ 178.62.3.98:55555        BitComet 2.10           D          298 KiB/s      0 B/s  ██████████ seed│
+│ [2001:db8:5::1]:51413    Transmission 3.00       D U   F X  201 KiB/s      0 B/s  ██████████ seed│
+│ 73.92.10.211:42069       Deluge 2.2.0            d U I F        0 B/s   96 KiB/s  ████▏─────  41%│
+│ 82.64.211.5:6881         qBittorrent 4.6.7       d     F        0 B/s      0 B/s  █▎────────  12%│
+│ 9 peers  ·  D/d down unchoked/interested  U/u up  I incoming  F fast  X pex                      │
+│                                                                                                  │
+│ ↓ ▇▇▇▇▇▆▆▆▅▅▅▆▆▆▇▇▇▇▇▇▇▇▇▇█████████▇▇▇▆▆▆▆▇▇▇▆▆▆▆▆▆▆▆▆▇▇▇██████▇▇███   4.2 MiB/s  peak 5.2 MiB/s │
+│ ↑ ▅▅▅▅▅▅▆▆▆▇▇▇▇▇▇▇▇▇▇███████▇▇▇▆▆▆▆▆▆▆▆▆▆▅▅▅▅▅▅▆▆▇▇▇██▇▇▇▇▇▇██████▇▇   367 KiB/s  peak 402 KiB/s │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+ ↑↓ select  tab panel  1-5 view  l log  s sort  / filter  ? help  q quit  p pause  x remove
 ```
 
-### Terminal UI
+(`cargo run --example tui_demo` shows this screen with a made-up session.)
 
-When stdout and stderr are terminals, a run shows a full-screen UI instead of progress bars and log lines (`--no-tui`, or `tui = false` in the config file, turns it off; `--tui` turns it on regardless). It is never used with `--check`, `--scrape` or `--print-config`. Only the UI can start without a torrent: `rtrnt` alone opens it empty, saying `press a to add a torrent`. At the top are the session's rates and counts, then the torrent table, then a detail panel for the selected torrent with five tabs: its peers (client, flags, rates and how much each has, with the torrent's rates over the last half minute, or the selected peer's while the panel has the focus), a map of its pieces with the swarm's numbers, its trackers, its files, and facts about it. The log sits below, and the keys at the bottom:
+## Install
+
+```sh
+cargo install --git https://github.com/read-docs/rtrnt
+```
+
+Or from a clone: `cargo install --path .`
+
+## Use it
+
+```sh
+rtrnt                          # open the UI, empty; press a to add a torrent
+rtrnt file.torrent 'magnet:?xt=urn:btih:...' -o ~/Downloads
+```
+
+The UI remembers its torrents between runs, so the next `rtrnt` picks up where you quit. `q` stops everything cleanly and saves progress; nothing is hashed again on the next start.
 
 | Key | Action |
 |-----|--------|
-| `↑`/`↓`, `j`/`k` | select a torrent; when the detail panel has the focus, select a peer on the Peers tab or a file on the Files tab, or scroll the other tabs |
-| `PgUp`/`PgDn` | move the peer or file selection a page, or scroll the other tabs |
-| `tab` | move the focus between the torrent table and the detail panel |
-| `1`–`5` | peers, pieces, trackers, files, info |
-| `l` | show or hide the log |
-| `s` / `S` | sort by the next column / reverse the order |
-| `/` | filter torrents by name; `esc` clears the filter |
-| `p` | pause the selected torrent (or take a queued one out of the queue), or resume it; a finished or failed torrent is run again |
-| `x` | remove the selected torrent from the session, after asking: `y` keeps its files, `D` deletes them too |
-| `K` / `J` | move the selected torrent earlier / later in the queue and the table (see Queue) |
-| `r` | recheck the selected torrent: hash its files again, ignoring the resume file (see below) |
-| `o` | download the selected torrent in order, the first and last pieces of each file first, or go back to rarest first (see below) |
-| `space`, `+`/`-` | on the Files tab with the detail panel focused: skip the file under the cursor or download it again; raise or lower its priority (skip, normal, high) (see below) |
-| `a` | add a torrent: the path of a `.torrent` file (a relative one is taken from the directory rtrnt was started in) or a magnet link. It starts as one given on the command line would, with the same output directory and settings; one the session has already is refused, and so is a file that does not load, with a note at the bottom |
-| `d` / `u` | set the download / upload limit in KiB/s, 0 for none, until the run ends; the header shows the limits next to the rates. While the alternative speed mode is on they set its limits, not the normal ones |
-| `D` / `U` | the same for the selected torrent alone: its own download / upload limit in KiB/s, 0 for none. Its peers must pass both its limit and the session's, so the slower one rules; the Info tab shows them |
-| `R` / `T` | the selected torrent's own seed ratio, and its own seed time in minutes, in place of `--seed-ratio` and `--seed-time` for it: a number, 0 for no limit, or nothing to go by the session again. They apply at once, to a torrent already seeding too (set both to none while it seeds and it stops) |
-| `t` | switch the alternative speed limits ("turtle mode") on or off, until the schedule next changes; the header shows `alt speed` while they apply |
-| `m` | turn the mouse off, so the terminal can select text, or on again |
-| `?` | help |
-| `q`, `Ctrl-C` | stop the torrents, as Ctrl-C does without the UI; pressed again, quit at once |
+| `a` | add a `.torrent` file or a magnet link |
+| `p` | pause or resume the selected torrent |
+| `x` | remove it (`y` keeps the files, `D` deletes them) |
+| `↑`/`↓`, `j`/`k` | select a torrent |
+| `tab`, `1`–`5` | focus the detail panel; peers, pieces, trackers, files, info |
+| `space`, `+`/`-` | on the Files tab: skip a file, raise or lower its priority |
+| `o` | download in order, for watching while it downloads |
+| `d` / `u` | session download / upload limit (`D` / `U` for the selected torrent) |
+| `t` | alternative speed limits ("turtle mode") on or off |
+| `/`, `s` | filter by name, change the sort |
+| `?` | every key |
+| `q` | quit |
 
-A pause stops the torrent as Ctrl-C does: the tracker hears `stopped`, its peers are let go, and the resume file is saved once the pieces being written are on disk. The files stay as they are. Resuming starts it again from that resume file, so nothing is hashed, and a magnet link whose metadata had arrived from the `.torrent` it saved, so the metadata is not fetched again. A complete torrent resumed seeds if `--seed-ratio` or `--seed-time` says to, and is otherwise done at once. The row keeps its place, and its totals, ratio and time active count the earlier runs; so does the seed ratio, so a pause does not start the share over (the seed time does start over). A torrent still paused when the session ends makes the exit code 130, as Ctrl-C does, and the next run resumes it.
+The full list, with what each key does to a running, paused or queued torrent, is in [docs/tui.md](docs/tui.md).
 
-A recheck of a running torrent stops it as a pause does and starts it again with every piece hashed, its row showing `queued` at once and then the checking progress; it then carries on downloading or seeding. A paused torrent is checked and stays paused, with the result saved in its resume file. A finished or failed torrent is checked and then runs again, so one found incomplete fetches the rest. A torrent being removed or already restarting is left alone, and so is a magnet link whose metadata has not arrived; a note at the bottom says so.
+## Features
 
-The Files tab shows each file's priority in its `Get` column: `skip`, `normal` or `high` (skipped files are dimmed), and a cursor on one file while the panel has the focus. `space` toggles the file between skip and normal, `+` (or `=`) raises it and `-` lowers it. A skipped file is not downloaded, unless a piece it shares with a wanted file is, and is then created at its full length (sparse where the file system allows); high files are fetched before the rest. The torrent's size, progress and the tracker's `left` count only the wanted pieces, and a torrent with every wanted piece is done. A running torrent restarts to apply a change, as for a recheck, which hashes nothing while its resume file is good. For one paused or finished, the choice is saved in its resume file and applies when it runs next (`p`); a note at the bottom says so. A torrent being removed or pausing is left alone, and so is a magnet link whose metadata has not arrived. The choice is kept across runs.
+- **Finding peers:** HTTP and UDP trackers, the DHT (BEP 5), peer exchange (BEP 11), magnet links (BEP 9) and web seeds (BEP 19 and 17)
+- **Peer protocol:** extension protocol (BEP 10), fast extension (BEP 6), IPv4 and IPv6
+- **Choosing what to download:** skip files, give files priority, or download in order (first and last pieces of each file first)
+- **Many torrents at once:** a queue with active download and seed limits that you reorder by hand (`K` / `J`)
+- **Speed limits:** session-wide and per torrent, plus alternative limits switched by a weekly schedule
+- **Seeding:** stop at a ratio or after some time, session-wide or per torrent
+- **Resume and session files:** quitting and starting again does not rehash, and the torrent list comes back
+- **Networking:** router port mapping (PCP, NAT-PMP, UPnP IGD) and an IP blocklist (PeerGuardian, eMule, CIDR)
+- **Automation:** a watch directory for `.torrent` and `.magnet` files, and a command to run when a torrent completes
+- **Config file:** every setting can live in `~/.config/rtrnt/config.toml`
 
-Sequential download (`o`) makes a torrent take its pieces in file order instead of the rarest first, so media can play while it downloads: for each file in turn, its first piece, then its last (an MP4 or AVI often keeps its index at the end), then the pieces between from the lowest. A piece a file shares with the one before it is fetched where that one put it, and a skipped file adds nothing. Priorities still come first, so a `high` file goes before the rest, and only wanted pieces are taken, so it works with file selection. It takes effect at once in a running torrent, with no restart, and also for one that is paused or finished, for its next run. The Info tab shows the order, and the key bar says what `o` would do. Downloading in order is slower to spread over the swarm, and a rare piece may be a long time coming; it is meant for watching, not for helping the swarm. `--sequential` (`sequential = true` in the config file) starts every torrent this way, `--no-sequential` undoes a `true` in the file; `o` overrides it for one torrent. The choice made with `o` is kept in the session file.
+## Without the UI
 
-Removing a torrent stops it first if it runs, as a pause does, and its row shows `removing` until it has; then the row goes. `y` leaves its files and its resume file as they are, so adding it again later starts without hashing. `D` (uppercase only) also deletes its files, the directories they leave empty (never the output directory itself), its resume file and, for a magnet link, the `.torrent` it saved; the `.torrent` file it was started from stays. Only regular files are deleted: a symbolic link where a file or directory of the torrent's should be is left alone, and so is what it points to. Nothing is deleted while another running torrent writes one of the files, and whatever could not be deleted is logged and shown at the bottom. A magnet link still fetching its metadata has no files yet. A removed torrent no longer counts toward the exit code.
+When stdout isn't a terminal, or with `--no-tui`, rtrnt prints progress bars and log lines, downloads what it was given and exits. Combined with `--watch-dir` it keeps running until Ctrl-C, which works as a basic headless seedbox:
 
-The mouse works too: click a torrent or a peer to select it, a column heading to sort by it (again to reverse), or a tab title to show it; the wheel moves the selection, or scrolls the detail panel, under the pointer. While the UI has the mouse, most terminals still select text with Shift held down, or press `m` to give the mouse back.
-
-Peer flags: `D` we download from the peer, `d` we want to but it chokes us; `U` we upload to it, `u` it wants us to but we choke it; `I` it connected to us; `F` fast extension; `X` peer exchange. When every torrent has finished the UI says so and waits for `q`, and the warnings and errors of the last 10 seconds are printed once the terminal is back. `cargo run --example tui_demo` shows the UI with a made-up session.
-
-Give several torrents and they are downloaded at once, each with its own progress bar, sharing one listening port, one DHT node, the rate limits and the connection limit, and checking the data already on disk one torrent at a time. One that fails does not stop the others, Ctrl-C stops them all, and the run ends when every one is done (and seeded, with `--seed-ratio` or `--seed-time`). A torrent that would write a file another running one writes is refused, naming the file, before it touches anything. With `--check` or `--scrape`, each torrent is handled in turn under its name.
-
-A magnet link works wherever a .torrent file does. The torrent's metadata is fetched from peers found through the link's trackers (`tr`), its peers (`x.pe`) and the DHT, then the download carries on with the same peers. The metadata is saved as `<info hash>.torrent` in the output directory, so running the same link again resumes without fetching it, and `--check` uses that file (it fails without it). `--scrape` asks the link's trackers.
-
-Options: `-o, --output <DIR>` (default `.`), `--max-peers <N>` per torrent (default 30), `--max-connections <N>` across all torrents (default 200), `-p, --port <PORT>` to listen on for incoming peers over IPv4 and IPv6 (default 6881), `--no-dht` to find peers through trackers only (`--dht` turns the DHT back on if the config file turned it off), `--check` to verify a finished download (for a magnet link, against the saved `.torrent`), `--recheck` to ignore the resume files and hash the data already on disk, `--sequential` to download pieces in order, the first and last of each file first (`--no-sequential` turns it off again, if the config file turned it on), `--select-file <FILES>` to download only some files of each torrent (`1,3-5`, numbered from 1 in the torrent's order; a number past the last file is a warning, and if none is left every file is downloaded; a magnet link applies it once its metadata arrives; command line only, and it beats the choice saved in the resume file), `--scrape` to print each tracker's seeder, leecher and completed counts without downloading (a magnet link's `tr` trackers), `--seed-ratio <RATIO>` and `--seed-time <MINUTES>` to keep seeding once the download is complete, until we have uploaded that many times the torrent's size or for that long, whichever comes first (both default to 0, which exits at completion), and `--max-download-rate <KIB/S>` and `--max-upload-rate <KIB/S>` to limit how fast piece data moves each way, in KiB per second across all peers of all torrents (both default to 0, unlimited). The limits count piece data only, not protocol messages or TCP/IP headers, so the traffic on the wire is slightly higher. Without `--no-dht`, peers are also looked up in the BitTorrent DHT (on UDP, same port), so torrents without trackers download too. Connected peers that support peer exchange also tell us about more peers, and we tell them about ours (never for private torrents). A torrent file that lists web seeds (`url-list`, BEP 19, or `httpseeds`, BEP 17) is also downloaded from those HTTP servers, with no peers needed; they show in the Peers tab with their rate and state. Set `RUST_LOG=debug` for per-peer logs.
-
-Progress is saved in a resume file per torrent, `$XDG_STATE_HOME/rtrnt/resume/<info hash>.resume` (`~/.local/state/rtrnt/resume/` when that is unset), every 30 seconds while pieces complete and at exit. A restart trusts the pieces it lists as long as the files still have the size and modification time they had then, so a clean exit rehashes nothing, and after a crash only the files written since the last save are hashed. `--recheck` ignores the file; `--check` never reads it. The file also keeps which files of the torrent are skipped or come first, once something sets that.
-
-### Queue
-
-`--max-active-downloads <N>` and `--max-active-seeds <N>` (`max-active-downloads` and `max-active-seeds` in the config file; both default to 0, no limit) cap how many torrents run at once. A torrent counts as a download until it is complete (checking its data and fetching metadata included) and as a seed after, and each kind has its own slots. The rest wait with the status `queued`, in the order of the table, which is the queue: `K` and `J` move the selected torrent one place earlier or later (the table must be sorted by `added`, the default, to see it). A slot freed by a pause, a removal, a torrent that ends or one that completes and stops, goes to the first torrent in line for that kind; a seed over its limit (a download finished while the seed slots were full) goes back in the queue, the later ones first, and returns when a slot frees. Pausing a queued torrent takes it out of the queue; resuming it puts it back at its place, and runs it at once if a slot is free. The order is in the session file, so a restart queues in the same order (the file does not say which torrents were complete, so after a restart a finished torrent waits for a download slot until its check shows it complete; the check of a finished torrent is quick). A rate limit is not affected by the queue. Once Ctrl-C has been pressed, no queued torrent starts.
-
-### Session
-
-The terminal UI remembers its torrents between runs. The session file, `$XDG_STATE_HOME/rtrnt/session` (`~/.local/state/rtrnt/session` when that is unset), holds the torrents in the table's order, whether each was paused, the rate limits once they are set from the UI (`d`, `u`), and each torrent's own limits and seed settings (`D`, `U`, `R`, `T`), which a pause or a restart keeps too. Session files written before the per-torrent settings existed load as they were, with none set. It is saved after every change and when the run ends; a torrent running when you quit is saved as running, so the next run starts it again, and a paused one comes back paused. A `.torrent` file is copied to `$XDG_STATE_HOME/rtrnt/torrents/<info hash>.torrent` when it is added, so moving or deleting the original does not lose the torrent; removing the torrent deletes the copy. At startup the session's torrents come first, then those on the command line (one the session has already is not added twice, and one it has paused is resumed). The rate limits are taken from the command line, then the session, then the config file, then the default; `--print-config` says `session` where the session's limits apply. A session file that cannot be read (another version, say) is moved to `session.bad` and the run starts empty.
-
-Without the UI nothing is loaded or saved, so `rtrnt --no-tui x.torrent` still downloads that one torrent and exits. `session = true` in the config file keeps the session there too (the run then also restarts the session's torrents), `session = false` or `--no-session` turns it off in the UI. It is never used with `--check` or `--scrape`.
-
-### Watch directory
-
-`--watch-dir <DIR>` (`watch-dir` in the config file) takes the `.torrent` files, and the `.magnet` files whose first line is a magnet link, that appear in a directory, as rTorrent and Transmission do. The directory is looked at every 2 seconds, and a file is taken once its size and modification time are the same on two looks in a row, so a download a browser has not finished is left alone. A file that does not parse is renamed to `<name>.invalid` and a notice says why. Otherwise the torrent is added as by `a` in the UI, and the file is renamed to `<name>.added`, or deleted with `--watch-dir-delete` (`watch-dir-delete = true`). A `.torrent` is first copied into `$XDG_STATE_HOME/rtrnt/torrents/` (the session's store, which is used for this even when the session is not kept), and the torrent runs from the copy, so the rename or delete does not lose it; if there is no state directory the file is used where it is and left alone. The header shows the directory. With a watch directory the run does not end with the last torrent and none is needed on the command line: without the UI it goes on until Ctrl-C, which stops the watching as well.
-
-`--completion-hook <ARG>` (`completion-hook` in the config file, a list of strings) runs a command when a torrent finishes downloading, as Transmission's `script-torrent-done` does. The first argument is the program and the rest are its arguments, so on the command line the flag is repeated once per argument (`--completion-hook notify-send --completion-hook "download complete"`). The command is run directly, never through a shell, so nothing a torrent contains can change what runs; the torrent's details are passed only as environment variables: `RTRNT_NAME` (the torrent's name), `RTRNT_PATH` (the download directory joined with the name), `RTRNT_DIR` (the download directory) and `RTRNT_INFO_HASH` (lowercase hex). To use them in a script, run it with a shell yourself: `["sh", "-c", "mv \"$RTRNT_PATH\" ~/done/"]`. It runs once, in the background, when the last piece is verified, and not for a torrent that was already complete when it was added or resumed. It has no input or output (the terminal UI owns the terminal), and its exit status or failure to start is logged. rtrnt does not wait for it, but does not stop it either at exit.
-
-### IP blocklist
-
-`--blocklist <FILE>` (`blocklist` in the config file) refuses the peers whose addresses are in a list file, as Transmission and qBittorrent do. The file may mix PeerGuardian text lines (`name:1.2.3.4-1.2.3.255`), eMule `ipfilter.dat` lines (`1.2.3.4 - 1.2.3.255 , 000 , name`, where an access level of 128 or more means the range is allowed, so it is skipped), CIDR blocks (`10.0.0.0/8`, `2001:db8::/32`), single addresses and bare ranges, over IPv4 and IPv6. Blank lines and lines starting with `#`, `;` or `//` are skipped, and a line that fits no format is skipped and counted in a warning. Gzipped lists are not read: decompress them first. Peers from trackers, the DHT, peer exchange and magnet links are left out of the peer pool, and connections from listed addresses are closed as soon as they are accepted. The number of ranges loaded is logged, and a list that cannot be read stops the start.
-
-### Port mapping
-
-Behind a home router, nobody outside can connect to us unless the router forwards the listening port. Unless told not to (`--no-portmap`, or `portmap = false` in the config file; `--portmap` overrides the file), rtrnt asks the router in the background, so startup is never delayed and a failure is only logged and shown. When the listening port opens, the TCP port is mapped, and so is the DHT's UDP port once the DHT starts. The router is asked with PCP (RFC 6887) and NAT-PMP (RFC 6886) at the default gateway, UDP port 5351, then with UPnP IGD: an SSDP search, the device description, and SOAP calls (`AddPortMapping`, `DeletePortMapping`, `GetExternalIPAddress`) to its `WANIPConnection` or `WANPPPConnection` service. The first to answer is used. Leases are an hour, renewed at half the lease; if the router stops answering it is looked for again. On a normal exit the mappings are removed, waiting up to 3 seconds. The header shows `mapped <external address>:<port> (<protocol>)`, `mapping port...` while looking, or `port not mapped` (the log says why). The default gateway is read from `/proc/net/route` on Linux and from `route -n get default` elsewhere.
-
-### Config file
-
-Every option except `--check`, `--recheck`, `--select-file`, `--scrape`, `--config` and `--print-config` can also be set in `~/.config/rtrnt/config.toml` (or `$XDG_CONFIG_HOME/rtrnt/config.toml`), or in a file given with `--config <PATH>`. Keys are the long option names, except that `--no-dht` is `dht = false`, `--no-tui` is `tui = false`, `--no-session` is `session = false`, `--no-sequential` is `sequential = false`, `--no-portmap` is `portmap = false`, `--watch-dir-delete` is `watch-dir-delete = true` and `--completion-hook` is a `completion-hook` list. `alt-speed-schedule` can only be set in the file, and every key is optional:
-
-```toml
-output = "~/Downloads"
-max-peers = 50
-max-connections = 150
-port = 51413
-seed-ratio = 1.5
-seed-time = 120
-dht = false
-portmap = true
-max-download-rate = 2048
-max-upload-rate = 256
-max-active-downloads = 3
-max-active-seeds = 5
-tui = false
-watch-dir = "~/torrents"
-watch-dir-delete = false
-blocklist = "~/p2p.txt"
-completion-hook = ["notify-send", "rtrnt", "download complete"]
-sequential = false
-alt-speed-download = 50
-alt-speed-upload = 20
-alt-speed-schedule = [
-    { days = ["weekdays"], from = "08:00", to = "18:00" },
-    { days = ["fri", "sat"], from = "22:00", to = "06:00" },
-]
+```sh
+rtrnt --no-tui --watch-dir ~/torrents -o ~/Downloads --seed-ratio 2
 ```
 
-Alternative speed limits ("turtle mode") are a second pair of rate limits, `--alt-speed-download` and `--alt-speed-upload` in KiB/s (default 50 each, 0 for none), that replace `--max-download-rate` and `--max-upload-rate` while they are on. `alt-speed-schedule` turns them on by itself: each rule is a span of the day, `from` to `to` as `HH:MM` in local time, on some `days` (`mon` to `sun`, `weekdays`, `weekend`; every day if left out). A `to` that is not after `from` runs past midnight into the next day and belongs to the day it starts on, so the Friday rule above lasts until Saturday 06:00 and Saturday's until Sunday 06:00; equal times make a span of 24 hours. The schedule is looked at every 10 seconds. The `t` key switches by hand, and the switch holds until the schedule next changes (the next time a rule starts or ends), after which the schedule is in charge again; with no schedule it holds until `t` is pressed again. In the terminal UI, limits set with `d` and `u` while the mode is on are its limits, and the session file keeps them, the switch by hand and the normal limits separately, so a restart finds the same mode.
+There's no remote control yet (no RPC or web UI). To keep the UI running after you log out, start it inside `tmux` or `screen`.
 
-A flag on the command line overrides the file, and the file overrides the built-in defaults. `--print-config` shows the effective settings and where each one came from. Unknown keys are errors, so typos don't go unnoticed.
+`--check` verifies a finished download, and `--scrape` asks the trackers for seeder and leecher counts without downloading.
 
-Run the tests with `cargo test`. They include a loopback integration test against a mock seeder.
+## Documentation
 
-See [ROADMAP.md](ROADMAP.md) for what's done and what's next.
-
-## Dependencies
-
-- **tokio** - Async runtime
-- **serde** & **serde_bencode** - Torrent file parsing
-- **sha1** - Piece hash verification
-- **reqwest** - HTTP tracker communication
-- **clap** - Command-line interface
-- **toml** - Config file parsing
-- **indicatif** - Progress tracking
-- **ratatui**, **crossterm** & **futures-util** - Terminal UI and its key events
-- **chrono** - Local time in the UI
-- **unicode-width** - Column widths of torrent names
-- **anyhow** - Error handling
-
-## Project Structure
-
-```
-src/
-├── main.rs        # CLI entry point: hands the torrents to the manager, prints the result
-├── cli.rs         # Command-line arguments (clap)
-├── shutdown.rs    # Ctrl-C handling: first stops gracefully, second exits
-├── log_line.rs    # Log output that does not break the progress bars
-├── lib.rs         # Library root
-├── bencode.rs     # Raw bencode scanning (info-hash span)
-├── blocklist.rs   # IP blocklist: PeerGuardian, eMule and CIDR lists, merged ranges, binary search
-├── client.rs      # What the torrents of a session share: port, DHT, rate limits, bars
-├── config.rs      # Config file loading and CLI > file > default precedence
-├── dht/           # Trackerless peer discovery (BEP 5)
-│   ├── mod.rs       # DHT node: UDP socket, queries and answers, lookups
-│   ├── krpc.rs      # KRPC messages, bencode values, compact node/peer info
-│   ├── routing.rs   # Node ids, XOR distance, k-bucket routing table
-│   ├── lookup.rs    # Iterative lookup state machine
-│   ├── token.rs     # get_peers tokens with rotating secrets
-│   ├── store.rs     # Peers announced to us
-│   └── search.rs    # Periodic lookups for the torrent being downloaded
-├── portmap.rs     # Router port mapping: background task, renewal, removal on exit
-├── portmap/       # PCP, NAT-PMP, UPnP IGD and default gateway lookup
-├── download.rs    # Download config, Session and the entry points
-├── download/
-│   ├── swarm.rs     # A torrent's main loop: starts, replaces and bans peer workers
-│   ├── worker.rs    # One peer: download and upload over its connection
-│   ├── web.rs       # One web seed: whole pieces over HTTP, with backoff
-│   ├── queue.rs     # Piece queue: rarest first or sequential, endgame, availability
-│   ├── requests.rs  # Pieces in progress and request pipelining
-│   ├── upload.rs    # Blocks peers asked us for
-│   ├── check.rs     # Hashing the data on disk
-│   ├── choker.rs    # Choking algorithm: who may download from us
-│   ├── peer_pool.rs # Known peers, retry backoff and bans
-│   └── progress.rs  # Progress bar
-├── listener.rs    # Incoming peers, handed to the torrent their handshake asks for
-├── magnet.rs      # Magnet links (BEP 9): parsing, metadata fetch, then download
-├── magnet/
-│   └── metadata.rs  # ut_metadata: messages, assembling and fetching the info dict
-├── manager.rs     # The session's torrents: starts each, tracks its state, exit code
-├── peer.rs        # Peer wire protocol
-├── peer/
-│   ├── message.rs   # Message encode/decode
-│   ├── handshake.rs # Handshakes, ours and incoming
-│   ├── connection.rs # A connection to one peer
-│   ├── extension.rs # Extension protocol (BEP 10) handshake
-│   ├── fast.rs      # Fast extension (BEP 6): allowed fast set, Have All/Have None
-│   └── pex.rs       # Peer exchange (BEP 11): telling peers about each other
-├── altspeed.rs    # Alternative speed limits: the schedule, and which limits apply when
-├── queue.rs       # Which torrents run: the active download and seed limits
-├── rate_limit.rs  # Upload and download rate limits (shared token buckets)
-├── resume.rs      # Resume files: what was on disk last time
-├── selection.rs   # Which files to download, and which first; piece priorities
-├── session.rs     # The session file and the store of .torrent copies
-├── source.rs      # What to download: a .torrent file or a magnet link
-├── state.rs       # The state directory and atomic writes
-├── stats.rs       # Counters the engine publishes for the UI: torrents, peers, trackers
-├── stats/
-│   ├── torrent.rs   # One torrent: state, pieces, trackers, peer sources
-│   └── peer.rs      # One peer: flags, client, bytes
-├── webseed.rs     # Web seeds (BEP 19 and 17): URL mapping and HTTP fetching
-├── storage.rs     # Maps pieces onto files on disk (single and multi-file)
-├── storage/
-│   └── verify.rs    # Hash checks of the data on disk
-├── torrent.rs     # Torrent file parsing and validation
-├── torrent_limits.rs # A torrent's own rate limits and seed settings, live
-├── tracker.rs     # Tracker announce and scrape
-├── tracker/
-│   ├── http.rs      # HTTP trackers
-│   ├── udp.rs       # UDP trackers (BEP 15)
-│   └── announcer.rs # Re-announces and completed/stopped events
-├── watch.rs       # The watch directory: torrents dropped there are added
-└── tui/           # Terminal UI
-    ├── mod.rs        # Event loop, terminal setup and restore
-    ├── app.rs        # Selection, tabs, sort, input line; rate history
-    ├── snapshot.rs   # Plain copies of the stats, taken each tick
-    ├── log_buffer.rs # Log lines kept in memory for the log pane
-    ├── theme.rs      # Colors, true color or ANSI
-    ├── demo.rs       # A made-up session for the demo and the view tests
-    └── view/         # One file per area of the screen
-examples/
-└── tui_demo.rs    # The UI with a made-up session
-tests/
-├── dht.rs         # DHT nodes on loopback: bootstrap, announce, lookup
-└── loopback/      # End-to-end runs against mock seeders, trackers and peers,
-                   # one file per topic, shared helpers in common.rs
-```
-
-Unit tests live next to the code: inline in small modules, in `foo/tests.rs`
-for `foo.rs` otherwise.
-
-## How It Works
-
-1. **Torrent Parsing** - Reads and parses .torrent files, extracting metadata and calculating info hash, or for a magnet link fetches the metadata from peers
-2. **Tracker Announce, DHT and Peer Exchange** - Contacts trackers, searches the DHT and asks connected peers to discover peers in the swarm
-3. **Peer Handshake** - Establishes connections with peers using the BitTorrent protocol
-4. **Piece Download** - Downloads file pieces in 16KB blocks from multiple peers concurrently, and whole pieces from web seeds over HTTP
-5. **Verification** - Validates each piece against its SHA-1 hash before assembly
+- [Terminal UI](docs/tui.md): every key, pause, recheck, file selection, sequential download, removal, the mouse, peer flags
+- [Usage and options](docs/usage.md): command-line flags, several torrents, magnet links, resume files
+- [Queue and session](docs/queue-and-session.md): active limits, queue order, what the session file keeps
+- [Config file](docs/config.md): every key, alternative speed limits and their schedule
+- [Watch directory and completion hook](docs/automation.md)
+- [Networking](docs/networking.md): IP blocklist, port mapping
+- [Development](docs/development.md): tests, dependencies, source layout
+- [ROADMAP.md](ROADMAP.md): what's done and what's next
